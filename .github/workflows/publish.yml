@@ -76,7 +76,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - name: Package chart
         run: |
           version="${GITHUB_REF_NAME#v}"
