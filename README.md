@@ -95,11 +95,13 @@ cargo test                  # unit tests + example manifests validated against t
 cargo clippy --all-targets
 sh hack/gen-crds.sh         # regenerate chart CRDs after changing src/crd.rs
 helm lint charts/kube-hardware-autoscaler
-sh hack/e2e/run.sh          # end-to-end on a local 2-node minikube (see the script header)
+sh hack/e2e/run.sh          # optional, manual: end-to-end on a local 2-node minikube
 ```
 
-The end-to-end test runs the real image and chart. A fake JetKVM speaks JetKVM's MQTT
-protocol in place of real hardware. The test covers:
+The optional end-to-end test isn't part of CI. Run it locally when changing the CRDs, RBAC,
+the chart or the controllers. It runs the real image and chart against a real API server. A
+fake JetKVM speaks JetKVM's MQTT
+protocol in place of real hardware. It covers:
 - scale-down and scale-up through the fallback chain;
 - the CEL admission rules;
 - label-based membership and pool conflicts;
