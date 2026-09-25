@@ -11,6 +11,7 @@
 //! config is validated against its own type when the driver is built.
 
 mod chain;
+pub mod inband;
 mod ipmi;
 mod jetkvm;
 mod nanokvm;
@@ -199,7 +200,7 @@ pub struct DriverContext {
     pub namespace: String,
     /// Timeout for a single management interface operation.
     pub op_timeout: Duration,
-    /// Default image for Wake-on-LAN shutdown pods.
+    /// Default image for in-band shutdown and standby pods.
     pub shutdown_image: String,
     /// Image for Wake-on-LAN relay pods (the operator image; runs `wake`).
     pub relay_image: String,

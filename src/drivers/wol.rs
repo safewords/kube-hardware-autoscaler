@@ -5,12 +5,9 @@
 //!   Relays let machines on other network segments or sites (linked by a VPN,
 //!   for example) be woken by nodes that share their broadcast domain;
 //! * power off: a privileged pod is scheduled onto the node that runs
-//!   `systemctl poweroff` in the host namespaces;
+//!   `systemctl poweroff` in the host namespaces (see [`super::inband`]);
 //! * power state: inferred from the Node's `Ready` condition (put a `ping`
 //!   interface in front for an accurate reading).
-//!
-//! The shutdown pod carries the node's boot id and refuses to act if the host
-//! has rebooted since, so a stale pod can never shut down a freshly booted host.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -23,6 +20,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::inband::{self, HostCommand};
 use super::{DriverError, DriverInit, DriverKind, PowerDriver, Result};
 use crate::crd::{POWERED_OFF_ANNOTATION, PowerState};
 use crate::wake;
@@ -176,12 +174,6 @@ fn short_hash(parts: &[&str]) -> String {
 }
 
 impl WakeOnLanDriver {
-    fn shutdown_pod_name(&self) -> String {
-        let mut name = format!("kha-shutdown-{}", self.node_name.replace('.', "-"));
-        name.truncate(63);
-        name.trim_end_matches('-').to_string()
-    }
-
     async fn delete_pod(&self, name: &str) -> Result<()> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
         match pods
@@ -298,16 +290,6 @@ impl WakeOnLanDriver {
     }
 }
 
-const SHUTDOWN_SCRIPT: &str = r#"set -eu
-current="$(cat /proc/sys/kernel/random/boot_id)"
-if [ -n "${EXPECTED_BOOT_ID}" ] && [ "${current}" != "${EXPECTED_BOOT_ID}" ]; then
-  echo "host rebooted since shutdown was requested (boot id ${current}); not shutting down"
-  exit 0
-fi
-echo "powering off host"
-exec nsenter -t 1 -m -u -i -n -p -- sh -c 'systemctl poweroff || poweroff'
-"#;
-
 #[async_trait]
 impl PowerDriver for WakeOnLanDriver {
     async fn power_state(&self) -> Result<PowerState> {
@@ -320,7 +302,7 @@ impl PowerDriver for WakeOnLanDriver {
 
     async fn power_on(&self) -> Result<()> {
         // Make sure no stale shutdown pod survives into the next boot.
-        self.delete_pod(&self.shutdown_pod_name()).await?;
+        inband::cancel(&self.client, &self.namespace, &self.node_name).await?;
 
         let mut errors = Vec::new();
         let mut sent = false;
@@ -353,53 +335,14 @@ impl PowerDriver for WakeOnLanDriver {
     async fn power_off(&self, _force: bool) -> Result<()> {
         // Wake-on-LAN has no out-of-band power off; a forced request simply
         // re-issues the in-band shutdown.
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        let node = nodes
-            .get_opt(&self.node_name)
-            .await?
-            .ok_or_else(|| DriverError::Interface(format!("node {} not found", self.node_name)))?;
-        let boot_id = node
-            .status
-            .as_ref()
-            .and_then(|s| s.node_info.as_ref())
-            .map(|i| i.boot_id.clone())
-            .unwrap_or_default();
-
-        self.delete_pod(&self.shutdown_pod_name()).await?;
-        let pod: Pod = serde_json::from_value(json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": self.shutdown_pod_name(),
-                "namespace": self.namespace,
-                "labels": {
-                    "app.kubernetes.io/name": "kube-hardware-autoscaler",
-                    "app.kubernetes.io/component": "shutdown",
-                    "hardware-autoscaler.safewords.com/node": self.node_name,
-                },
-            },
-            "spec": {
-                "nodeName": self.node_name,
-                "hostPID": true,
-                "restartPolicy": "Never",
-                "activeDeadlineSeconds": 900,
-                "terminationGracePeriodSeconds": 0,
-                "priorityClassName": "system-node-critical",
-                "tolerations": [{"operator": "Exists"}],
-                "containers": [{
-                    "name": "shutdown",
-                    "image": self.shutdown_image,
-                    "command": ["sh", "-c", SHUTDOWN_SCRIPT],
-                    "env": [{"name": "EXPECTED_BOOT_ID", "value": boot_id}],
-                    "securityContext": {"privileged": true},
-                    "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}},
-                }],
-            },
-        }))
-        .map_err(|e| DriverError::Interface(format!("building shutdown pod: {e}")))?;
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        pods.create(&PostParams::default(), &pod).await?;
-        Ok(())
+        inband::run(
+            &self.client,
+            &self.namespace,
+            &self.node_name,
+            &self.shutdown_image,
+            HostCommand::PowerOff,
+        )
+        .await
     }
 }
 

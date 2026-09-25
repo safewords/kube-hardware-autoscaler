@@ -56,7 +56,7 @@ pub fn member_state(mn: &NodePowerManagementConfig, pool: &str) -> MemberState {
         .filter(|d| d.pool == pool)
         .map(|d| d.target);
     match decision {
-        Some(PowerTarget::Off) if st.phase == Phase::Off => MemberState::Offline,
+        Some(PowerTarget::Off) if matches!(st.phase, Phase::Off | Phase::Standby) => MemberState::Offline,
         Some(PowerTarget::Off) => MemberState::Leaving,
         Some(PowerTarget::On) if ready_on => MemberState::Online,
         Some(PowerTarget::On) if st.phase == Phase::Error => MemberState::Unavailable,
@@ -64,7 +64,7 @@ pub fn member_state(mn: &NodePowerManagementConfig, pool: &str) -> MemberState {
         None => match st.phase {
             Phase::On if st.node_ready => MemberState::Online,
             Phase::On | Phase::PoweringOn => MemberState::Booting,
-            Phase::Off => MemberState::Offline,
+            Phase::Off | Phase::Standby => MemberState::Offline,
             Phase::Draining | Phase::PoweringOff => MemberState::Leaving,
             Phase::Unknown | Phase::Error => MemberState::Unavailable,
         },
@@ -342,6 +342,16 @@ mod tests {
             s(mn(PowerPolicy::Auto, Phase::Off, false, Some(("p", PowerTarget::Off)))),
             Offline
         );
+        assert_eq!(
+            s(mn(
+                PowerPolicy::Auto,
+                Phase::Standby,
+                false,
+                Some(("p", PowerTarget::Off))
+            )),
+            Offline
+        );
+        assert_eq!(s(mn(PowerPolicy::Auto, Phase::Standby, false, None)), Offline);
         assert_eq!(
             s(mn(PowerPolicy::Auto, Phase::Error, false, Some(("p", PowerTarget::On)))),
             Unavailable

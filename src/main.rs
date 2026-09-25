@@ -43,7 +43,7 @@ struct DriverArgs {
     /// Timeout for a single management interface operation, in seconds.
     #[arg(long, env = "KHA_OP_TIMEOUT_SECONDS", default_value_t = 60)]
     op_timeout_seconds: u64,
-    /// Default image for Wake-on-LAN shutdown pods (must provide sh and nsenter).
+    /// Default image for in-band shutdown and standby pods (must provide sh and nsenter).
     #[arg(long, env = "KHA_SHUTDOWN_IMAGE", default_value = "debian:stable-slim")]
     shutdown_image: String,
     /// Image for Wake-on-LAN relay pods on neighbouring nodes (this operator's image).

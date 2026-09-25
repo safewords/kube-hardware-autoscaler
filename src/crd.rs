@@ -188,6 +188,25 @@ pub struct LifecycleSpec {
     /// scale-down is aborted and the node is uncordoned.
     #[serde(default)]
     pub force_after_drain_timeout: bool,
+    /// What "off" means for this machine: a full `Shutdown` (default) or
+    /// `Standby` (suspend to RAM, which wakes in seconds). Standby is always
+    /// entered in-band, through a privileged pod running `systemctl suspend`
+    /// on the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN
+    /// is the most reliable way to wake a suspended machine). If the node is
+    /// still Ready `shutdownTimeoutSeconds` after the suspend request, the
+    /// machine is forced off like a stuck shutdown.
+    #[serde(default)]
+    pub power_off_mode: PowerOffMode,
+}
+
+/// How a machine is taken offline.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum PowerOffMode {
+    /// Shut the operating system down and power the machine off.
+    #[default]
+    Shutdown,
+    /// Suspend to RAM (ACPI S3).
+    Standby,
 }
 
 fn default_boot_timeout() -> u64 {
@@ -207,6 +226,7 @@ impl Default for LifecycleSpec {
             drain_timeout_seconds: default_drain_timeout(),
             shutdown_timeout_seconds: default_shutdown_timeout(),
             force_after_drain_timeout: false,
+            power_off_mode: PowerOffMode::default(),
         }
     }
 }
@@ -221,6 +241,8 @@ pub enum Phase {
     Draining,
     PoweringOff,
     Off,
+    /// Suspended to RAM by the operator (`lifecycle.powerOffMode: Standby`).
+    Standby,
     Error,
 }
 
@@ -352,6 +374,12 @@ pub struct NodePowerManagementConfigStatus {
     /// The last power action issued to the management interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_power_action: Option<PowerActionRecord>,
+    /// When the operator last put the machine into standby. Cleared once it is
+    /// back online or has been powered off instead. While set, power-on
+    /// requests are repeated even if an interface reads the suspended machine
+    /// as On (some BMCs do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby_since: Option<DateTime<Utc>>,
     /// When a forced (hard) power off was issued during the current `PoweringOff` phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_off_at: Option<DateTime<Utc>>,
@@ -372,7 +400,7 @@ pub struct NodePowerManagementConfigStatus {
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PowerActionRecord {
-    /// `PowerOn`, `PowerOff` or `ForceOff`.
+    /// `PowerOn`, `PowerOff`, `ForceOff` or `Standby`.
     pub action: String,
     pub time: DateTime<Utc>,
     /// Whether a management interface accepted the request.
@@ -626,6 +654,7 @@ mod tests {
         const YAML11_BOOLS: &[&str] = &["y", "yes", "n", "no", "true", "false", "on", "off"];
         let values: Vec<String> = [
             serde_json::to_value([PowerPolicy::Auto, PowerPolicy::AlwaysOn, PowerPolicy::AlwaysOff]).unwrap(),
+            serde_json::to_value([PowerOffMode::Shutdown, PowerOffMode::Standby]).unwrap(),
             serde_json::to_value([
                 InterfaceAction::Status,
                 InterfaceAction::PowerOn,

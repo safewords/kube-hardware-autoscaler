@@ -19,7 +19,7 @@ operator:
   dryRun: false
   # -- Timeout for one management-interface operation, in seconds.
   opTimeoutSeconds: 60
-  # -- Default image for Wake-on-LAN shutdown pods (needs `sh` and `nsenter`).
+  # -- Default image for in-band shutdown and standby pods (needs `sh` and `nsenter`).
   shutdownImage: debian:stable-slim
   # -- Emit JSON logs.
   logJson: false

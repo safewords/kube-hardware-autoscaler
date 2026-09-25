@@ -55,6 +55,8 @@ spec:
   - BMCs must report the same system UUID as the Node, or that interface is disabled.
   - An interface reporting Off for a live Node blocks all actions.
   - One config per Node, enforced by the API server.
+- **Shutdown or standby:** idle machines are shut down, or with `powerOffMode: Standby`
+  suspended to RAM and woken in seconds.
 - **Demand-driven scaling:** unschedulable pods are bin-packed onto powered-off machines,
   checking resources, node selectors, node affinity and taints. Idle machines are drained
   through the eviction API, which respects PDBs. `safe-to-evict` annotations are honoured.

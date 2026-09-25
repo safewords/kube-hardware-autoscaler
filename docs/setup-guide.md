@@ -120,7 +120,7 @@ Useful values (see `charts/kube-hardware-autoscaler/values.yaml` for all):
 |---|---|---|
 | `operator.dryRun` | `false` | Log power actions without executing them. |
 | `operator.opTimeoutSeconds` | `60` | Upper bound for one management-interface call. |
-| `operator.shutdownImage` | `debian:stable-slim` | Image of Wake-on-LAN shutdown pods (needs `sh` + `nsenter`). |
+| `operator.shutdownImage` | `debian:stable-slim` | Image of in-band shutdown and standby pods (needs `sh` + `nsenter`). |
 | `hostNetwork` | `false` | Required for Wake-on-LAN; helps when BMCs are only reachable from the node network. |
 | `credentials` | `[]` | Convenience: creates credential Secrets. |
 | `nodePools` / `nodePowerManagementConfigs` | `[]` | Convenience: creates the custom resources from values. |
@@ -179,6 +179,7 @@ spec:
     drainTimeoutSeconds: 300
     shutdownTimeoutSeconds: 300
     forceAfterDrainTimeout: false
+    powerOffMode: Shutdown   # Shutdown | Standby (suspend to RAM, see below)
 ```
 
 More examples: [`examples/`](../examples) (IPMI, Redfish, PiKVM, JetKVM, Wake-on-LAN,
@@ -187,6 +188,43 @@ fallback chains, NodeScalingPool).
 There's no pool field. A machine joins a pool when its Node's labels match the pool's
 `nodeSelector` (step 6). Until then the operator only observes it, so it's safe to apply
 these first and check the machines' status.
+
+### Standby instead of shutdown
+
+With `lifecycle.powerOffMode: Standby`, an idle machine is suspended to RAM (ACPI S3)
+instead of shut down. It draws a few watts and is back in seconds rather than after a
+full boot, with its page cache and container images still in memory.
+
+```yaml
+spec:
+  powerInterfaces:
+    - driver: ping                        # accurate state: a suspended machine stops answering
+      config: { method: icmp }
+    - driver: wakeOnLan                   # wakes the machine from S3
+      config: { macAddress: "aa:bb:cc:dd:ee:ff" }
+  lifecycle:
+    powerOffMode: Standby
+```
+
+- **Entering standby** is always in-band: after the drain, the operator runs a privileged
+  pod on the node that calls `systemctl suspend` (the same kind of pod the `wakeOnLan`
+  driver uses to shut down, using `operator.shutdownImage`). BMCs and KVMs can't suspend
+  a machine, so no interface is needed for it.
+- **Waking** goes through the `powerOn` interfaces as usual. Wake-on-LAN is the most reliable
+  way to wake from S3; enable it in the firmware and the OS (`ethtool -s <nic> wol g`). A KVM
+  power-button press usually works too. IPMI and Redfish `power on` often do nothing to a
+  suspended machine, since the BMC considers it already on.
+- **Detection:** the machine counts as in standby (phase `Standby`) once its power reads Off
+  or its Node stops being Ready. Some BMCs report a suspended machine as On, so the Node
+  going NotReady is enough. While waking, the power-on request is repeated until the Node
+  is Ready, whatever the interface reports.
+- **If the suspend fails** (the node is still Ready after `shutdownTimeoutSeconds`), the
+  machine is forced off, as with a stuck shutdown.
+- If demand returns before the machine has gone to sleep, the suspend pod is withdrawn and
+  the machine is woken.
+
+Check that `systemctl suspend` works on the machine, and that it wakes up from the chosen
+interface, before enabling this.
 
 ### Multiple interfaces and fallback
 
@@ -575,7 +613,7 @@ scaleDown:
 
 ### Node fencing
 
-Just before powering a machine off, the operator annotates its Node with
+Just before powering a machine off (or putting it into standby), the operator annotates its Node with
 `hardware-autoscaler.safewords.com/powered-off: <RFC 3339 time>`. Tools that fence
 unresponsive nodes, for example by adding the `node.kubernetes.io/out-of-service` taint,
 should **skip nodes carrying this annotation**: an intentionally powered-off node isn't a

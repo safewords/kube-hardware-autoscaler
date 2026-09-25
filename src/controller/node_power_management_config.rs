@@ -9,6 +9,10 @@
 //!    (graceful, forced after shutdownTimeout)   (evict pods)
 //! ```
 //!
+//! With `lifecycle.powerOffMode: Standby`, `PoweringOff` suspends the machine
+//! in-band instead and ends in `Standby` (rather than `Off`) once the power
+//! reads Off or the Node stops being Ready.
+//!
 //! The desired state comes from `spec.powerPolicy` (`AlwaysOn`/`AlwaysOff`), or with
 //! `Auto` from `status.scalingDecision`, written by the `NodeScalingPool` controller.
 //!
@@ -34,9 +38,10 @@ use super::{
 };
 use crate::crd::{
     COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
-    NodePowerManagementConfig, NodePowerManagementConfigStatus, Phase, PowerActionRecord, PowerPolicy, PowerState,
-    PowerTarget, ScalingDecision,
+    NodePowerManagementConfig, NodePowerManagementConfigStatus, Phase, PowerActionRecord, PowerOffMode, PowerPolicy,
+    PowerState, PowerTarget, ScalingDecision,
 };
+use crate::drivers::inband::{self, HostCommand};
 use crate::drivers::{Outcome, PowerChain};
 use crate::identity::IdentityCheck;
 use crate::membership::{self, Membership};
@@ -108,9 +113,26 @@ impl Reconciler<'_> {
             match action {
                 "PowerOn" => self.chain.power_on().await,
                 "PowerOff" => self.chain.power_off(false).await,
+                // No management interface can suspend a machine; it is always done in-band.
+                "Standby" => {
+                    let d = &self.ctx.drivers;
+                    let node = &self.mn.spec.node_name;
+                    inband::run(&d.client, &d.namespace, node, &d.shutdown_image, HostCommand::Suspend)
+                        .await
+                        .map(|()| Outcome {
+                            value: (),
+                            via: "in-band".into(),
+                            failures: vec![],
+                        })
+                }
                 _ => self.chain.power_off(true).await,
             }
         };
+        match action {
+            "Standby" => self.st.standby_since = Some(self.now),
+            "PowerOff" | "ForceOff" => self.st.standby_since = None,
+            _ => {}
+        }
         let ok = result.is_ok();
         self.ctx.metrics.power_action(&self.mn.spec.node_name, action, ok);
         self.st.last_power_action = Some(PowerActionRecord {
@@ -164,6 +186,7 @@ impl Reconciler<'_> {
             }
             self.set_phase(Phase::On);
             self.st.forced_off_at = None;
+            self.st.standby_since = None;
             self.st.message = None;
             return Ok(SLOW);
         }
@@ -183,8 +206,27 @@ impl Reconciler<'_> {
                             self.st.message.clone().unwrap(),
                         )
                         .await;
-                } else if power == PowerState::Off && self.since_last_action("PowerOn") > RETRY_ACTION_AFTER {
+                } else if (power == PowerState::Off || self.st.standby_since.is_some())
+                    && self.since_last_action("PowerOn") > RETRY_ACTION_AFTER
+                {
+                    // Some BMCs read a suspended machine as On, so after a standby
+                    // keep asking until the Node is Ready.
                     self.act("PowerOn").await;
+                }
+                Ok(FAST)
+            }
+            // Unlike a shutdown, a standby can be called off: withdraw the
+            // suspend pod if it has not run yet, and wake the machine if it has.
+            Phase::PoweringOff | Phase::Standby if self.st.standby_since.is_some() => {
+                if let Err(e) =
+                    inband::cancel(&self.ctx.client, &self.ctx.drivers.namespace, &self.mn.spec.node_name).await
+                {
+                    warn!(node = %self.mn.spec.node_name, error = %e, "cannot delete suspend pod");
+                }
+                if self.act("PowerOn").await {
+                    self.set_phase(Phase::PoweringOn);
+                } else {
+                    self.set_phase(Phase::Error);
                 }
                 Ok(FAST)
             }
@@ -196,7 +238,7 @@ impl Reconciler<'_> {
                 self.st.message = Some("waiting for shutdown to complete before powering back on".into());
                 Ok(FAST)
             }
-            _ if power == PowerState::On => {
+            _ if power == PowerState::On && self.st.standby_since.is_none() => {
                 // Powered but not Ready yet (booting, or an aborted scale down).
                 if let Some(node) = &self.node {
                     uncordon_if_ours(&self.ctx.client, node).await?;
@@ -218,20 +260,27 @@ impl Reconciler<'_> {
         }
     }
 
+    /// The action that takes this machine offline.
+    fn off_action(&self) -> &'static str {
+        match self.mn.spec.lifecycle.power_off_mode {
+            PowerOffMode::Shutdown => "PowerOff",
+            PowerOffMode::Standby => "Standby",
+        }
+    }
+
     async fn ensure_off(&mut self) -> Result<Duration, Error> {
         let power = self.st.power_state;
-        if power == PowerState::Off {
-            if self.st.phase != Phase::Off {
-                self.ctx
-                    .event(
-                        self.mn,
-                        EventType::Normal,
-                        "PoweredOff",
-                        "machine is powered off".into(),
-                    )
-                    .await;
+        let suspended = in_standby(self.st.phase, self.st.standby_since.is_some(), self.st.node_ready);
+        if power == PowerState::Off || suspended {
+            let (phase, reason, note) = if self.st.standby_since.is_some() {
+                (Phase::Standby, "Standby", "machine is in standby")
+            } else {
+                (Phase::Off, "PoweredOff", "machine is powered off")
+            };
+            if self.st.phase != phase {
+                self.ctx.event(self.mn, EventType::Normal, reason, note.into()).await;
             }
-            self.set_phase(Phase::Off);
+            self.set_phase(phase);
             self.st.forced_off_at = None;
             self.st.message = None;
             return Ok(SLOW);
@@ -250,9 +299,9 @@ impl Reconciler<'_> {
                         self.st.forced_off_at = Some(self.now);
                     }
                 } else if self.st.last_power_action.as_ref().is_some_and(|a| !a.succeeded)
-                    && self.since_last_action("PowerOff") > RETRY_ACTION_AFTER / 3
+                    && self.since_last_action(self.off_action()) > RETRY_ACTION_AFTER / 3
                 {
-                    self.act("PowerOff").await;
+                    self.act(self.off_action()).await;
                 }
                 Ok(FAST)
             }
@@ -293,7 +342,7 @@ impl Reconciler<'_> {
         {
             warn!(node = %self.mn.spec.node_name, error = %e, "cannot annotate node as powered off");
         }
-        self.act("PowerOff").await;
+        self.act(self.off_action()).await;
         // Even if the request failed we move on; PoweringOff retries and eventually forces.
         self.set_phase(Phase::PoweringOff);
     }
@@ -387,6 +436,9 @@ impl Reconciler<'_> {
 
     /// Without a desired state, only mirror what the interface reports.
     fn observe(&mut self) -> Duration {
+        if in_standby(self.st.phase, self.st.standby_since.is_some(), self.st.node_ready) {
+            return SLOW;
+        }
         match self.st.power_state {
             PowerState::On if self.st.node_ready => self.set_phase(Phase::On),
             PowerState::On => self.set_phase(Phase::PoweringOn),
@@ -395,6 +447,13 @@ impl Reconciler<'_> {
         }
         SLOW
     }
+}
+
+/// Whether a standby we requested has taken effect. Most interfaces read a
+/// suspended machine as Off, but some BMCs keep reporting On in S3; the
+/// kubelet going quiet is the reliable signal.
+pub fn in_standby(phase: Phase, standby_requested: bool, node_ready: bool) -> bool {
+    standby_requested && matches!(phase, Phase::PoweringOff | Phase::Standby) && !node_ready
 }
 
 /// Seconds after our own power-off during which "interface says Off, node
@@ -611,7 +670,7 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
     let since_off = st
         .last_power_action
         .as_ref()
-        .filter(|a| a.action == "PowerOff" || a.action == "ForceOff")
+        .filter(|a| matches!(a.action.as_str(), "PowerOff" | "ForceOff" | "Standby"))
         .map(|a| (now - a.time).num_seconds());
     let consistent = power_state_consistent(st.power_state, st.node_ready, lease_age, since_off);
     if consistent {
@@ -686,6 +745,18 @@ mod tests {
         assert!(power_state_consistent(PowerState::Off, true, None, None));
         // On readings never contradict (a booting node is legitimately not Ready yet).
         assert!(power_state_consistent(PowerState::On, false, None, None));
+    }
+
+    #[test]
+    fn standby_is_reached_when_the_node_goes_quiet() {
+        // Suspend requested, node no longer Ready: in standby even if a BMC still reads On.
+        assert!(in_standby(Phase::PoweringOff, true, false));
+        assert!(in_standby(Phase::Standby, true, false));
+        // Still Ready: the suspend has not happened (yet).
+        assert!(!in_standby(Phase::PoweringOff, true, true));
+        // A NotReady node is not in standby unless we asked for it.
+        assert!(!in_standby(Phase::PoweringOff, false, false));
+        assert!(!in_standby(Phase::Draining, true, false));
     }
 
     fn decision(pool: &str, target: PowerTarget) -> ScalingDecision {

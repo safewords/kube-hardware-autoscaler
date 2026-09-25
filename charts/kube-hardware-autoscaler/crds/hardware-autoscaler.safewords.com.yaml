@@ -63,6 +63,7 @@
                       "bootTimeoutSeconds": 900,
                       "drainTimeoutSeconds": 300,
                       "forceAfterDrainTimeout": false,
+                      "powerOffMode": "Shutdown",
                       "shutdownTimeoutSeconds": 300
                     },
                     "description": "Timeouts and drain behaviour for power transitions.",
@@ -85,6 +86,15 @@
                         "default": false,
                         "description": "Power off anyway when the drain times out. When false (default) the\nscale-down is aborted and the node is uncordoned.",
                         "type": "boolean"
+                      },
+                      "powerOffMode": {
+                        "default": "Shutdown",
+                        "description": "What \"off\" means for this machine: a full `Shutdown` (default) or\n`Standby` (suspend to RAM, which wakes in seconds). Standby is always\nentered in-band, through a privileged pod running `systemctl suspend`\non the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN\nis the most reliable way to wake a suspended machine). If the node is\nstill Ready `shutdownTimeoutSeconds` after the suspend request, the\nmachine is forced off like a stuck shutdown.",
+                        "enum": [
+                          "Shutdown",
+                          "Standby"
+                        ],
+                        "type": "string"
                       },
                       "shutdownTimeoutSeconds": {
                         "default": 300,
@@ -275,7 +285,7 @@
                     "nullable": true,
                     "properties": {
                       "action": {
-                        "description": "`PowerOn`, `PowerOff` or `ForceOff`.",
+                        "description": "`PowerOn`, `PowerOff`, `ForceOff` or `Standby`.",
                         "type": "string"
                       },
                       "succeeded": {
@@ -327,7 +337,8 @@
                       "Draining",
                       "PoweringOff",
                       "Off",
-                      "Error"
+                      "Error",
+                      "Standby"
                     ],
                     "type": "string"
                   },
@@ -383,6 +394,12 @@
                       "time"
                     ],
                     "type": "object"
+                  },
+                  "standbySince": {
+                    "description": "When the operator last put the machine into standby. Cleared once it is\nback online or has been powered off instead. While set, power-on\nrequests are repeated even if an interface reads the suspended machine\nas On (some BMCs do).",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
                   }
                 },
                 "type": "object"
