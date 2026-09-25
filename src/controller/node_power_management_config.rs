@@ -29,7 +29,9 @@ use kube::runtime::events::EventType;
 use kube::{Api, ResourceExt};
 use tracing::{info, warn};
 
-use super::{Context, Error, cordon, node_ready, patch_status_diff, uncordon_if_ours};
+use super::{
+    Context, Error, clear_powered_off, cordon, mark_powered_off, node_ready, patch_status_diff, uncordon_if_ours,
+};
 use crate::crd::{
     COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
     NodePowerManagementConfig, NodePowerManagementConfigStatus, Phase, PowerActionRecord, PowerPolicy, PowerState,
@@ -144,6 +146,11 @@ impl Reconciler<'_> {
                 && uncordon_if_ours(&self.ctx.client, node).await?
             {
                 info!(node = %self.mn.spec.node_name, "uncordoned node");
+            }
+            if let Some(node) = &self.node
+                && clear_powered_off(&self.ctx.client, node).await?
+            {
+                info!(node = %self.mn.spec.node_name, "cleared powered-off marker (and any out-of-service fence)");
             }
             if self.st.phase != Phase::On {
                 self.ctx
@@ -280,6 +287,12 @@ impl Reconciler<'_> {
     }
 
     async fn power_off(&mut self) {
+        // Tell node fencing this is deliberate before the machine goes quiet.
+        if !self.ctx.dry_run
+            && let Err(e) = mark_powered_off(&self.ctx.client, &self.mn.spec.node_name, self.now).await
+        {
+            warn!(node = %self.mn.spec.node_name, error = %e, "cannot annotate node as powered off");
+        }
         self.act("PowerOff").await;
         // Even if the request failed we move on; PoweringOff retries and eventually forces.
         self.set_phase(Phase::PoweringOff);

@@ -495,6 +495,7 @@ scaleUp:
   enabled: true
   pendingPodGraceSeconds: 30
   maxNodesPerStep: 3
+  requireExplicitSelection: false   # see "Dedicated pools"
 scaleDown:
   enabled: true
   utilizationThresholdPercent: 50
@@ -502,7 +503,50 @@ scaleDown:
   delayAfterScaleUpSeconds: 600
   drainFailureBackoffSeconds: 1800
   maxNodesPerStep: 1          # concurrent drains/power-offs
+  ignoreDaemonSetUtilization: false
+  ignoreNonSelectingPodUtilization: false
 ```
+
+### Dedicated pools (standby GPUs and similar)
+
+For a pool that should be on **only while its own work exists**, for example a GPU machine
+woken for transcode Jobs, set these three options:
+
+```yaml
+scaleUp:
+  requireExplicitSelection: true           # only pods that target the pool can wake it
+scaleDown:
+  ignoreDaemonSetUtilization: true         # DaemonSets don't keep it on
+  ignoreNonSelectingPodUtilization: true   # guests (e.g. CI runners) don't keep it on
+```
+
+- **Targeting the pool:** a pod targets it when its `nodeSelector`, or every required
+  node-affinity term (`In` with exactly that value), requires all of the pool's
+  `nodeSelector.matchLabels`. Pods without such a selector never power the pool on, even when
+  they're Unschedulable and would fit.
+- **What counts as load:** utilization then counts only the pods that target the pool. Guest
+  pods are still drained before power-off, and they must fit on the remaining online members
+  or on **schedulable nodes outside every pool** (such as an always-on base). The machine
+  stays on if they don't fit.
+- **Protecting running work:** give that work (e.g. the Jobs) the annotation
+  `hardware-autoscaler.safewords.com/safe-to-evict: "false"`. A node running such a pod is
+  never considered idle.
+- **Guests you can't interrupt:** guest pods are evicted at power-off, so a CI runner in the
+  middle of a job fails. Either annotate such pods `safe-to-evict: "false"`, or keep them off
+  the machine entirely with a `NoSchedule` taint that only the pool's workloads tolerate.
+  DaemonSets that must run there (CNI and CSI agents, etc.) need the toleration too.
+
+### Node fencing
+
+Just before powering a machine off, the operator annotates its Node with
+`hardware-autoscaler.safewords.com/powered-off: <RFC 3339 time>`. Tools that fence
+unresponsive nodes, for example by adding the `node.kubernetes.io/out-of-service` taint,
+should **skip nodes carrying this annotation**: an intentionally powered-off node isn't a
+failed one.
+
+When the operator powers the machine back on and its Node is Ready, it removes the
+annotation. It also removes any `out-of-service` taint, but only from nodes carrying its own
+annotation, so it never undoes a fence placed on a genuinely failed node.
 
 The scheduling model covers resource requests (CPU, memory, pod count),
 `nodeSelector`, required node affinity, and taints and tolerations. It ignores

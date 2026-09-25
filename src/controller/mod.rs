@@ -13,7 +13,7 @@ use kube::{Api, Client, Resource, ResourceExt};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::crd::{CORDONED_BY_ANNOTATION, NodePowerManagementConfig, NodeScalingPool};
+use crate::crd::{CORDONED_BY_ANNOTATION, NodePowerManagementConfig, NodeScalingPool, POWERED_OFF_ANNOTATION};
 use crate::drivers::DriverContext;
 use crate::identity::IdentityCheck;
 use crate::metrics::Metrics;
@@ -167,6 +167,36 @@ pub async fn cordon(client: &Client, node: &Node) -> Result<(), Error> {
     api.patch(&node.name_any(), &PatchParams::default(), &Patch::Merge(patch))
         .await?;
     Ok(())
+}
+
+const OUT_OF_SERVICE_TAINT: &str = "node.kubernetes.io/out-of-service";
+
+/// Marks a Node as deliberately powered off by the operator, so node fencing
+/// tools can tell it apart from a failed node.
+pub async fn mark_powered_off(client: &Client, node: &str, now: chrono::DateTime<chrono::Utc>) -> Result<(), Error> {
+    let api: Api<Node> = Api::all(client.clone());
+    let patch = json!({"metadata": {"annotations": {POWERED_OFF_ANNOTATION: now.to_rfc3339()}}});
+    api.patch(node, &PatchParams::default(), &Patch::Merge(patch)).await?;
+    Ok(())
+}
+
+/// After the operator powered a machine back on: removes the powered-off
+/// marker and any `out-of-service` fence taint added while it was off. Only
+/// acts on Nodes carrying the marker, so genuine fences are left alone.
+pub async fn clear_powered_off(client: &Client, node: &Node) -> Result<bool, Error> {
+    if !node.annotations().contains_key(POWERED_OFF_ANNOTATION) {
+        return Ok(false);
+    }
+    let api: Api<Node> = Api::all(client.clone());
+    let taints = node.spec.as_ref().and_then(|s| s.taints.clone()).unwrap_or_default();
+    let mut patch = json!({"metadata": {"annotations": {POWERED_OFF_ANNOTATION: null}}});
+    if taints.iter().any(|t| t.key == OUT_OF_SERVICE_TAINT) {
+        let kept: Vec<_> = taints.into_iter().filter(|t| t.key != OUT_OF_SERVICE_TAINT).collect();
+        patch["spec"] = json!({ "taints": kept });
+    }
+    api.patch(&node.name_any(), &PatchParams::default(), &Patch::Merge(patch))
+        .await?;
+    Ok(true)
 }
 
 /// Uncordons a node only if the operator cordoned it.

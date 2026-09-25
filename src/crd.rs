@@ -23,6 +23,13 @@ pub const CORDONED_BY_ANNOTATION: &str = "hardware-autoscaler.safewords.com/cord
 /// equivalent `cluster-autoscaler.kubernetes.io/safe-to-evict` is honoured too.
 pub const SAFE_TO_EVICT_ANNOTATION: &str = "hardware-autoscaler.safewords.com/safe-to-evict";
 
+/// Node annotation set (with an RFC 3339 timestamp) while the operator has
+/// deliberately powered the machine off. Node fencing tools should skip nodes
+/// carrying it: an intentionally powered-off node is not a failed one. Removed,
+/// together with any `node.kubernetes.io/out-of-service` taint, once the
+/// operator has powered the machine back on and the Node is Ready.
+pub const POWERED_OFF_ANNOTATION: &str = "hardware-autoscaler.safewords.com/powered-off";
+
 // ---------------------------------------------------------------------------
 // NodePowerManagementConfig
 // ---------------------------------------------------------------------------
@@ -485,6 +492,12 @@ pub struct ScaleUpSpec {
     /// Unschedulable pods younger than this are ignored (lets the scheduler settle).
     #[serde(default = "default_pending_grace")]
     pub pending_pod_grace_seconds: u64,
+    /// Only count pending pods that explicitly target this pool: their
+    /// `nodeSelector` (or every required node-affinity term) must require all of
+    /// the pool's `nodeSelector.matchLabels`. Keeps unrelated pods (CI runners,
+    /// overflow from other nodes) from powering on a dedicated pool such as GPUs.
+    #[serde(default)]
+    pub require_explicit_selection: bool,
     /// Maximum machines powered on per autoscaler cycle.
     #[serde(default = "default_scale_up_step")]
     pub max_nodes_per_step: u32,
@@ -496,6 +509,7 @@ impl Default for ScaleUpSpec {
             enabled: true,
             pending_pod_grace_seconds: default_pending_grace(),
             max_nodes_per_step: default_scale_up_step(),
+            require_explicit_selection: false,
         }
     }
 }
@@ -518,6 +532,15 @@ pub struct ScaleDownSpec {
     /// Do not retry a node whose drain failed within this many seconds.
     #[serde(default = "default_drain_backoff")]
     pub drain_failure_backoff_seconds: u64,
+    /// Leave DaemonSet pods out of the utilization calculation (they run on every
+    /// eligible node anyway), like cluster-autoscaler's --ignore-daemonsets-utilization.
+    #[serde(default)]
+    pub ignore_daemon_set_utilization: bool,
+    /// Leave pods that do not explicitly target this pool out of the utilization
+    /// calculation: they are guests that get drained elsewhere, not a reason to
+    /// keep the machine powered on.
+    #[serde(default)]
+    pub ignore_non_selecting_pod_utilization: bool,
     /// Maximum machines concurrently being scaled down.
     #[serde(default = "default_scale_down_step")]
     pub max_nodes_per_step: u32,
@@ -532,6 +555,8 @@ impl Default for ScaleDownSpec {
             delay_after_scale_up_seconds: default_delay_after_scale_up(),
             drain_failure_backoff_seconds: default_drain_backoff(),
             max_nodes_per_step: default_scale_down_step(),
+            ignore_daemon_set_utilization: false,
+            ignore_non_selecting_pod_utilization: false,
         }
     }
 }

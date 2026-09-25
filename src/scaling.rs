@@ -55,11 +55,29 @@ pub struct Member {
     pub allocatable: ResourceAmounts,
     /// Sum of requests of all non-terminated pods bound to the node.
     pub requested: ResourceAmounts,
+    /// The part of `requested` that counts towards utilization (pool options can
+    /// leave out DaemonSet pods and pods that do not target the pool).
+    pub counted: ResourceAmounts,
     /// Pods that would have to be rescheduled if this node went away.
     pub movable_pods: Vec<PodView>,
     /// Pods that block powering the node off.
     pub blocking_pods: Vec<String>,
     pub drain_failed_at: Option<DateTime<Utc>>,
+}
+
+/// A schedulable node outside every scaling pool: somewhere evicted pods can
+/// go when a member powers off.
+#[derive(Clone, Debug)]
+pub struct ExternalNode {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+    pub taints: Vec<Taint>,
+    /// allocatable minus the requests of the pods already running there.
+    pub free: ResourceAmounts,
+}
+
+fn external_key(name: &str) -> String {
+    format!("external/{name}")
 }
 
 pub struct PoolSnapshot<'a> {
@@ -70,6 +88,8 @@ pub struct PoolSnapshot<'a> {
     pub now: DateTime<Utc>,
     pub last_scale_up: Option<DateTime<Utc>>,
     pub unneeded_since: BTreeMap<String, DateTime<Utc>>,
+    /// Nodes outside every pool that can absorb evicted pods.
+    pub external: Vec<ExternalNode>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -155,6 +175,29 @@ fn pod_fits(pod: &PodView, m: &Member, free: &ResourceAmounts) -> bool {
 }
 
 impl PodView {
+    /// Whether the pod explicitly targets nodes carrying all of `pool`'s
+    /// `matchLabels`: through its `nodeSelector`, or through required node
+    /// affinity where every term requires the label (`In` with exactly that
+    /// value). A pool without `matchLabels` is never explicitly selected.
+    pub fn explicitly_selects(&self, pool: &crate::crd::NodeSelector) -> bool {
+        if pool.match_labels.is_empty() {
+            return false;
+        }
+        pool.match_labels.iter().all(|(key, value)| {
+            self.node_selector.get(key) == Some(value)
+                || (!self.affinity_terms.is_empty()
+                    && self.affinity_terms.iter().all(|term| {
+                        term.iter().any(|r| {
+                            r.key == *key
+                                && r.operator == "In"
+                                && r.values
+                                    .as_deref()
+                                    .is_some_and(|v| !v.is_empty() && v.iter().all(|x| x == value))
+                        })
+                    }))
+        })
+    }
+
     pub fn from_pod(pod: &Pod) -> Self {
         let spec = pod.spec.as_ref();
         let affinity_terms = spec
@@ -289,6 +332,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         .pending
         .iter()
         .filter(|p| p.created.is_none_or(|c| s.now - c >= grace))
+        .filter(|p| !spec.scale_up.require_explicit_selection || p.explicitly_selects(&spec.node_selector))
         .filter(|p| {
             s.members.iter().any(|m| {
                 m.allocatable.fits(&p.requests)
@@ -356,7 +400,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     let threshold = spec.scale_down.utilization_threshold_percent as f64;
     let backoff = Duration::seconds(spec.scale_down.drain_failure_backoff_seconds as i64);
     let is_unneeded = |m: &Member| {
-        m.allocatable.utilization_percent(&m.requested) < threshold
+        m.allocatable.utilization_percent(&m.counted) < threshold
             && m.blocking_pods.is_empty()
             && m.drain_failed_at.is_none_or(|t| s.now - t >= backoff)
     };
@@ -393,7 +437,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     let step = spec.scale_down.max_nodes_per_step.max(1) as usize;
     if blocked_reason.is_none() && (leaving < step || over_max > 0) {
         let unneeded_for = Duration::seconds(spec.scale_down.unneeded_seconds as i64);
-        let util = |m: &Member| m.allocatable.utilization_percent(&m.requested);
+        let util = |m: &Member| m.allocatable.utilization_percent(&m.counted);
         let mut eligible: Vec<&Member> = candidates
             .iter()
             .copied()
@@ -408,13 +452,17 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         eligible.sort_by(|a, b| util(a).total_cmp(&util(b)));
 
         let mut removed: BTreeSet<String> = BTreeSet::new();
-        // Free capacity on nodes that stay online (including non-auto online members).
+        // Where evicted pods could go: online pool members, plus schedulable nodes
+        // outside any scaling pool (e.g. an always-on base) that never power off.
         let mut free: BTreeMap<String, ResourceAmounts> = s
             .members
             .iter()
             .filter(|m| m.state == MemberState::Online)
             .map(|m| (m.name.clone(), m.allocatable.minus(&m.requested)))
             .collect();
+        for e in &s.external {
+            free.insert(external_key(&e.name), e.free);
+        }
         let budget = if over_max > 0 {
             over_max.max(step.saturating_sub(leaving))
         } else {
@@ -428,18 +476,27 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             // Simulate moving this node's pods to the remaining online nodes.
             let mut trial = free.clone();
             trial.remove(&m.name);
-            let targets: Vec<&Member> = s
+            let mut targets: Vec<(String, &BTreeMap<String, String>, &[Taint])> = s
                 .members
                 .iter()
                 .filter(|o| o.state == MemberState::Online && o.name != m.name && !removed.contains(&o.name))
+                .map(|o| (o.name.clone(), &o.labels, o.taints.as_slice()))
                 .collect();
+            targets.extend(
+                s.external
+                    .iter()
+                    .map(|e| (external_key(&e.name), &e.labels, e.taints.as_slice())),
+            );
             let mut pods: Vec<&PodView> = m.movable_pods.iter().collect();
             pods.sort_by_key(|p| std::cmp::Reverse((p.requests.cpu_millis, p.requests.memory_bytes)));
             let all_fit = pods.iter().all(|p| {
-                let slot = targets.iter().find(|o| pod_fits(p, o, &trial[&o.name]));
+                let slot = targets
+                    .iter()
+                    .find(|(key, labels, taints)| trial[key].fits(&p.requests) && pod_matches_node(p, labels, taints))
+                    .map(|(key, _, _)| key.clone());
                 match slot {
-                    Some(o) => {
-                        let f = trial.get_mut(&o.name).unwrap();
+                    Some(key) => {
+                        let f = trial.get_mut(&key).unwrap();
                         *f = f.minus(&p.requests);
                         true
                     }
@@ -490,6 +547,7 @@ mod tests {
                 enabled: true,
                 pending_pod_grace_seconds: 30,
                 max_nodes_per_step: 3,
+                require_explicit_selection: false,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -498,6 +556,8 @@ mod tests {
                 delay_after_scale_up_seconds: 600,
                 drain_failure_backoff_seconds: 1800,
                 max_nodes_per_step: 1,
+                ignore_daemon_set_utilization: false,
+                ignore_non_selecting_pod_utilization: false,
             },
         }
     }
@@ -523,6 +583,11 @@ mod tests {
                 pods: 110,
             },
             requested: ResourceAmounts {
+                cpu_millis: used_cpu,
+                memory_bytes: 0,
+                pods: 0,
+            },
+            counted: ResourceAmounts {
                 cpu_millis: used_cpu,
                 memory_bytes: 0,
                 pods: 0,
@@ -556,6 +621,7 @@ mod tests {
             now,
             last_scale_up: None,
             unneeded_since: BTreeMap::new(),
+            external: vec![],
         }
     }
 
@@ -876,6 +942,184 @@ mod tests {
                 serde_json::json!({"metadata": {"name": "a"}, "status": {"phase": "Succeeded"}})
             )),
             DrainClass::Ignore
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedicated_pool_tests {
+    //! A single-machine GPU pool that only GPU work may wake, with guest pods
+    //! and DaemonSets that must not keep it on (the "standby GPU" setup).
+    use super::*;
+    use crate::crd::{NodeSelector, ScaleDownSpec, ScaleUpSpec};
+
+    const GI: i64 = 1 << 30;
+
+    fn gpu_spec() -> NodeScalingPoolSpec {
+        NodeScalingPoolSpec {
+            node_selector: NodeSelector {
+                match_labels: BTreeMap::from([("example.com/gpu".to_string(), "true".to_string())]),
+                match_expressions: vec![],
+            },
+            min_online: 0,
+            max_online: Some(1),
+            scale_up: ScaleUpSpec {
+                enabled: true,
+                pending_pod_grace_seconds: 15,
+                max_nodes_per_step: 1,
+                require_explicit_selection: true,
+            },
+            scale_down: ScaleDownSpec {
+                enabled: true,
+                utilization_threshold_percent: 10,
+                unneeded_seconds: 900,
+                delay_after_scale_up_seconds: 900,
+                drain_failure_backoff_seconds: 1800,
+                max_nodes_per_step: 1,
+                ignore_daemon_set_utilization: true,
+                ignore_non_selecting_pod_utilization: true,
+            },
+        }
+    }
+
+    fn cpu(millis: i64) -> ResourceAmounts {
+        ResourceAmounts {
+            cpu_millis: millis,
+            memory_bytes: GI,
+            pods: 1,
+        }
+    }
+
+    fn gpu_box(state: MemberState) -> Member {
+        Member {
+            name: "gpu-1".into(),
+            state,
+            auto: true,
+            labels: BTreeMap::from([("example.com/gpu".to_string(), "true".to_string())]),
+            taints: vec![],
+            allocatable: ResourceAmounts {
+                cpu_millis: 12000,
+                memory_bytes: 64 * GI,
+                pods: 110,
+            },
+            requested: ResourceAmounts::default(),
+            counted: ResourceAmounts::default(),
+            movable_pods: vec![],
+            blocking_pods: vec![],
+            drain_failed_at: None,
+        }
+    }
+
+    fn pod(name: &str, selector: &[(&str, &str)], now: DateTime<Utc>) -> PodView {
+        PodView {
+            namespace: "default".into(),
+            name: name.into(),
+            requests: cpu(1000),
+            node_selector: selector.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            created: Some(now - Duration::seconds(60)),
+            ..Default::default()
+        }
+    }
+
+    fn base(free_cpu: i64) -> ExternalNode {
+        ExternalNode {
+            name: "always-on-1".into(),
+            labels: BTreeMap::new(),
+            taints: vec![],
+            free: ResourceAmounts {
+                cpu_millis: free_cpu,
+                memory_bytes: 32 * GI,
+                pods: 100,
+            },
+        }
+    }
+
+    fn snap<'a>(
+        spec: &'a NodeScalingPoolSpec,
+        m: Member,
+        pending: Vec<PodView>,
+        now: DateTime<Utc>,
+    ) -> PoolSnapshot<'a> {
+        PoolSnapshot {
+            spec,
+            members: vec![m],
+            pending,
+            now,
+            last_scale_up: None,
+            unneeded_since: BTreeMap::new(),
+            external: vec![],
+        }
+    }
+
+    #[test]
+    fn ci_pods_do_not_wake_the_pool_but_gpu_jobs_do() {
+        let now = Utc::now();
+        let spec = gpu_spec();
+        let ci = pod("runner", &[], now);
+        let p = plan(&snap(&spec, gpu_box(MemberState::Offline), vec![ci], now));
+        assert!(
+            p.power_on.is_empty(),
+            "an untargeted pod must not power on a dedicated pool"
+        );
+        assert_eq!(p.relevant_pending, 0);
+
+        let job = pod("transcode", &[("example.com/gpu", "true")], now);
+        let p = plan(&snap(&spec, gpu_box(MemberState::Offline), vec![job], now));
+        assert_eq!(p.power_on.len(), 1);
+    }
+
+    #[test]
+    fn required_affinity_counts_as_explicit_selection() {
+        let now = Utc::now();
+        let spec = gpu_spec();
+        let mut job = pod("transcode", &[], now);
+        job.affinity_terms = vec![vec![NodeSelectorRequirement {
+            key: "example.com/gpu".into(),
+            operator: "In".into(),
+            values: Some(vec!["true".into()]),
+        }]];
+        assert!(job.explicitly_selects(&spec.node_selector));
+        // "In [true, false]" also allows non-GPU nodes: not explicit.
+        job.affinity_terms[0][0].values = Some(vec!["true".into(), "false".into()]);
+        assert!(!job.explicitly_selects(&spec.node_selector));
+    }
+
+    #[test]
+    fn guests_move_to_the_always_on_base_so_the_pool_can_power_off() {
+        let now = Utc::now();
+        let spec = gpu_spec();
+        let mut m = gpu_box(MemberState::Online);
+        // A CI runner landed on the GPU box: it is requested load, but not counted.
+        m.requested = cpu(2000);
+        m.counted = ResourceAmounts::default();
+        m.movable_pods = vec![pod("runner", &[], now)];
+        let mut s = snap(&spec, m, vec![], now);
+        s.unneeded_since = BTreeMap::from([("gpu-1".to_string(), now - Duration::seconds(1000))]);
+
+        // Without anywhere to move the runner, the single-machine pool is stuck on.
+        assert!(plan(&s).power_off.is_empty());
+        // With room on the always-on base, it powers off.
+        s.external = vec![base(4000)];
+        assert_eq!(plan(&s).power_off.len(), 1);
+        // But not when the base is full.
+        s.external = vec![base(500)];
+        assert!(plan(&s).power_off.is_empty());
+    }
+
+    #[test]
+    fn running_gpu_job_blocks_power_off() {
+        let now = Utc::now();
+        let spec = gpu_spec();
+        let mut m = gpu_box(MemberState::Online);
+        m.blocking_pods = vec!["default/transcode (annotated safe-to-evict=false)".into()];
+        let mut s = snap(&spec, m, vec![], now);
+        s.unneeded_since = BTreeMap::from([("gpu-1".to_string(), now - Duration::seconds(1000))]);
+        s.external = vec![base(4000)];
+        let p = plan(&s);
+        assert!(p.power_off.is_empty());
+        assert!(
+            !p.unneeded_since.contains_key("gpu-1"),
+            "a node with a running job is not even unneeded"
         );
     }
 }

@@ -18,7 +18,7 @@ use kube::{Api, ResourceExt};
 use serde_json::json;
 use tracing::{info, warn};
 
-use super::{Context, Error, patch_status_diff};
+use super::{Context, Error, node_ready, patch_status_diff};
 use crate::crd::{
     COND_POWER_STATE_CONSISTENT, NodePowerManagementConfig, NodeScalingPool, Phase, PowerPolicy, PowerTarget,
     ResourceAmounts, ScalingDecision,
@@ -26,7 +26,8 @@ use crate::crd::{
 use crate::membership::{self, Membership};
 use crate::resources::{node_allocatable, pod_requests};
 use crate::scaling::{
-    DrainClass, Member, MemberState, PodView, PoolSnapshot, drain_class, is_active, is_unschedulable, plan,
+    DrainClass, ExternalNode, Member, MemberState, PodView, PoolSnapshot, drain_class, is_active, is_daemonset_pod,
+    is_unschedulable, plan,
 };
 
 const INTERVAL: Duration = Duration::from_secs(15);
@@ -70,7 +71,9 @@ pub fn member_state(mn: &NodePowerManagementConfig, pool: &str) -> MemberState {
     }
 }
 
-fn build_member(mn: &NodePowerManagementConfig, pool: &str, ctx: &Context) -> Option<Member> {
+fn build_member(mn: &NodePowerManagementConfig, pool: &NodeScalingPool, ctx: &Context) -> Option<Member> {
+    let pool_name = pool.name_any();
+    let down = &pool.spec.scale_down;
     let st = mn.status.clone().unwrap_or_default();
     // Membership requires a live Node, so it exists here.
     let node = ctx.node(&mn.spec.node_name)?;
@@ -81,16 +84,24 @@ fn build_member(mn: &NodePowerManagementConfig, pool: &str, ctx: &Context) -> Op
         .unwrap_or_default();
 
     let mut requested = ResourceAmounts::default();
+    let mut counted = ResourceAmounts::default();
     let mut movable_pods = Vec::new();
     let mut blocking_pods = Vec::new();
     for pod in ctx.pods_on(&mn.spec.node_name) {
         if !is_active(&pod) {
             continue;
         }
-        requested.add(&pod_requests(&pod));
+        let requests = pod_requests(&pod);
+        requested.add(&requests);
+        let view = PodView::from_pod(&pod);
+        let ignored = (down.ignore_daemon_set_utilization && is_daemonset_pod(&pod))
+            || (down.ignore_non_selecting_pod_utilization && !view.explicitly_selects(&pool.spec.node_selector));
+        if !ignored {
+            counted.add(&requests);
+        }
         match drain_class(&pod) {
             DrainClass::Ignore => {}
-            DrainClass::Evict => movable_pods.push(PodView::from_pod(&pod)),
+            DrainClass::Evict => movable_pods.push(view),
             DrainClass::Block(why) => blocking_pods.push(format!(
                 "{}/{} ({why})",
                 pod.namespace().unwrap_or_default(),
@@ -101,16 +112,50 @@ fn build_member(mn: &NodePowerManagementConfig, pool: &str, ctx: &Context) -> Op
 
     Some(Member {
         name: mn.name_any(),
-        state: member_state(mn, pool),
+        state: member_state(mn, &pool_name),
         auto: mn.spec.power_policy == PowerPolicy::Auto,
         labels: node.labels().clone(),
         taints,
         allocatable,
         requested,
+        counted,
         movable_pods,
         blocking_pods,
         drain_failed_at: st.drain_failed_at,
     })
+}
+
+/// Schedulable nodes that no scaling pool can power off: Ready, not cordoned,
+/// and without an `Auto` NodePowerManagementConfig. Pods evicted from a member
+/// may move there (e.g. to an always-on base) when deciding scale-down.
+fn external_nodes(ctx: &Context) -> Vec<ExternalNode> {
+    let auto_managed: std::collections::BTreeSet<String> = ctx
+        .node_power_management_configs
+        .state()
+        .iter()
+        .filter(|c| c.spec.power_policy == PowerPolicy::Auto)
+        .map(|c| c.spec.node_name.clone())
+        .collect();
+    ctx.nodes
+        .state()
+        .iter()
+        .filter(|n| !auto_managed.contains(&n.name_any()))
+        .filter(|n| node_ready(n) && !n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false))
+        .map(|n| {
+            let mut used = ResourceAmounts::default();
+            for pod in ctx.pods_on(&n.name_any()) {
+                if is_active(&pod) {
+                    used.add(&pod_requests(&pod));
+                }
+            }
+            ExternalNode {
+                name: n.name_any(),
+                labels: n.labels().clone(),
+                taints: n.spec.as_ref().and_then(|s| s.taints.clone()).unwrap_or_default(),
+                free: node_allocatable(n).minus(&used),
+            }
+        })
+        .collect()
 }
 
 async fn decide(
@@ -152,7 +197,8 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
             _ => {}
         }
     }
-    let members: Vec<Member> = managed.iter().filter_map(|mn| build_member(mn, &name, &ctx)).collect();
+    let members: Vec<Member> = managed.iter().filter_map(|mn| build_member(mn, &pool, &ctx)).collect();
+    let external = external_nodes(&ctx);
     let pending: Vec<PodView> = ctx
         .pods
         .state()
@@ -168,6 +214,7 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
         now,
         last_scale_up: old.last_scale_up_time,
         unneeded_since: old.unneeded_since.clone(),
+        external,
     };
     let result = plan(&snapshot);
 
