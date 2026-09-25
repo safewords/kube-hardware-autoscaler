@@ -46,6 +46,13 @@ struct DriverArgs {
     /// Default image for Wake-on-LAN shutdown pods (must provide sh and nsenter).
     #[arg(long, env = "KHA_SHUTDOWN_IMAGE", default_value = "debian:stable-slim")]
     shutdown_image: String,
+    /// Image for Wake-on-LAN relay pods on neighbouring nodes (this operator's image).
+    #[arg(
+        long,
+        env = "KHA_RELAY_IMAGE",
+        default_value = "ghcr.io/safewords/kube-hardware-autoscaler:latest"
+    )]
+    relay_image: String,
 }
 
 #[derive(Subcommand)]
@@ -60,6 +67,18 @@ enum Command {
         /// Log power actions instead of executing them.
         #[arg(long, env = "KHA_DRY_RUN")]
         dry_run: bool,
+    },
+    /// Send a Wake-on-LAN magic packet from this host (used by relay pods).
+    Wake {
+        /// MAC address of the NIC to wake.
+        #[arg(long)]
+        mac: String,
+        /// UDP port.
+        #[arg(long, default_value_t = 9)]
+        port: u16,
+        /// Broadcast address; defaults to every interface's broadcast address plus 255.255.255.255.
+        #[arg(long)]
+        broadcast: Option<String>,
     },
     /// Print the CustomResourceDefinitions as YAML.
     Crds,
@@ -91,7 +110,8 @@ enum PowerAction {
 }
 
 fn init_logging(json: bool) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,kube=warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,kube_runtime=warn,kube_client=warn"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     if json {
         builder.json().init();
@@ -106,6 +126,7 @@ fn driver_context(client: Client, args: &DriverArgs) -> DriverContext {
         namespace: args.namespace.clone(),
         op_timeout: Duration::from_secs(args.op_timeout_seconds),
         shutdown_image: args.shutdown_image.clone(),
+        relay_image: args.relay_image.clone(),
     }
 }
 
@@ -269,6 +290,14 @@ async fn main() -> anyhow::Result<()> {
             metrics_addr,
             dry_run,
         } => run(drivers, metrics_addr, dry_run).await,
+        Command::Wake { mac, port, broadcast } => {
+            let mac_bytes = kube_hardware_autoscaler::wake::parse_mac(&mac).context("invalid --mac")?;
+            let targets = kube_hardware_autoscaler::wake::targets(broadcast.as_deref(), port)?;
+            let sent = kube_hardware_autoscaler::wake::send(&mac_bytes, &targets, 3).await?;
+            let list: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+            info!(%mac, packets = sent, targets = %list.join(" "), "magic packet sent");
+            Ok(())
+        }
         Command::Crds => {
             // JSON documents (valid YAML): unquoted YAML would let YAML 1.1
             // parsers turn enum values such as `On`/`Off` into booleans.

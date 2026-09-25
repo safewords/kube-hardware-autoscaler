@@ -12,3 +12,4 @@ pub mod membership;
 pub mod metrics;
 pub mod resources;
 pub mod scaling;
+pub mod wake;

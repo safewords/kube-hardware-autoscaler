@@ -59,6 +59,8 @@ spec:
               value: "0.0.0.0:{{ .Values.operator.metricsPort }}"
             - name: KHA_OP_TIMEOUT_SECONDS
               value: {{ .Values.operator.opTimeoutSeconds | quote }}
+            - name: KHA_RELAY_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
             - name: KHA_SHUTDOWN_IMAGE
               value: {{ .Values.operator.shutdownImage | quote }}
             {{- if .Values.operator.dryRun }}

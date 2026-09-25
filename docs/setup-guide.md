@@ -82,8 +82,9 @@ The API server also rejects a `NodePowerManagementConfig` whose `metadata.name` 
   - **Redfish**: HTTPS to the BMC and a user allowed to run `ComputerSystem.Reset`.
   - **PiKVM**: HTTPS to the KVM, with the ATX board wired to the machine.
   - **JetKVM**: the ATX or DC extension, and JetKVM connected to an MQTT broker the operator can reach.
-  - **Wake-on-LAN**: WoL enabled in BIOS/NIC, and the operator running with
-    `hostNetwork: true` on the same L2 segment.
+  - **Wake-on-LAN**: WoL enabled in BIOS/NIC, and either the operator running with
+    `hostNetwork: true` on the same L2 segment, or another node on that segment acting as a relay
+    (see [relays](#waking-machines-on-other-segments-or-sites-relays)), e.g. across sites linked by a VPN.
 - BIOS power-restore policy should be *stay off* (or *last state*), so that a
   power blip doesn't bring machines up behind the operator's back.
 - The operator itself must not run on a machine it may power off. Pin it to the
@@ -435,8 +436,10 @@ No credentials are needed.
 | Field | Default | |
 |---|---|---|
 | `macAddress` | required | `aa:bb:cc:dd:ee:ff` |
-| `broadcastAddress` | `255.255.255.255` | use the subnet broadcast when routing is involved |
+| `broadcastAddress` | automatic | when omitted, each sender uses every interface's broadcast address plus `255.255.255.255` |
 | `port` | `9` | |
+| `sendFromOperator` | `true` | send from the operator's own node |
+| `relay` | none | also send from neighbouring nodes (see below) |
 | `shutdownImage` | operator default | needs `sh` + `nsenter` |
 
 Power on sends a magic packet. Power off runs a privileged, `hostPID` pod on the node
@@ -445,6 +448,40 @@ ID and does nothing if the host has rebooted since, so a leftover pod can never 
 a freshly booted machine. The power state is inferred from the node's `Ready` condition,
 which lags a real shutdown by the kubelet grace period (about 40 s). Add a `ping` interface
 in front for an accurate reading.
+
+#### Waking machines on other segments or sites (relays)
+
+A magic packet is a broadcast. It doesn't cross routers or VPN tunnels, so the operator can
+only wake machines on its own node's network segment. With `relay`, the operator starts a
+short-lived pod on one or more **neighbouring nodes**, and each one sends the packet on
+every network interface of its node. A machine at another site is woken by nodes that share
+its network.
+
+```yaml
+- driver: wakeOnLan
+  config:
+    macAddress: "aa:bb:cc:dd:ee:07"
+    sendFromOperator: false            # the operator runs at another site
+    relay:
+      sameTopologyAs: topology.kubernetes.io/zone   # nodes at the same site
+      nodeSelector: {}                 # optionally restrict which nodes may relay
+      maxNodes: 3                      # default
+```
+
+- **Candidate relays** are Ready nodes other than the target that the operator hasn't powered
+  off.
+- **`sameTopologyAs`** keeps only candidates whose value for that label equals the target
+  Node's value. The target's Node object keeps its labels while the machine is off. Label
+  each node with its site (the standard `topology.kubernetes.io/zone` works well). If the
+  target lacks the label, no relay is chosen.
+- **Without `sameTopologyAs`**, the packet fans out from up to `maxNodes` nodes anywhere in the
+  cluster. That's topology-agnostic: whichever relay shares the target's network delivers it.
+- **How relays run:** they talk only to the Kubernetes API, with no listening ports or extra
+  daemons. Each is a pod using the operator's own image (`kube-hardware-autoscaler wake`),
+  with `hostNetwork`, non-root, and all capabilities dropped. The pods finish within seconds,
+  and the next wake replaces them.
+- **Mixing both:** with `sendFromOperator: true` (the default) *and* `relay`, the packet
+  goes out both ways. The wake succeeds if either path sends it.
 
 ### `ping`
 

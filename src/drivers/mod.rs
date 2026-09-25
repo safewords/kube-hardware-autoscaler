@@ -201,6 +201,8 @@ pub struct DriverContext {
     pub op_timeout: Duration,
     /// Default image for Wake-on-LAN shutdown pods.
     pub shutdown_image: String,
+    /// Image for Wake-on-LAN relay pods (the operator image; runs `wake`).
+    pub relay_image: String,
 }
 
 async fn load_credentials(ctx: &DriverContext, r: &CredentialsRef) -> Result<Credentials> {

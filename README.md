@@ -42,8 +42,9 @@ spec:
 ## Features
 
 - **Driver catalog:** `ipmi` (native IPMI v2.0/RMCP+, no `ipmitool`), `redfish`, `pikvm`,
-  `nanokvm`, `jetkvm` (via its MQTT integration), `wakeOnLan` (with an in-band shutdown
-  pod) and `ping` (status only, via TCP or ICMP). Adding a driver takes one file and one
+  `nanokvm`, `jetkvm` (via its MQTT integration), `wakeOnLan` (with an in-band shutdown pod, and
+  relays on neighbouring nodes for machines on other network segments or sites
+  such as VPN-linked locations) and `ping` (status only, via TCP or ICMP). Adding a driver takes one file and one
   catalog line, and the CRD doesn't change.
 - **Several interfaces per machine:** tried in priority order, with per-interface timeouts
   and per-operation `actions`. Degraded interfaces show up in status.

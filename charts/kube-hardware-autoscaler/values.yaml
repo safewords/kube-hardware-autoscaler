@@ -24,7 +24,7 @@ operator:
   # -- Emit JSON logs.
   logJson: false
   # -- RUST_LOG-style filter.
-  logLevel: info,kube=warn
+  logLevel: info,kube_runtime=warn,kube_client=warn
   # -- Port of the /metrics, /healthz and /readyz endpoints.
   metricsPort: 8080
 

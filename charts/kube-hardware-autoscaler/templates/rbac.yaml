@@ -61,7 +61,7 @@ subjects:
     namespace: {{ .Release.Namespace }}
 ---
 # Credentials are only ever read from the operator's own namespace, and
-# Wake-on-LAN shutdown pods are created there.
+# Wake-on-LAN shutdown and relay pods are created there.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
