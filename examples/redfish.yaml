@@ -1,0 +1,25 @@
+# A server with a Redfish BMC (iDRAC, iLO, XClarity, OpenBMC, ...).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: idrac-worker-2
+  namespace: kube-hardware-autoscaler
+type: Opaque
+stringData:
+  username: root
+  password: changeme
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: worker-2
+spec:
+  nodeName: worker-2
+  powerInterfaces:
+    - driver: redfish
+      credentialsSecretRef:
+        name: idrac-worker-2
+      config:
+        endpoint: https://192.168.10.12
+        # systemId: System.Embedded.1   # discovered automatically when omitted
+        insecureSkipVerify: true        # BMCs usually ship self-signed certificates

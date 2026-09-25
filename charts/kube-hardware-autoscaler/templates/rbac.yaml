@@ -1,0 +1,95 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kube-hardware-autoscaler.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- if .Values.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["hardware-autoscaler.safewords.com"]
+    resources: ["nodepowermanagementconfigs", "nodescalingpools"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["hardware-autoscaler.safewords.com"]
+    resources: ["nodepowermanagementconfigs/status", "nodescalingpools/status"]
+    verbs: ["get", "patch", "update"]
+  # Cordon/uncordon.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Demand detection and draining.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  # Kubelet leases: detect an interface reporting Off while the node is alive.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kube-hardware-autoscaler.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Credentials are only ever read from the operator's own namespace, and
+# Wake-on-LAN shutdown pods are created there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kube-hardware-autoscaler.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

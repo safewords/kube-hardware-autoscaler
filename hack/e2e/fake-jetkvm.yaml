@@ -1,0 +1,94 @@
+# End-to-end test fixtures: an MQTT broker and a fake JetKVM that behaves like
+# the real device's MQTT integration (retained ATX state, toggling power button).
+# Used by hack/e2e/run.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto
+  namespace: kube-hardware-autoscaler
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  namespace: kube-hardware-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mosquitto }
+  template:
+    metadata:
+      labels: { app: mosquitto }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: kha-e2e }
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2
+          ports: [{ containerPort: 1883 }]
+          volumeMounts:
+            - { name: conf, mountPath: /mosquitto/config }
+      volumes:
+        - name: conf
+          configMap: { name: mosquitto }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  namespace: kube-hardware-autoscaler
+spec:
+  selector: { app: mosquitto }
+  ports: [{ port: 1883, targetPort: 1883 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-jetkvm
+  namespace: kube-hardware-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fake-jetkvm }
+  template:
+    metadata:
+      labels: { app: fake-jetkvm }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: kha-e2e }
+      containers:
+        - name: jetkvm
+          image: eclipse-mosquitto:2
+          env:
+            - { name: BASE, value: jetkvm/fake01 }
+            - { name: BROKER, value: mosquitto.kube-hardware-autoscaler.svc }
+          command: ["sh", "-c"]
+          args:
+            - |
+              # Power state lives in a file so the command loop and the
+              # republisher share it. Like the real device, state and
+              # availability are (re)published retained, also after broker restarts.
+              echo true > /tmp/power
+              publish() {
+                mosquitto_pub -h "$BROKER" -r -t "$BASE/status" -m '{"online":true}' &&
+                mosquitto_pub -h "$BROKER" -r -t "$BASE/atx/state" -m "{\"power\":$(cat /tmp/power),\"hdd\":false}"
+              }
+              until publish; do sleep 1; done
+              ( while sleep 5; do publish || true; done ) &
+              echo "fake jetkvm up, power=$(cat /tmp/power)"
+              while true; do
+                mosquitto_sub -h "$BROKER" -t "$BASE/atx_power_short/set" -t "$BASE/atx_power_long/set" -v |
+                while read -r topic payload; do
+                  state=$(cat /tmp/power)
+                  case "$topic" in
+                    */atx_power_short/set) if [ "$state" = true ]; then state=false; else state=true; fi ;;
+                    */atx_power_long/set) state=false ;;
+                  esac
+                  echo "$state" > /tmp/power
+                  echo "command $topic -> power=$state"
+                  publish
+                done
+                sleep 1
+              done

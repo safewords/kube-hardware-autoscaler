@@ -1,0 +1,17 @@
+kube-hardware-autoscaler is running in namespace {{ .Release.Namespace }}{{ if .Values.operator.dryRun }} in DRY-RUN mode (no power actions are executed){{ end }}.
+
+Credential secrets must live in this namespace ({{ .Release.Namespace }}).
+
+Check the available drivers and their config schemas:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "kube-hardware-autoscaler.fullname" . }} -- kube-hardware-autoscaler drivers --schemas
+
+Watch machines and pools:
+  kubectl get nodepowermanagementconfigs,nodescalingpools
+
+Verify a machine's credentials without waiting for the autoscaler:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "kube-hardware-autoscaler.fullname" . }} -- kube-hardware-autoscaler power <nodepowermanagementconfig> status
+{{- if not .Values.hostNetwork }}
+
+Note: hostNetwork is disabled. Wake-on-LAN packets usually cannot leave the pod
+network; set hostNetwork=true if you use the wakeOnLan driver.
+{{- end }}

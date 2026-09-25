@@ -1,0 +1,54 @@
+# The worker node is "powered" by a fake JetKVM. Its first interface is an
+# unreachable IPMI BMC, so every operation must fall back to JetKVM.
+# Pool membership comes from the Node label hardware-autoscaler.safewords.com/pool=e2e
+# (applied by run.sh), not from the NodePowerManagementConfig.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bmc-unreachable
+  namespace: kube-hardware-autoscaler
+type: Opaque
+stringData:
+  username: ADMIN
+  password: nope
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: kha-e2e-m02            # must equal nodeName
+spec:
+  nodeName: kha-e2e-m02
+  powerInterfaces:
+    - name: bmc
+      driver: ipmi
+      timeoutSeconds: 3
+      credentialsSecretRef: { name: bmc-unreachable }
+      config:
+        address: 192.0.2.1            # TEST-NET-1: guaranteed unreachable
+        requestTimeoutMs: 500
+        attempts: 1
+    - name: kvm
+      driver: jetkvm
+      config:
+        broker: mqtt://mosquitto.kube-hardware-autoscaler.svc:1883
+        baseTopic: jetkvm/fake01
+  lifecycle:
+    drainTimeoutSeconds: 60
+    shutdownTimeoutSeconds: 30
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodeScalingPool
+metadata:
+  name: e2e
+spec:
+  nodeSelector:
+    matchLabels:
+      hardware-autoscaler.safewords.com/pool: e2e
+  minOnline: 0
+  maxOnline: 1
+  scaleUp:
+    pendingPodGraceSeconds: 5
+  scaleDown:
+    utilizationThresholdPercent: 50
+    unneededSeconds: 20
+    delayAfterScaleUpSeconds: 20

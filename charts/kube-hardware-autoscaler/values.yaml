@@ -1,0 +1,118 @@
+# -- Operator image.
+image:
+  repository: ghcr.io/safewords/kube-hardware-autoscaler
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The operator holds per-machine state in the NodePowerManagementConfig status and does not
+# implement leader election: keep a single replica (the Deployment uses the
+# Recreate strategy so two instances never run concurrently).
+replicaCount: 1
+
+operator:
+  # -- Log power actions instead of executing them (safe way to try out scaling policies).
+  dryRun: false
+  # -- Timeout for one management-interface operation, in seconds.
+  opTimeoutSeconds: 60
+  # -- Default image for Wake-on-LAN shutdown pods (needs `sh` and `nsenter`).
+  shutdownImage: debian:stable-slim
+  # -- Emit JSON logs.
+  logJson: false
+  # -- RUST_LOG-style filter.
+  logLevel: info,kube=warn
+  # -- Port of the /metrics, /healthz and /readyz endpoints.
+  metricsPort: 8080
+
+# -- Run the operator in the host network namespace. Required for Wake-on-LAN
+# (broadcast packets must reach the machines' L2 segment) and often helpful when
+# BMCs sit on a management network only reachable from the nodes.
+hostNetwork: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+
+# -- Credential secrets to create in the release namespace. Each entry becomes a
+# Secret usable from `spec.powerInterfaces[].credentialsSecretRef`. Prefer managing
+# secrets out-of-band (sealed-secrets, external-secrets, ...) in production.
+credentials: []
+#  - name: bmc-rack1
+#    username: ADMIN
+#    password: changeme
+#    # Optional IPMI BMC key (Kg) for two-key logins.
+#    kgKey: ""
+
+# -- NodeScalingPools to create (see docs/setup-guide.md for all fields). A pool
+# selects its machines by Node labels; nodeSelector is required and non-empty.
+nodeScalingPools: []
+#  - name: gpu
+#    nodeSelector:
+#      matchLabels:
+#        example.com/gpu: "true"
+#    minOnline: 0
+#    maxOnline: 1
+#    scaleDown:
+#      utilizationThresholdPercent: 10
+#      unneededSeconds: 900
+
+# -- NodePowerManagementConfigs to create. `name` must equal `nodeName`. Pool membership
+# comes from the Node's labels, not from the NodePowerManagementConfig.
+nodePowerManagementConfigs: []
+#  - name: worker-1
+#    nodeName: worker-1
+#    powerPolicy: Auto
+#    powerInterfaces:
+#      - driver: ipmi
+#        credentialsSecretRef:
+#          name: bmc-rack1
+#        config:
+#          address: 192.168.10.11
+
+metrics:
+  service:
+    enabled: true
+    type: ClusterIP
+  serviceMonitor:
+    # -- Create a prometheus-operator ServiceMonitor.
+    enabled: false
+    interval: 30s
+    labels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+# -- Keep the operator off machines it may power down, e.g. by pinning it to
+# control-plane nodes or to nodes that are never part of a NodePool.
+affinity: {}

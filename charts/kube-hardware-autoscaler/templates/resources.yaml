@@ -1,0 +1,39 @@
+{{- range .Values.credentials }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" $ | nindent 4 }}
+type: Opaque
+stringData:
+  username: {{ required "credentials[].username is required" .username | quote }}
+  password: {{ required "credentials[].password is required" .password | quote }}
+  {{- with .kgKey }}
+  kgKey: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- range .Values.nodeScalingPools }}
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodeScalingPool
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" $ | nindent 4 }}
+spec:
+  {{- toYaml (omit . "name") | nindent 2 }}
+{{- end }}
+{{- range .Values.nodePowerManagementConfigs }}
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" $ | nindent 4 }}
+spec:
+  {{- toYaml (omit . "name") | nindent 2 }}
+{{- end }}

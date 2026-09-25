@@ -1,0 +1,39 @@
+# A machine behind a PiKVM with the ATX control board.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pikvm-worker-3
+  namespace: kube-hardware-autoscaler
+type: Opaque
+stringData:
+  username: admin
+  password: changeme
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: worker-3
+spec:
+  nodeName: worker-3
+  powerInterfaces:
+    - driver: pikvm
+      credentialsSecretRef:
+        name: pikvm-worker-3
+      config:
+        endpoint: https://pikvm-3.lan
+        insecureSkipVerify: true
+---
+# A machine without a BMC: woken with Wake-on-LAN, shut down in-band.
+# Requires the operator to run with hostNetwork=true on the same L2 segment and
+# the operator namespace to allow privileged pods.
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: worker-4
+spec:
+  nodeName: worker-4
+  powerInterfaces:
+    - driver: wakeOnLan
+      config:
+        macAddress: "aa:bb:cc:dd:ee:04"
+        broadcastAddress: 192.168.1.255

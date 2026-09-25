@@ -1,0 +1,16 @@
+apiVersion: v2
+name: kube-hardware-autoscaler
+description: Kubernetes Hardware Autoscaler - power bare-metal nodes on and off (IPMI, Redfish, PiKVM, Wake-on-LAN) based on scheduling demand.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/safewords/kube-hardware-autoscaler
+sources:
+  - https://github.com/safewords/kube-hardware-autoscaler
+keywords:
+  - autoscaling
+  - bare-metal
+  - ipmi
+  - redfish
+  - wake-on-lan
+  - power-management

@@ -1,0 +1,32 @@
+# Safety-gate fixtures for hack/e2e/run.sh.
+
+# Wrong wiring: this NodePowerManagementConfig's interface reports the control-plane machine
+# as Off (a retained "power": false on jetkvm/wrong-machine) although its Node
+# is alive. The operator must flag PowerStateConsistent=False and never act,
+# even though powerPolicy AlwaysOn asks for "on".
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: kha-e2e
+spec:
+  nodeName: kha-e2e
+  powerPolicy: AlwaysOn
+  powerInterfaces:
+    - driver: jetkvm
+      config:
+        broker: mqtt://mosquitto.kube-hardware-autoscaler.svc:1883
+        baseTopic: jetkvm/wrong-machine
+---
+# A NodePowerManagementConfig for a Node that does not exist: NodeFound=False, no actions.
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: ghost
+spec:
+  nodeName: ghost
+  powerPolicy: AlwaysOff
+  powerInterfaces:
+    - driver: jetkvm
+      config:
+        broker: mqtt://mosquitto.kube-hardware-autoscaler.svc:1883
+        baseTopic: jetkvm/fake01

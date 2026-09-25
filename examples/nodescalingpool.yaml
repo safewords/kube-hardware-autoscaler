@@ -1,0 +1,32 @@
+# Scaling policy for a class of machines. Membership is explicit and comes
+# from the Nodes' labels: every NodePowerManagementConfig whose Node carries
+# `hardware-autoscaler.safewords.com/pool=workers` is in this pool.
+#
+#   kubectl label node worker-1 worker-2 worker-3 worker-4 hardware-autoscaler.safewords.com/pool=workers
+#
+# Any Node label works (e.g. a hardware-type label such as `gpu=true`); a
+# dedicated opt-in label makes enrolment deliberate. A Node matched by two
+# pools belongs to neither (see NodeScalingPool.status.conflicts).
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodeScalingPool
+metadata:
+  name: workers
+spec:
+  nodeSelector:                 # required, non-empty
+    matchLabels:
+      hardware-autoscaler.safewords.com/pool: workers
+    # matchExpressions:
+    #   - {key: node.kubernetes.io/maintenance, operator: DoesNotExist}
+  minOnline: 1                  # always keep at least one machine on
+  maxOnline: 4                  # never run more than four
+  scaleUp:
+    enabled: true
+    pendingPodGraceSeconds: 30  # ignore pods that have been unschedulable for less than this
+    maxNodesPerStep: 3
+  scaleDown:
+    enabled: true
+    utilizationThresholdPercent: 50   # CPU and memory requests both below 50% => unneeded
+    unneededSeconds: 600              # ... for 10 minutes => power off
+    delayAfterScaleUpSeconds: 600
+    drainFailureBackoffSeconds: 1800
+    maxNodesPerStep: 1

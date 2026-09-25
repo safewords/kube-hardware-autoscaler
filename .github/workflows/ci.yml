@@ -1,0 +1,77 @@
+name: ci
+
+# Runs on the self-hosted ARC scale set `safewords-runners` (DinD mode).
+# Pull requests from forks never run on self-hosted runners: they could execute
+# arbitrary code inside the cluster hosting the runners.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: safewords-runners
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: CRDs in the chart are up to date
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sh hack/gen-crds.sh
+          git diff --exit-code charts/kube-hardware-autoscaler/crds/
+
+  chart:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: safewords-runners
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/kube-hardware-autoscaler
+      - run: helm template t charts/kube-hardware-autoscaler --set hostNetwork=true > /dev/null
+
+  image:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: safewords-runners
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t kube-hardware-autoscaler:ci .
+      - run: docker run --rm kube-hardware-autoscaler:ci drivers
+
+  e2e:
+    # Real image + chart on a 2-node minikube; a fake JetKVM stands in for
+    # hardware. Heavy for a runner pod, so only on main and on demand.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: safewords-runners
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Build image
+        run: docker build -t kube-hardware-autoscaler:dev .
+      - name: Start minikube
+        run: |
+          curl -sSLo /tmp/minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 /tmp/minikube "$HOME/.local/bin/minikube"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/minikube" start -p kha-e2e --nodes 2 --driver=docker --memory 2048 --cpus 2
+          kubectl --context kha-e2e wait --for=condition=Ready node --all --timeout=300s
+      - name: End-to-end test
+        run: sh hack/e2e/run.sh
+      - name: Operator logs on failure
+        if: failure()
+        run: kubectl --context kha-e2e -n kube-hardware-autoscaler logs deploy/kube-hardware-autoscaler --tail=300 || true
+      - name: Clean up
+        if: always()
+        run: minikube delete -p kha-e2e || true

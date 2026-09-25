@@ -1,0 +1,79 @@
+# Multiple power interfaces with fallback.
+#
+# Every operation walks powerInterfaces top to bottom, skips interfaces not
+# enabled for that operation (`actions`), gives each attempt `timeoutSeconds`,
+# and stops at the first success. status.lastPowerAction.via shows which
+# interface did the work; status.interfaceWarnings lists interfaces that failed
+# before a fallback succeeded.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bmc-worker-5
+  namespace: kube-hardware-autoscaler
+type: Opaque
+stringData:
+  username: ADMIN
+  password: changeme
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: worker-5
+spec:
+  nodeName: worker-5
+  powerInterfaces:
+    # Preferred: IPMI for everything, but give up quickly if the BMC is wedged.
+    - name: bmc
+      driver: ipmi
+      timeoutSeconds: 20
+      credentialsSecretRef:
+        name: bmc-worker-5
+      config:
+        address: 192.168.10.15
+    # Fallback for powering on when the BMC is unreachable.
+    - name: wol
+      driver: wakeOnLan
+      actions: [powerOn]
+      config:
+        macAddress: "aa:bb:cc:dd:ee:05"
+    # Last resort: the JetKVM on the same machine, via MQTT.
+    - name: kvm
+      driver: jetkvm
+      timeoutSeconds: 15
+      config:
+        broker: mqtt://mosquitto.home.lan:1883
+        baseTopic: jetkvm/abc123
+---
+# JetKVM with the DC power extension: DC can only cut power hard, so a
+# graceful power off is delegated to an in-band shutdown (Wake-on-LAN driver's
+# shutdown pod), and DC is used for power on and for forced power off.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mqtt-home
+  namespace: kube-hardware-autoscaler
+type: Opaque
+stringData:
+  username: kube-hardware-autoscaler
+  password: changeme
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: mini-1
+spec:
+  nodeName: mini-1
+  powerInterfaces:
+    - name: jetkvm-dc
+      driver: jetkvm
+      credentialsSecretRef:
+        name: mqtt-home          # MQTT broker credentials
+      config:
+        broker: mqtts://mqtt.home.lan:8883
+        baseTopic: jetkvm/def456
+        extension: dc
+    - name: in-band
+      driver: wakeOnLan
+      actions: [powerOff]        # graceful shutdown pod only
+      config:
+        macAddress: "aa:bb:cc:dd:ee:06"

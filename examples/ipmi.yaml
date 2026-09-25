@@ -1,0 +1,34 @@
+# A server with an IPMI BMC, scaled by the "workers" pool.
+# Secrets must live in the operator's namespace (kube-hardware-autoscaler by default).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bmc-worker-1
+  namespace: kube-hardware-autoscaler
+type: Opaque
+stringData:
+  username: ADMIN
+  password: changeme
+  # Optional BMC key (Kg) for two-key logins:
+  # kgKey: "..."
+---
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: NodePowerManagementConfig
+metadata:
+  name: worker-1
+spec:
+  nodeName: worker-1            # the Kubernetes Node this machine registers as
+  powerPolicy: Auto             # Auto | AlwaysOn | AlwaysOff
+  powerInterfaces:              # tried in order; first success wins
+    - driver: ipmi
+      credentialsSecretRef:
+        name: bmc-worker-1
+      config:
+        address: 192.168.10.11     # BMC address
+        port: 623
+        privilegeLevel: ADMINISTRATOR   # or OPERATOR
+  lifecycle:
+    bootTimeoutSeconds: 900
+    drainTimeoutSeconds: 300
+    shutdownTimeoutSeconds: 300
+    forceAfterDrainTimeout: false
