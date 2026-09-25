@@ -132,7 +132,11 @@ impl PowerChain {
     ) -> Result<Outcome<T>> {
         let mut failures = self.unavailable.clone();
         let mut tried = false;
-        for link in self.links.iter().filter(|l| l.interface.handles(action)) {
+        for link in self
+            .links
+            .iter()
+            .filter(|l| l.interface.handles(action) && l.driver.supports(action))
+        {
             tried = true;
             let result = tokio::time::timeout(link.timeout, op(link.driver.as_ref()))
                 .await
@@ -308,5 +312,79 @@ mod tests {
         let chain = PowerChain::from_parts(vec![(i1, d1, t1), (i2, d2, t2)]);
         let out = chain.power_state().await.unwrap();
         assert_eq!((out.value, out.via.as_str()), (PowerState::Off, "b"));
+    }
+}
+
+#[cfg(test)]
+mod status_only_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+
+    /// Like the `ping` driver: reports state, cannot act.
+    struct Probe(Arc<AtomicU32>);
+
+    #[async_trait]
+    impl PowerDriver for Probe {
+        fn supports(&self, action: InterfaceAction) -> bool {
+            action == InterfaceAction::Status
+        }
+        async fn power_state(&self) -> Result<PowerState> {
+            Ok(PowerState::Off)
+        }
+        async fn power_on(&self) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(DriverError::Interface("status only".into()))
+        }
+        async fn power_off(&self, _force: bool) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(DriverError::Interface("status only".into()))
+        }
+    }
+
+    struct Waker;
+
+    #[async_trait]
+    impl PowerDriver for Waker {
+        async fn power_state(&self) -> Result<PowerState> {
+            Ok(PowerState::On)
+        }
+        async fn power_on(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn power_off(&self, _force: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn iface(name: &str) -> PowerInterface {
+        PowerInterface {
+            name: Some(name.into()),
+            driver: "fake".into(),
+            actions: None, // deliberately unrestricted
+            timeout_seconds: None,
+            credentials_secret_ref: None,
+            config: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_only_drivers_are_skipped_for_power_actions() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let chain = PowerChain::from_parts(vec![
+            (iface("ping"), Box::new(Probe(calls.clone())), Duration::from_secs(1)),
+            (iface("wol"), Box::new(Waker), Duration::from_secs(1)),
+        ]);
+        // Status comes from the probe (first in the list) ...
+        let s = chain.power_state().await.unwrap();
+        assert_eq!((s.value, s.via.as_str()), (PowerState::Off, "ping"));
+        // ... but power actions go straight to the next interface, without an error entry.
+        let on = chain.power_on().await.unwrap();
+        assert_eq!(on.via, "wol");
+        assert!(on.failures.is_empty(), "{:?}", on.failures);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

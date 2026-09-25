@@ -33,6 +33,12 @@ metadata:
 spec:
   nodeName: worker-4
   powerInterfaces:
+    # Real power reading: Wake-on-LAN alone only mirrors the Node's Ready condition.
+    - driver: ping
+      actions: [status]
+      config:
+        address: 192.168.1.44
+        method: tcp            # or icmp
     - driver: wakeOnLan
       config:
         macAddress: "aa:bb:cc:dd:ee:04"

@@ -442,7 +442,45 @@ No credentials are needed.
 Power on sends a magic packet. Power off runs a privileged, `hostPID` pod on the node
 that calls `systemctl poweroff` in the host namespaces. That pod stores the node's boot
 ID and does nothing if the host has rebooted since, so a leftover pod can never shut down
-a freshly booted machine. The power state is inferred from the node's `Ready` condition.
+a freshly booted machine. The power state is inferred from the node's `Ready` condition,
+which lags a real shutdown by the kubelet grace period (about 40 s). Add a `ping` interface
+in front for an accurate reading.
+
+### `ping`
+
+Status only: reports **On** when the machine answers on the network and **Off** when it
+doesn't. It never powers anything on or off; the chain skips it for those operations
+automatically. Put it first in `powerInterfaces` to give drivers without a real power reading
+(Wake-on-LAN, or a KVM without the power-LED header wired) an accurate one:
+
+```yaml
+powerInterfaces:
+  - driver: ping
+    actions: [status]
+    config:
+      address: 192.168.10.7     # the machine itself, not its BMC
+      method: icmp              # or tcp (default)
+  - driver: wakeOnLan
+    config: { macAddress: "aa:bb:cc:dd:ee:07" }
+```
+
+| Field | Default | |
+|---|---|---|
+| `address` | required | host name or IP of the machine |
+| `method` | `tcp` | `tcp` or `icmp` (IPv4 only) |
+| `port` | `22` | TCP port for `tcp` |
+| `timeoutMs` | `1000` | per probe |
+| `attempts` | `3` | probes before declaring the machine off |
+
+- **`tcp`:** connects to `port`. Both an accepted and a *refused* connection prove the host is
+  up. Only a timeout or "unreachable" counts as off. Needs no privileges.
+- **`icmp`:** ICMP echo through an unprivileged ping socket. Linux allows these when
+  `net.ipv4.ping_group_range` includes the operator's group (gid 65532). Many distributions
+  allow every group by default; check with `cat /proc/sys/net/ipv4/ping_group_range`. With
+  `hostNetwork: true` the host's setting applies. Otherwise set the sysctl on the pod through
+  `podSecurityContext.sysctls` in the chart values.
+- **No definite answer:** if every probe fails for another reason (for example, no route on the
+  operator's side), the reading is `Unknown`, and the chain falls through to the next interface.
 
 ## Scaling reference
 

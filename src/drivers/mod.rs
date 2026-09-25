@@ -15,6 +15,7 @@ mod ipmi;
 mod jetkvm;
 mod nanokvm;
 mod pikvm;
+mod ping;
 mod redfish;
 mod wol;
 
@@ -28,13 +29,14 @@ use kube::{Api, Client};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
-use crate::crd::{CredentialsRef, PowerInterface, PowerState};
+use crate::crd::{CredentialsRef, InterfaceAction, PowerInterface, PowerState};
 
 pub use chain::{Outcome, PowerChain};
 pub use ipmi::IpmiDriver;
 pub use jetkvm::JetKvmDriver;
 pub use nanokvm::NanoKvmDriver;
 pub use pikvm::PiKvmDriver;
+pub use ping::PingDriver;
 pub use redfish::RedfishDriver;
 pub use wol::WakeOnLanDriver;
 
@@ -46,6 +48,7 @@ pub static CATALOG: &[&dyn DriverFactory] = &[
     &Entry::<JetKvmDriver>(PhantomData),
     &Entry::<NanoKvmDriver>(PhantomData),
     &Entry::<WakeOnLanDriver>(PhantomData),
+    &Entry::<PingDriver>(PhantomData),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +74,11 @@ pub type Result<T, E = DriverError> = std::result::Result<T, E>;
 /// Controls the power of a single machine.
 #[async_trait]
 pub trait PowerDriver: Send + Sync {
+    /// Whether this driver can perform `action` at all (e.g. the `ping` driver
+    /// only reports state). The chain skips drivers for unsupported actions.
+    fn supports(&self, _action: InterfaceAction) -> bool {
+        true
+    }
     /// Queries the current power state.
     async fn power_state(&self) -> Result<PowerState>;
     /// Powers the machine on.
@@ -325,6 +333,19 @@ mod tests {
                 .is_ok()
         );
         assert!(!lookup("wakeOnLan").unwrap().requires_credentials());
+        assert!(
+            lookup("ping")
+                .unwrap()
+                .validate(&json!({"address": "10.0.0.7", "method": "icmp"}))
+                .is_ok()
+        );
+        assert!(
+            lookup("ping")
+                .unwrap()
+                .validate(&json!({"address": "10.0.0.7", "method": "udp"}))
+                .is_err()
+        );
+        assert!(!lookup("ping").unwrap().requires_credentials());
     }
 
     #[test]
