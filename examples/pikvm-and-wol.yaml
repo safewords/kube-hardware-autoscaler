@@ -37,8 +37,7 @@ spec:
     - driver: ping
       actions: [status]
       config:
-        address: 192.168.1.44
-        method: tcp            # or icmp
+        method: tcp          # or icmp; probes the Node's InternalIP unless `address` is set
     - driver: wakeOnLan
       config:
         macAddress: "aa:bb:cc:dd:ee:04"

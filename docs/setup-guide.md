@@ -458,15 +458,14 @@ powerInterfaces:
   - driver: ping
     actions: [status]
     config:
-      address: 192.168.10.7     # the machine itself, not its BMC
-      method: icmp              # or tcp (default)
+      method: icmp              # or tcp (default); address defaults to the Node's IP
   - driver: wakeOnLan
     config: { macAddress: "aa:bb:cc:dd:ee:07" }
 ```
 
 | Field | Default | |
 |---|---|---|
-| `address` | required | host name or IP of the machine |
+| `address` | the Node's `InternalIP` | host name or IP of the machine; IPv4 is preferred. Only needed to probe a different address. |
 | `method` | `tcp` | `tcp` or `icmp` (IPv4 only) |
 | `port` | `22` | TCP port for `tcp` |
 | `timeoutMs` | `1000` | per probe |

@@ -32,8 +32,10 @@ use crate::crd::{InterfaceAction, PowerState};
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PingConfig {
-    /// Host name or IP address of the machine (not its BMC).
-    pub address: String,
+    /// Host name or IP address of the machine (not its BMC). Defaults to the
+    /// Node's `InternalIP` (IPv4 preferred), which the Node keeps while off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     #[serde(default)]
     pub method: PingMethod,
     /// TCP port for the `tcp` method. Defaults to 22 (SSH).
@@ -67,25 +69,54 @@ pub enum PingMethod {
 
 pub struct PingDriver {
     config: PingConfig,
+    node_name: String,
+    /// Used to read the Node's addresses when `address` is not configured.
+    client: Option<kube::Client>,
 }
 
 impl DriverKind for PingDriver {
     const NAME: &'static str = "ping";
-    const DESCRIPTION: &'static str = "Reachability probe (TCP connect or ICMP echo); status only";
+    const DESCRIPTION: &'static str = "Reachability probe (TCP connect or ICMP echo) of the Node's IP; status only";
     const REQUIRES_CREDENTIALS: bool = false;
     type Config = PingConfig;
 
-    fn build(config: PingConfig, _init: &DriverInit<'_>) -> Result<Self> {
-        if config.address.is_empty() {
-            return Err(DriverError::Config("ping address must not be empty".into()));
+    fn build(config: PingConfig, init: &DriverInit<'_>) -> Result<Self> {
+        if config.address.as_deref() == Some("") {
+            return Err(DriverError::Config(
+                "ping address must not be empty (omit it to use the Node's IP)".into(),
+            ));
         }
         if config.attempts == 0 || config.timeout_ms == 0 {
             return Err(DriverError::Config(
                 "ping attempts and timeoutMs must be positive".into(),
             ));
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            node_name: init.node_name.to_string(),
+            client: Some(init.ctx.client.clone()),
+        })
     }
+}
+
+/// Picks the address to probe from a Node: its `InternalIP`s, IPv4 first
+/// (ICMP probing is IPv4-only), then `ExternalIP`s.
+fn node_address(node: &k8s_openapi::api::core::v1::Node) -> Option<IpAddr> {
+    let addrs = node.status.as_ref()?.addresses.as_ref()?;
+    let ips = |kind: &str| -> Vec<IpAddr> {
+        addrs
+            .iter()
+            .filter(|a| a.type_ == kind)
+            .filter_map(|a| a.address.parse::<IpAddr>().ok())
+            .collect()
+    };
+    let mut candidates = ips("InternalIP");
+    candidates.extend(ips("ExternalIP"));
+    candidates
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or(candidates.first())
+        .copied()
 }
 
 /// Outcome of one TCP connection attempt.
@@ -109,10 +140,28 @@ fn tcp_verdict(result: io::Result<()>) -> Option<bool> {
 
 impl PingDriver {
     async fn resolve(&self) -> Result<SocketAddr> {
-        let mut addrs = tokio::net::lookup_host((self.config.address.as_str(), self.config.port)).await?;
-        addrs
-            .next()
-            .ok_or_else(|| DriverError::Interface(format!("cannot resolve {}", self.config.address)))
+        if let Some(address) = &self.config.address {
+            let mut addrs = tokio::net::lookup_host((address.as_str(), self.config.port)).await?;
+            return addrs
+                .next()
+                .ok_or_else(|| DriverError::Interface(format!("cannot resolve {address}")));
+        }
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| DriverError::Config("no address configured and no Kubernetes client".into()))?;
+        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> = kube::Api::all(client);
+        let node = nodes
+            .get_opt(&self.node_name)
+            .await?
+            .ok_or_else(|| DriverError::Interface(format!("Node {} not found; set config.address", self.node_name)))?;
+        let ip = node_address(&node).ok_or_else(|| {
+            DriverError::Interface(format!(
+                "Node {} reports no InternalIP; set config.address",
+                self.node_name
+            ))
+        })?;
+        Ok(SocketAddr::new(ip, self.config.port))
     }
 
     async fn tcp_probe(&self, target: SocketAddr) -> Option<bool> {
@@ -256,13 +305,39 @@ mod tests {
     fn driver(address: &str, port: u16) -> PingDriver {
         PingDriver {
             config: PingConfig {
-                address: address.into(),
+                address: Some(address.into()),
                 method: PingMethod::Tcp,
                 port,
                 timeout_ms: 300,
                 attempts: 1,
             },
+            node_name: "n".into(),
+            client: None,
         }
+    }
+
+    #[test]
+    fn picks_node_internal_ipv4_first() {
+        let node: k8s_openapi::api::core::v1::Node = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "n"},
+            "status": {"addresses": [
+                {"type": "Hostname", "address": "n"},
+                {"type": "ExternalIP", "address": "203.0.113.9"},
+                {"type": "InternalIP", "address": "fd00::7"},
+                {"type": "InternalIP", "address": "192.168.10.7"}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(node_address(&node), Some("192.168.10.7".parse().unwrap()));
+        let v6_only: k8s_openapi::api::core::v1::Node = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "n"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "fd00::7"}]}
+        }))
+        .unwrap();
+        assert_eq!(node_address(&v6_only), Some("fd00::7".parse().unwrap()));
+        let none: k8s_openapi::api::core::v1::Node =
+            serde_json::from_value(serde_json::json!({"metadata": {"name": "n"}})).unwrap();
+        assert_eq!(node_address(&none), None);
     }
 
     #[test]
