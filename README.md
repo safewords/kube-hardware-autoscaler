@@ -99,9 +99,8 @@ sh hack/e2e/run.sh          # optional, manual: end-to-end on a local 2-node min
 ```
 
 The optional end-to-end test isn't part of CI. Run it locally when changing the CRDs, RBAC,
-the chart or the controllers. It runs the real image and chart against a real API server. A
-fake JetKVM speaks JetKVM's MQTT
-protocol in place of real hardware. It covers:
+the chart or the controllers. It runs the real image and chart against a real API server,
+with a fake JetKVM speaking JetKVM's MQTT protocol in place of real hardware. It covers:
 - scale-down and scale-up through the fallback chain;
 - the CEL admission rules;
 - label-based membership and pool conflicts;
