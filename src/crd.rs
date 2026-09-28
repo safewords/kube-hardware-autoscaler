@@ -192,9 +192,11 @@ pub struct LifecycleSpec {
     /// `Standby` (suspend to RAM, which wakes in seconds). Standby is always
     /// entered in-band, through a privileged pod running `systemctl suspend`
     /// on the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN
-    /// is the most reliable way to wake a suspended machine). If the node is
-    /// still Ready `shutdownTimeoutSeconds` after the suspend request, the
-    /// machine is forced off like a stuck shutdown.
+    /// is the most reliable way to wake a suspended machine). If the machine
+    /// does not go to sleep, wakes up by itself, or does not wake up when
+    /// asked, standby is considered broken on it: it is shut down (or, when it
+    /// will not wake, forced off and cold booted) and standby is not used again
+    /// for a day (`status.standbyFailedAt`).
     #[serde(default)]
     pub power_off_mode: PowerOffMode,
 }
@@ -380,6 +382,11 @@ pub struct NodePowerManagementConfigStatus {
     /// as On (some BMCs do).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standby_since: Option<DateTime<Utc>>,
+    /// When standby last failed on this machine (it did not go to sleep, woke
+    /// up by itself, or did not wake up). For a day afterwards the machine is
+    /// shut down instead of put into standby.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby_failed_at: Option<DateTime<Utc>>,
     /// When a forced (hard) power off was issued during the current `PoweringOff` phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_off_at: Option<DateTime<Utc>>,

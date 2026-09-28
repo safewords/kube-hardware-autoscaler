@@ -89,7 +89,7 @@
                       },
                       "powerOffMode": {
                         "default": "Shutdown",
-                        "description": "What \"off\" means for this machine: a full `Shutdown` (default) or\n`Standby` (suspend to RAM, which wakes in seconds). Standby is always\nentered in-band, through a privileged pod running `systemctl suspend`\non the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN\nis the most reliable way to wake a suspended machine). If the node is\nstill Ready `shutdownTimeoutSeconds` after the suspend request, the\nmachine is forced off like a stuck shutdown.",
+                        "description": "What \"off\" means for this machine: a full `Shutdown` (default) or\n`Standby` (suspend to RAM, which wakes in seconds). Standby is always\nentered in-band, through a privileged pod running `systemctl suspend`\non the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN\nis the most reliable way to wake a suspended machine). If the machine\ndoes not go to sleep, wakes up by itself, or does not wake up when\nasked, standby is considered broken on it: it is shut down (or, when it\nwill not wake, forced off and cold booted) and standby is not used again\nfor a day (`status.standbyFailedAt`).",
                         "enum": [
                           "Shutdown",
                           "Standby"
@@ -394,6 +394,12 @@
                       "time"
                     ],
                     "type": "object"
+                  },
+                  "standbyFailedAt": {
+                    "description": "When standby last failed on this machine (it did not go to sleep, woke\nup by itself, or did not wake up). For a day afterwards the machine is\nshut down instead of put into standby.",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
                   },
                   "standbySince": {
                     "description": "When the operator last put the machine into standby. Cleared once it is\nback online or has been powered off instead. While set, power-on\nrequests are repeated even if an interface reads the suspended machine\nas On (some BMCs do).",

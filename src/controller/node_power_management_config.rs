@@ -53,6 +53,11 @@ const NORMAL: Duration = Duration::from_secs(30);
 const SLOW: Duration = Duration::from_secs(60);
 /// Minimum time between repeated power commands while waiting for a transition.
 const RETRY_ACTION_AFTER: i64 = 90;
+/// A machine still up this long after being suspended did not go to sleep
+/// (or woke straight back up). Capped by `shutdownTimeoutSeconds`.
+const STANDBY_SETTLE_SECS: i64 = 240;
+/// After standby failed on a machine, it is shut down instead for this long.
+const STANDBY_BACKOFF_SECS: i64 = 24 * 3600;
 
 /// The state to drive towards. With `Auto`, only a decision from the pool the
 /// machine currently belongs to counts (stale decisions are cleared earlier).
@@ -130,7 +135,7 @@ impl Reconciler<'_> {
         };
         match action {
             "Standby" => self.st.standby_since = Some(self.now),
-            "PowerOff" | "ForceOff" => self.st.standby_since = None,
+            "PowerOff" => self.st.standby_since = None,
             _ => {}
         }
         let ok = result.is_ok();
@@ -193,7 +198,18 @@ impl Reconciler<'_> {
         let boot_timeout = self.mn.spec.lifecycle.boot_timeout_seconds as i64;
         match self.st.phase {
             Phase::PoweringOn => {
-                if self.in_phase_for() > boot_timeout {
+                if self.in_phase_for() > boot_timeout && self.st.standby_since.is_some() {
+                    // Asleep but not answering the wake-up: cut the power so the
+                    // next power on is a cold boot. Keep standby_since so the
+                    // wake-ups continue should the force off not be possible.
+                    self.standby_failed(format!("machine did not wake from standby within {boot_timeout}s"))
+                        .await;
+                    self.act("ForceOff").await;
+                    self.set_phase(Phase::Error);
+                    self.st.message = Some(format!(
+                        "did not wake from standby within {boot_timeout}s; forced off for a cold boot"
+                    ));
+                } else if self.in_phase_for() > boot_timeout {
                     self.set_phase(Phase::Error);
                     self.st.message = Some(format!(
                         "node did not become Ready within {boot_timeout}s of powering on"
@@ -262,14 +278,38 @@ impl Reconciler<'_> {
 
     /// The action that takes this machine offline.
     fn off_action(&self) -> &'static str {
-        match self.mn.spec.lifecycle.power_off_mode {
-            PowerOffMode::Shutdown => "PowerOff",
-            PowerOffMode::Standby => "Standby",
-        }
+        off_action(
+            self.mn.spec.lifecycle.power_off_mode,
+            self.st.standby_failed_at,
+            self.now,
+        )
+    }
+
+    /// Records that standby does not work on this machine right now; it is
+    /// shut down instead until the backoff expires.
+    async fn standby_failed(&mut self, why: String) {
+        self.st.standby_failed_at = Some(self.now);
+        warn!(nodepowermanagementconfig = %self.mn.name_any(), reason = %why, "standby failed");
+        let note = format!(
+            "{why}; shutting down instead of standby for the next {}h",
+            STANDBY_BACKOFF_SECS / 3600
+        );
+        self.ctx.event(self.mn, EventType::Warning, "StandbyFailed", note).await;
     }
 
     async fn ensure_off(&mut self) -> Result<Duration, Error> {
         let power = self.st.power_state;
+        if self.st.phase == Phase::Standby
+            && self.st.standby_since.is_some()
+            && self.st.node_ready
+            && power != PowerState::Off
+        {
+            // Nobody asked it to wake up. Re-suspending would just loop, so
+            // drain it again (below) and shut it down instead.
+            self.standby_failed("machine woke up from standby by itself".into())
+                .await;
+            self.st.standby_since = None;
+        }
         let suspended = in_standby(self.st.phase, self.st.standby_since.is_some(), self.st.node_ready);
         if power == PowerState::Off || suspended {
             let (phase, reason, note) = if self.st.standby_since.is_some() {
@@ -289,7 +329,17 @@ impl Reconciler<'_> {
         match self.st.phase {
             Phase::PoweringOff => {
                 let shutdown_timeout = lc.shutdown_timeout_seconds as i64;
-                if self.in_phase_for() > shutdown_timeout {
+                let settle = shutdown_timeout.min(STANDBY_SETTLE_SECS);
+                if self.st.standby_since.is_some() && self.in_phase_for() > settle {
+                    // Still up: the suspend did not happen, or the machine woke
+                    // straight back up. It is running, so shut it down gracefully.
+                    self.standby_failed(format!(
+                        "machine did not stay in standby (still up {settle}s after suspending)"
+                    ))
+                    .await;
+                    self.act("PowerOff").await;
+                    self.st.phase_since = Some(self.now);
+                } else if self.in_phase_for() > shutdown_timeout {
                     let since_force = self.st.forced_off_at.map(|t| (self.now - t).num_seconds());
                     if since_force.is_none_or(|s| s > RETRY_ACTION_AFTER) {
                         self.st.message = Some(format!(
@@ -297,6 +347,7 @@ impl Reconciler<'_> {
                         ));
                         self.act("ForceOff").await;
                         self.st.forced_off_at = Some(self.now);
+                        self.st.standby_since = None;
                     }
                 } else if self.st.last_power_action.as_ref().is_some_and(|a| !a.succeeded)
                     && self.since_last_action(self.off_action()) > RETRY_ACTION_AFTER / 3
@@ -449,6 +500,16 @@ impl Reconciler<'_> {
     }
 }
 
+/// `Standby` or `PowerOff`: standby is used when configured, unless it failed
+/// on this machine within the backoff period.
+pub fn off_action(mode: PowerOffMode, standby_failed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> &'static str {
+    let standby_broken = standby_failed_at.is_some_and(|t| (now - t).num_seconds() < STANDBY_BACKOFF_SECS);
+    match mode {
+        PowerOffMode::Standby if !standby_broken => "Standby",
+        _ => "PowerOff",
+    }
+}
+
 /// Whether a standby we requested has taken effect. Most interfaces read a
 /// suspended machine as Off, but some BMCs keep reporting On in S3; the
 /// kubelet going quiet is the reliable signal.
@@ -488,6 +549,13 @@ async fn lease_age_secs(ctx: &Context, node: &str, now: DateTime<Utc>) -> Option
 pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) -> Result<Action, Error> {
     let name = mn.name_any();
     let api: Api<NodePowerManagementConfig> = Api::all(ctx.client.clone());
+    // Our own writes (the status patch, cordoning the Node) trigger the next
+    // reconcile before the cache has seen the new status. Acting on that stale
+    // copy would repeat the last transition, e.g. send a second suspend or
+    // power on. Read the live object instead.
+    let Some(mn) = api.get_opt(&name).await?.map(Arc::new) else {
+        return Ok(Action::await_change());
+    };
     let old = mn.status.clone().unwrap_or_default();
     let mut st = old.clone();
     let now = Utc::now();
@@ -757,6 +825,16 @@ mod tests {
         // A NotReady node is not in standby unless we asked for it.
         assert!(!in_standby(Phase::PoweringOff, false, false));
         assert!(!in_standby(Phase::Draining, true, false));
+    }
+
+    #[test]
+    fn failed_standby_falls_back_to_shutdown_for_a_day() {
+        let now = Utc::now();
+        let hours_ago = |h| Some(now - chrono::Duration::hours(h));
+        assert_eq!(off_action(PowerOffMode::Standby, None, now), "Standby");
+        assert_eq!(off_action(PowerOffMode::Standby, hours_ago(1), now), "PowerOff");
+        assert_eq!(off_action(PowerOffMode::Standby, hours_ago(25), now), "Standby");
+        assert_eq!(off_action(PowerOffMode::Shutdown, None, now), "PowerOff");
     }
 
     fn decision(pool: &str, target: PowerTarget) -> ScalingDecision {

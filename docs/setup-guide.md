@@ -218,13 +218,24 @@ spec:
   or its Node stops being Ready. Some BMCs report a suspended machine as On, so the Node
   going NotReady is enough. While waking, the power-on request is repeated until the Node
   is Ready, whatever the interface reports.
-- **If the suspend fails** (the node is still Ready after `shutdownTimeoutSeconds`), the
-  machine is forced off, as with a stuck shutdown.
 - If demand returns before the machine has gone to sleep, the suspend pod is withdrawn and
   the machine is woken.
+- **If standby fails**, the operator emits a `StandbyFailed` warning event, sets
+  `status.standbyFailedAt`, and shuts the machine down instead of suspending it for the
+  next 24 hours. Standby counts as failed when:
+  - the machine is still up 240 s after the suspend (or `shutdownTimeoutSeconds`, if
+    shorter). It is then shut down gracefully;
+  - it wakes up from standby by itself. It is drained again and shut down, rather than
+    suspended in a loop;
+  - it does not wake within `bootTimeoutSeconds`. It is then forced off so the next power
+    on is a cold boot. This needs an interface that can force it off while it's asleep,
+    such as a BMC whose user is allowed to control power. The in-band shutdown of
+    `wakeOnLan` can't reach a sleeping machine.
 
 Check that `systemctl suspend` works on the machine, and that it wakes up from the chosen
-interface, before enabling this.
+interface, before enabling this. A machine that wakes up the moment it is suspended usually
+has a PCIe port or USB controller allowed to wake it. `/proc/acpi/wakeup` lists them, and
+writing an entry's name to that file toggles it. Leave the entry above the NIC enabled.
 
 ### Multiple interfaces and fallback
 
