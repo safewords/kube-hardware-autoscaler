@@ -207,8 +207,12 @@ pub enum PowerOffMode {
     /// Shut the operating system down and power the machine off.
     #[default]
     Shutdown,
-    /// Suspend to RAM (ACPI S3).
+    /// Suspend to RAM with whatever sleep mode the kernel uses by default.
     Standby,
+    /// Suspend to RAM in ACPI S3 when the machine's kernel offers it (`deep`
+    /// in `/sys/power/mem_sleep`, checked once per boot), otherwise shut down.
+    /// Like `Standby`, falls back to shutdown for a day after sleep fails.
+    Auto,
 }
 
 fn default_boot_timeout() -> u64 {
@@ -387,6 +391,10 @@ pub struct NodePowerManagementConfigStatus {
     /// shut down instead of put into standby.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standby_failed_at: Option<DateTime<Utc>>,
+    /// Whether the machine can sleep in S3, as found by the sleep probe for
+    /// its current boot (`powerOffMode: Auto`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_support: Option<SleepSupport>,
     /// When a forced (hard) power off was issued during the current `PoweringOff` phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_off_at: Option<DateTime<Utc>>,
@@ -402,6 +410,18 @@ pub struct NodePowerManagementConfigStatus {
     /// Human-readable details about the current state or the last error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Result of a sleep capability probe.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SleepSupport {
+    /// Boot the probe ran in; a new boot is probed again.
+    pub boot_id: String,
+    /// Whether ACPI S3 (`deep`) is available.
+    pub s3: bool,
+    /// Contents of `/sys/power/mem_sleep`, or why the probe failed.
+    pub detail: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -661,7 +681,7 @@ mod tests {
         const YAML11_BOOLS: &[&str] = &["y", "yes", "n", "no", "true", "false", "on", "off"];
         let values: Vec<String> = [
             serde_json::to_value([PowerPolicy::Auto, PowerPolicy::AlwaysOn, PowerPolicy::AlwaysOff]).unwrap(),
-            serde_json::to_value([PowerOffMode::Shutdown, PowerOffMode::Standby]).unwrap(),
+            serde_json::to_value([PowerOffMode::Shutdown, PowerOffMode::Standby, PowerOffMode::Auto]).unwrap(),
             serde_json::to_value([
                 InterfaceAction::Status,
                 InterfaceAction::PowerOn,

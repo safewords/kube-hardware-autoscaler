@@ -282,8 +282,20 @@ pub enum DrainClass {
     Block(&'static str),
 }
 
+/// Short-lived pods the operator itself runs on nodes (sleep probe, in-band
+/// shutdown/suspend, Wake-on-LAN relay).
+pub fn is_operator_helper_pod(pod: &Pod) -> bool {
+    let labels = pod.metadata.labels.as_ref();
+    let label = |k: &str| labels.and_then(|l| l.get(k)).map(String::as_str);
+    label("app.kubernetes.io/name") == Some("kube-hardware-autoscaler")
+        && matches!(
+            label("app.kubernetes.io/component"),
+            Some("sleep-probe" | "shutdown" | "wake-relay")
+        )
+}
+
 pub fn drain_class(pod: &Pod) -> DrainClass {
-    if !is_active(pod) {
+    if !is_active(pod) || is_operator_helper_pod(pod) {
         return DrainClass::Ignore;
     }
     let annotation = |k: &str| {
@@ -941,6 +953,13 @@ mod tests {
             drain_class(&mk(
                 serde_json::json!({"metadata": {"name": "a"}, "status": {"phase": "Succeeded"}})
             )),
+            DrainClass::Ignore
+        );
+        // The operator's own helper pods (probe, suspend/shutdown, wake relay) never hold up a drain.
+        assert_eq!(
+            drain_class(&mk(serde_json::json!({"metadata": {"name": "kha-probe-x", "labels": {
+                "app.kubernetes.io/name": "kube-hardware-autoscaler",
+                "app.kubernetes.io/component": "sleep-probe"}}}))),
             DrainClass::Ignore
         );
     }

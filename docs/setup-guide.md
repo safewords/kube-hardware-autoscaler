@@ -179,7 +179,7 @@ spec:
     drainTimeoutSeconds: 300
     shutdownTimeoutSeconds: 300
     forceAfterDrainTimeout: false
-    powerOffMode: Shutdown   # Shutdown | Standby (suspend to RAM, see below)
+    powerOffMode: Shutdown   # Shutdown | Standby | Auto (S3 sleep where available, see below)
 ```
 
 More examples: [`examples/`](../examples) (IPMI, Redfish, PiKVM, JetKVM, Wake-on-LAN,
@@ -203,8 +203,23 @@ spec:
     - driver: wakeOnLan                   # wakes the machine from S3
       config: { macAddress: "aa:bb:cc:dd:ee:ff" }
   lifecycle:
-    powerOffMode: Standby
+    powerOffMode: Auto                    # or Standby
 ```
+
+`Auto` is the safe choice for a mixed fleet. It checks each machine and only sleeps the ones
+that can do so properly:
+
+- Once per boot, while the machine is online, a small unprivileged pod reads
+  `/sys/power/mem_sleep` through a read-only mount. If the kernel offers `deep` (ACPI S3),
+  idle periods suspend the machine in S3; `deep` is selected explicitly, so a kernel whose
+  default is `s2idle` still sleeps in S3. Without `deep` (only `s2idle`, which many NICs
+  can't wake from), the machine is shut down. The result is in `status.sleepSupport`, and a
+  `SleepProbe` event records it.
+- If the probe hasn't finished 60 s after the drain, the machine is shut down.
+- If sleeping fails (see below), the machine is shut down for the next 24 hours, as with
+  `Standby`.
+
+`Standby` always suspends, using the kernel's default sleep mode, until it fails.
 
 - **Entering standby** is always in-band: after the drain, the operator runs a privileged
   pod on the node that calls `systemctl suspend` (the same kind of pod the `wakeOnLan`

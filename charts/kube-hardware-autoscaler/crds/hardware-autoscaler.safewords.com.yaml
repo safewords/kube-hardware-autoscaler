@@ -92,7 +92,8 @@
                         "description": "What \"off\" means for this machine: a full `Shutdown` (default) or\n`Standby` (suspend to RAM, which wakes in seconds). Standby is always\nentered in-band, through a privileged pod running `systemctl suspend`\non the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN\nis the most reliable way to wake a suspended machine). If the machine\ndoes not go to sleep, wakes up by itself, or does not wake up when\nasked, standby is considered broken on it: it is shut down (or, when it\nwill not wake, forced off and cold booted) and standby is not used again\nfor a day (`status.standbyFailedAt`).",
                         "enum": [
                           "Shutdown",
-                          "Standby"
+                          "Standby",
+                          "Auto"
                         ],
                         "type": "string"
                       },
@@ -392,6 +393,30 @@
                       "reason",
                       "target",
                       "time"
+                    ],
+                    "type": "object"
+                  },
+                  "sleepSupport": {
+                    "description": "Whether the machine can sleep in S3, as found by the sleep probe for\nits current boot (`powerOffMode: Auto`).",
+                    "nullable": true,
+                    "properties": {
+                      "bootId": {
+                        "description": "Boot the probe ran in; a new boot is probed again.",
+                        "type": "string"
+                      },
+                      "detail": {
+                        "description": "Contents of `/sys/power/mem_sleep`, or why the probe failed.",
+                        "type": "string"
+                      },
+                      "s3": {
+                        "description": "Whether ACPI S3 (`deep`) is available.",
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "bootId",
+                      "detail",
+                      "s3"
                     ],
                     "type": "object"
                   },

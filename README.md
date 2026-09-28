@@ -56,7 +56,9 @@ spec:
   - An interface reporting Off for a live Node blocks all actions.
   - One config per Node, enforced by the API server.
 - **Shutdown or standby:** idle machines are shut down, or with `powerOffMode: Standby`
-  suspended to RAM and woken in seconds.
+  suspended to RAM and woken in seconds. `powerOffMode: Auto` uses S3 sleep on machines
+  whose kernel offers it and shuts the others down. Either mode falls back to shutdown
+  when sleeping fails.
 - **Demand-driven scaling:** unschedulable pods are bin-packed onto powered-off machines,
   checking resources, node selectors, node affinity and taints. Idle machines are drained
   through the eviction API, which respects PDBs. `safe-to-evict` annotations are honoured.

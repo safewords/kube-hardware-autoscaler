@@ -11,7 +11,8 @@
 //!
 //! With `lifecycle.powerOffMode: Standby`, `PoweringOff` suspends the machine
 //! in-band instead and ends in `Standby` (rather than `Off`) once the power
-//! reads Off or the Node stops being Ready.
+//! reads Off or the Node stops being Ready. `Auto` does the same in ACPI S3 if
+//! a probe finds the kernel offers it, and shuts down otherwise.
 //!
 //! The desired state comes from `spec.powerPolicy` (`AlwaysOn`/`AlwaysOff`), or with
 //! `Auto` from `status.scalingDecision`, written by the `NodeScalingPool` controller.
@@ -39,9 +40,9 @@ use super::{
 use crate::crd::{
     COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
     NodePowerManagementConfig, NodePowerManagementConfigStatus, Phase, PowerActionRecord, PowerOffMode, PowerPolicy,
-    PowerState, PowerTarget, ScalingDecision,
+    PowerState, PowerTarget, ScalingDecision, SleepSupport,
 };
-use crate::drivers::inband::{self, HostCommand};
+use crate::drivers::inband::{self, HostCommand, Probe};
 use crate::drivers::{Outcome, PowerChain};
 use crate::identity::IdentityCheck;
 use crate::membership::{self, Membership};
@@ -58,6 +59,9 @@ const RETRY_ACTION_AFTER: i64 = 90;
 const STANDBY_SETTLE_SECS: i64 = 240;
 /// After standby failed on a machine, it is shut down instead for this long.
 const STANDBY_BACKOFF_SECS: i64 = 24 * 3600;
+/// How long a drained machine waits for its sleep probe before shutting down
+/// (`powerOffMode: Auto`).
+const PROBE_WAIT_SECS: i64 = 60;
 
 /// The state to drive towards. With `Auto`, only a decision from the pool the
 /// machine currently belongs to counts (stale decisions are cleared earlier).
@@ -122,7 +126,11 @@ impl Reconciler<'_> {
                 "Standby" => {
                     let d = &self.ctx.drivers;
                     let node = &self.mn.spec.node_name;
-                    inband::run(&d.client, &d.namespace, node, &d.shutdown_image, HostCommand::Suspend)
+                    let cmd = match self.mn.spec.lifecycle.power_off_mode {
+                        PowerOffMode::Auto => HostCommand::SuspendS3,
+                        _ => HostCommand::Suspend,
+                    };
+                    inband::run(&d.client, &d.namespace, node, &d.shutdown_image, cmd)
                         .await
                         .map(|()| Outcome {
                             value: (),
@@ -193,6 +201,10 @@ impl Reconciler<'_> {
             self.st.forced_off_at = None;
             self.st.standby_since = None;
             self.st.message = None;
+            if self.mn.spec.lifecycle.power_off_mode == PowerOffMode::Auto {
+                // Find out early, so a scale down does not have to wait for it.
+                self.probe_sleep().await;
+            }
             return Ok(SLOW);
         }
         let boot_timeout = self.mn.spec.lifecycle.boot_timeout_seconds as i64;
@@ -281,8 +293,54 @@ impl Reconciler<'_> {
         off_action(
             self.mn.spec.lifecycle.power_off_mode,
             self.st.standby_failed_at,
+            self.s3_known(),
             self.now,
         )
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        let id = self.node.as_ref()?.status.as_ref()?.node_info.as_ref()?.boot_id.clone();
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// Whether the machine can sleep in S3, if probed during its current boot.
+    fn s3_known(&self) -> Option<bool> {
+        let boot = self.boot_id()?;
+        self.st
+            .sleep_support
+            .as_ref()
+            .filter(|s| s.boot_id == boot)
+            .map(|s| s.s3)
+    }
+
+    /// Advances the sleep probe for the current boot; `None` while pending.
+    async fn probe_sleep(&mut self) -> Option<bool> {
+        if let Some(known) = self.s3_known() {
+            return Some(known);
+        }
+        let boot = self.boot_id()?;
+        let d = &self.ctx.drivers;
+        let (boot_id, s3, detail) =
+            match inband::probe_sleep(&d.client, &d.namespace, &self.mn.spec.node_name, &d.shutdown_image).await {
+                Ok(Probe::Pending) => return None,
+                // Ran before a reboot: probe again.
+                Ok(Probe::Done { boot_id, .. }) if boot_id != boot => return None,
+                Ok(Probe::Done { boot_id, mem_sleep }) => (boot_id, inband::offers_s3(&mem_sleep), mem_sleep),
+                Ok(Probe::Failed(e)) => (boot, false, format!("probe failed: {e}")),
+                Err(e) => {
+                    warn!(node = %self.mn.spec.node_name, error = %e, "sleep probe failed");
+                    (boot, false, format!("probe failed: {e}"))
+                }
+            };
+        let note = if s3 {
+            format!("machine can sleep in S3 (mem_sleep: {detail}); idle periods use standby")
+        } else {
+            format!("machine cannot sleep in S3 (mem_sleep: {detail}); idle periods shut it down")
+        };
+        info!(nodepowermanagementconfig = %self.mn.name_any(), s3, detail = %detail, "sleep probe");
+        self.ctx.event(self.mn, EventType::Normal, "SleepProbe", note).await;
+        self.st.sleep_support = Some(SleepSupport { boot_id, s3, detail });
+        Some(s3)
     }
 
     /// Records that standby does not work on this machine right now; it is
@@ -426,6 +484,14 @@ impl Reconciler<'_> {
         }
 
         if remaining.is_empty() && blocked.is_empty() {
+            if self.mn.spec.lifecycle.power_off_mode == PowerOffMode::Auto
+                && self.probe_sleep().await.is_none()
+                && self.in_phase_for() <= PROBE_WAIT_SECS
+            {
+                // Not known yet; after PROBE_WAIT_SECS it is a shutdown.
+                self.st.message = Some("checking whether the machine can sleep in S3".into());
+                return Ok(Duration::from_secs(2));
+            }
             self.st.message = None;
             self.power_off().await;
             return Ok(FAST);
@@ -500,12 +566,20 @@ impl Reconciler<'_> {
     }
 }
 
-/// `Standby` or `PowerOff`: standby is used when configured, unless it failed
-/// on this machine within the backoff period.
-pub fn off_action(mode: PowerOffMode, standby_failed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> &'static str {
+/// `Standby` or `PowerOff`. Standby is used when configured (with `Auto`,
+/// only if the machine is known to sleep in S3), unless it failed on this
+/// machine within the backoff period.
+pub fn off_action(
+    mode: PowerOffMode,
+    standby_failed_at: Option<DateTime<Utc>>,
+    s3: Option<bool>,
+    now: DateTime<Utc>,
+) -> &'static str {
     let standby_broken = standby_failed_at.is_some_and(|t| (now - t).num_seconds() < STANDBY_BACKOFF_SECS);
     match mode {
-        PowerOffMode::Standby if !standby_broken => "Standby",
+        _ if standby_broken => "PowerOff",
+        PowerOffMode::Standby => "Standby",
+        PowerOffMode::Auto if s3 == Some(true) => "Standby",
         _ => "PowerOff",
     }
 }
@@ -831,10 +905,22 @@ mod tests {
     fn failed_standby_falls_back_to_shutdown_for_a_day() {
         let now = Utc::now();
         let hours_ago = |h| Some(now - chrono::Duration::hours(h));
-        assert_eq!(off_action(PowerOffMode::Standby, None, now), "Standby");
-        assert_eq!(off_action(PowerOffMode::Standby, hours_ago(1), now), "PowerOff");
-        assert_eq!(off_action(PowerOffMode::Standby, hours_ago(25), now), "Standby");
-        assert_eq!(off_action(PowerOffMode::Shutdown, None, now), "PowerOff");
+        assert_eq!(off_action(PowerOffMode::Standby, None, None, now), "Standby");
+        assert_eq!(off_action(PowerOffMode::Standby, hours_ago(1), None, now), "PowerOff");
+        assert_eq!(off_action(PowerOffMode::Standby, hours_ago(25), None, now), "Standby");
+        assert_eq!(off_action(PowerOffMode::Shutdown, None, Some(true), now), "PowerOff");
+    }
+
+    #[test]
+    fn auto_sleeps_only_where_s3_is_available() {
+        let now = Utc::now();
+        assert_eq!(off_action(PowerOffMode::Auto, None, Some(true), now), "Standby");
+        assert_eq!(off_action(PowerOffMode::Auto, None, Some(false), now), "PowerOff");
+        // Unknown (probe did not finish): shut down.
+        assert_eq!(off_action(PowerOffMode::Auto, None, None, now), "PowerOff");
+        // S3 available but it failed recently: shut down.
+        let failed = Some(now - chrono::Duration::hours(2));
+        assert_eq!(off_action(PowerOffMode::Auto, failed, Some(true), now), "PowerOff");
     }
 
     fn decision(pool: &str, target: PowerTarget) -> ScalingDecision {
