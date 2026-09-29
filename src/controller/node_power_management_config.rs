@@ -584,6 +584,17 @@ pub fn off_action(
     }
 }
 
+/// Whether a machine can sleep in S3, for scale-up ordering: it is asleep in
+/// standby right now, or its last sleep probe found S3 and standby has not
+/// failed on it within the backoff period. The probe result of an earlier boot
+/// is used as-is, since a powered-off machine cannot be probed.
+pub fn s3_capable(st: &NodePowerManagementConfigStatus, now: DateTime<Utc>) -> bool {
+    let standby_broken = st
+        .standby_failed_at
+        .is_some_and(|t| (now - t).num_seconds() < STANDBY_BACKOFF_SECS);
+    st.phase == Phase::Standby || (!standby_broken && st.sleep_support.as_ref().is_some_and(|s| s.s3))
+}
+
 /// Whether a standby we requested has taken effect. Most interfaces read a
 /// suspended machine as Off, but some BMCs keep reporting On in S3; the
 /// kubelet going quiet is the reliable signal.

@@ -23,6 +23,7 @@ spec:
     enabled: true
     pendingPodGraceSeconds: 30  # ignore pods that have been unschedulable for less than this
     maxNodesPerStep: 3
+    preferS3Capable: false      # true: power on machines that can sleep in S3 first
   scaleDown:
     enabled: true
     utilizationThresholdPercent: 50   # CPU and memory requests both below 50% => unneeded

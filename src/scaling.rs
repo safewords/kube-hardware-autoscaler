@@ -63,6 +63,8 @@ pub struct Member {
     /// Pods that block powering the node off.
     pub blocking_pods: Vec<String>,
     pub drain_failed_at: Option<DateTime<Utc>>,
+    /// Whether the machine can sleep in S3 (see `scaleUp.preferS3Capable`).
+    pub s3_capable: bool,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -369,8 +371,14 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         .iter()
         .filter(|m| m.auto && m.state == MemberState::Offline)
         .collect();
-    // Prefer the largest machines so fewer are needed.
-    offline.sort_by_key(|m| std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)));
+    // Optionally S3-capable machines first; then the largest, so fewer are needed.
+    let prefer_s3 = spec.scale_up.prefer_s3_capable;
+    offline.sort_by_key(|m| {
+        (
+            prefer_s3 && !m.s3_capable,
+            std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)),
+        )
+    });
 
     let mut opened: Vec<(String, String)> = Vec::new();
     let can_open = |opened: &Vec<(String, String)>| {
@@ -560,6 +568,7 @@ mod tests {
                 pending_pod_grace_seconds: 30,
                 max_nodes_per_step: 3,
                 require_explicit_selection: false,
+                prefer_s3_capable: false,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -607,6 +616,7 @@ mod tests {
             movable_pods: vec![],
             blocking_pods: vec![],
             drain_failed_at: None,
+            s3_capable: false,
         }
     }
 
@@ -656,6 +666,30 @@ mod tests {
         assert_eq!(p.power_on.len(), 1);
         assert_eq!(p.relevant_pending, 2);
         assert!(p.power_off.is_empty());
+    }
+
+    #[test]
+    fn prefers_s3_capable_machines_only_when_asked() {
+        let now = Utc::now();
+        let mut big = member("big", MemberState::Offline, 0);
+        big.allocatable.cpu_millis = 16000;
+        let mut sleeper = member("sleeper", MemberState::Offline, 0);
+        sleeper.s3_capable = true;
+        let members = vec![big, sleeper];
+        let pods = vec![pod("p1", 1000, 60, now)];
+
+        let mut spec = spec();
+        let default = plan(&snapshot(&spec, members.clone(), pods.clone(), now));
+        assert_eq!(default.power_on[0].0, "big", "size decides by default");
+
+        spec.scale_up.prefer_s3_capable = true;
+        let preferred = plan(&snapshot(&spec, members.clone(), pods.clone(), now));
+        assert_eq!(preferred.power_on[0].0, "sleeper");
+
+        // A pod only the machine without S3 can hold still gets it.
+        let huge = vec![pod("p1", 12000, 60, now)];
+        let fallback = plan(&snapshot(&spec, members, huge, now));
+        assert_eq!(fallback.power_on[0].0, "big");
     }
 
     #[test]
@@ -987,6 +1021,7 @@ mod dedicated_pool_tests {
                 pending_pod_grace_seconds: 15,
                 max_nodes_per_step: 1,
                 require_explicit_selection: true,
+                prefer_s3_capable: false,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -1026,6 +1061,7 @@ mod dedicated_pool_tests {
             movable_pods: vec![],
             blocking_pods: vec![],
             drain_failed_at: None,
+            s3_capable: false,
         }
     }
 

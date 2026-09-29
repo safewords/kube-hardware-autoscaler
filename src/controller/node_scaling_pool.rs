@@ -18,6 +18,7 @@ use kube::{Api, ResourceExt};
 use serde_json::json;
 use tracing::{info, warn};
 
+use super::node_power_management_config::s3_capable;
 use super::{Context, Error, node_ready, patch_status_diff};
 use crate::crd::{
     COND_POWER_STATE_CONSISTENT, NodePowerManagementConfig, NodeScalingPool, Phase, PowerPolicy, PowerTarget,
@@ -122,6 +123,7 @@ fn build_member(mn: &NodePowerManagementConfig, pool: &NodeScalingPool, ctx: &Co
         movable_pods,
         blocking_pods,
         drain_failed_at: st.drain_failed_at,
+        s3_capable: s3_capable(&st, Utc::now()),
     })
 }
 

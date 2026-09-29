@@ -556,6 +556,14 @@ pub struct ScaleUpSpec {
     /// Maximum machines powered on per autoscaler cycle.
     #[serde(default = "default_scale_up_step")]
     pub max_nodes_per_step: u32,
+    /// Power on machines that can sleep in S3 before those that cannot
+    /// (`powerOffMode: Auto`/`Standby`): they are back in seconds after the
+    /// next idle period instead of needing a full boot. A machine counts as
+    /// S3-capable while it is in `Standby`, or when its last sleep probe found
+    /// S3 and standby has not failed on it in the past day. Machine size only
+    /// breaks ties within each group.
+    #[serde(default)]
+    pub prefer_s3_capable: bool,
 }
 
 impl Default for ScaleUpSpec {
@@ -565,6 +573,7 @@ impl Default for ScaleUpSpec {
             pending_pod_grace_seconds: default_pending_grace(),
             max_nodes_per_step: default_scale_up_step(),
             require_explicit_selection: false,
+            prefer_s3_capable: false,
         }
     }
 }

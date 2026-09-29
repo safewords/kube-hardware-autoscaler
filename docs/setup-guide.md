@@ -221,6 +221,14 @@ that can do so properly:
 
 `Standby` always suspends, using the kernel's default sleep mode, until it fails.
 
+In a pool that mixes machines with and without S3, set `scaleUp.preferS3Capable: true` on
+the `NodeScalingPool` so scale-up picks the S3-capable ones first. After the next idle period
+they're back in seconds instead of after a full boot. A machine counts as S3-capable while
+it's in `Standby`, or when its last sleep probe found S3 and standby hasn't failed on it in
+the past day. Machine size only breaks ties within each group. A pod that only fits a
+machine without S3 still gets that machine. The option is off by default, so scale-up picks
+the largest machine first.
+
 - **Entering standby** is always in-band: after the drain, the operator runs a privileged
   pod on the node that calls `systemctl suspend` (the same kind of pod the `wakeOnLan`
   driver uses to shut down, using `operator.shutdownImage`). BMCs and KVMs can't suspend
@@ -597,6 +605,7 @@ scaleUp:
   pendingPodGraceSeconds: 30
   maxNodesPerStep: 3
   requireExplicitSelection: false   # see "Dedicated pools"
+  preferS3Capable: false            # power on S3-capable machines first (see below)
 scaleDown:
   enabled: true
   utilizationThresholdPercent: 50
