@@ -321,25 +321,7 @@ impl NodePowerManagementConfigStatus {
         message: impl Into<String>,
         now: DateTime<Utc>,
     ) {
-        let status = status.to_string();
-        let message = message.into();
-        match self.conditions.iter_mut().find(|c| c.type_ == type_) {
-            Some(c) => {
-                if c.status != status {
-                    c.last_transition_time = now;
-                }
-                c.status = status;
-                c.reason = reason.to_string();
-                c.message = message;
-            }
-            None => self.conditions.push(Condition {
-                type_: type_.to_string(),
-                status,
-                reason: reason.to_string(),
-                message,
-                last_transition_time: now,
-            }),
-        }
+        set_condition(&mut self.conditions, type_, status, reason, message, now);
     }
 
     pub fn condition_is_true(&self, type_: &str) -> bool {
@@ -560,10 +542,79 @@ pub struct ScaleUpSpec {
     /// (`powerOffMode: Auto`/`Standby`): they are back in seconds after the
     /// next idle period instead of needing a full boot. A machine counts as
     /// S3-capable while it is in `Standby`, or when its last sleep probe found
-    /// S3 and standby has not failed on it in the past day. Machine size only
-    /// breaks ties within each group.
+    /// S3 and standby has not failed on it in the past day. Ranks after the
+    /// `preferredNodes` weight and before machine size (see `preferredNodes`).
     #[serde(default)]
     pub prefer_s3_capable: bool,
+    /// Which machines this pool would rather use: a weight from 0 to 100 per
+    /// machine, by Node name. Machines not listed weigh 0; each name may
+    /// appear once. Machines are powered on in this order, and powered off
+    /// in exactly the reverse order:
+    /// 1. weight, highest first;
+    /// 2. with `preferS3Capable`, machines that can sleep in S3 first;
+    /// 3. size (CPU, then memory), largest first: fewer machines absorb the
+    ///    pending pods, and on the way down the smallest goes first, taking
+    ///    the least capacity away;
+    /// 4. Node name, ascending.
+    ///
+    /// Scale-up gives each pending pod the first machine in this order that
+    /// it fits on; `minOnline` takes the first machines that are off. When
+    /// several machines are unneeded, scale-down powers off the last first.
+    /// A weight never makes a machine eligible that otherwise is not, and
+    /// never keeps one on that is otherwise unneeded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "preferred_nodes_schema")]
+    pub preferred_nodes: Vec<PreferredNode>,
+}
+
+/// One entry of `scaleUp.preferredNodes`.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PreferredNode {
+    /// Node name (equal to the machine's `NodePowerManagementConfig` name).
+    pub name: String,
+    /// 0 to 100; higher wakes first and powers off last.
+    pub weight: u32,
+}
+
+/// The highest `scaleUp.preferredNodes[].weight`.
+pub const MAX_NODE_WEIGHT: u32 = 100;
+
+fn preferred_nodes_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        // A list keyed by name: the API server refuses duplicate names.
+        "x-kubernetes-list-type": "map",
+        "x-kubernetes-list-map-keys": ["name"],
+        "items": {
+            "type": "object",
+            "required": ["name", "weight"],
+            "properties": {
+                "name": {
+                    "description": "Node name (equal to the machine's NodePowerManagementConfig name).",
+                    "type": "string",
+                    "minLength": 1
+                },
+                "weight": {
+                    "description": "0 to 100; higher wakes first and powers off last.",
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_NODE_WEIGHT
+                }
+            }
+        }
+    })
+}
+
+impl ScaleUpSpec {
+    /// The weight of the machine registered as Node `node`: its first
+    /// `preferredNodes` entry, 0 when unlisted.
+    pub fn node_weight(&self, node: &str) -> u32 {
+        self.preferred_nodes
+            .iter()
+            .find(|p| p.name == node)
+            .map_or(0, |p| p.weight)
+    }
 }
 
 impl Default for ScaleUpSpec {
@@ -574,6 +625,7 @@ impl Default for ScaleUpSpec {
             max_nodes_per_step: default_scale_up_step(),
             require_explicit_selection: false,
             prefer_s3_capable: false,
+            preferred_nodes: Vec::new(),
         }
     }
 }
@@ -590,9 +642,20 @@ pub struct ScaleDownSpec {
     /// How long a node must be continuously unneeded before it is powered off.
     #[serde(default = "default_unneeded")]
     pub unneeded_seconds: u64,
-    /// Do not scale down within this many seconds after a scale up.
-    #[serde(default = "default_delay_after_scale_up")]
-    pub delay_after_scale_up_seconds: u64,
+    /// After this pool powers any machine on (for pending pods or for
+    /// `minOnline`), power no machine in the pool off for this many seconds,
+    /// however idle it looks. Pool-wide, and it only holds scale-down back:
+    /// scale-up is never delayed by it. It covers the time between a machine
+    /// booting and its pods being scheduled and started. The equivalent of
+    /// cluster-autoscaler's `--scale-down-delay-after-add`. 600 when neither
+    /// this nor the deprecated `delayAfterScaleUpSeconds` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_after_power_on_seconds: Option<u64>,
+    /// Deprecated: the old name of `holdAfterPowerOnSeconds`, still accepted
+    /// with the same meaning. When both are set, `holdAfterPowerOnSeconds`
+    /// wins (and the operator logs a warning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_after_scale_up_seconds: Option<u64>,
     /// Do not retry a node whose drain failed within this many seconds.
     #[serde(default = "default_drain_backoff")]
     pub drain_failure_backoff_seconds: u64,
@@ -616,7 +679,8 @@ impl Default for ScaleDownSpec {
             enabled: true,
             utilization_threshold_percent: default_utilization(),
             unneeded_seconds: default_unneeded(),
-            delay_after_scale_up_seconds: default_delay_after_scale_up(),
+            hold_after_power_on_seconds: None,
+            delay_after_scale_up_seconds: None,
             drain_failure_backoff_seconds: default_drain_backoff(),
             max_nodes_per_step: default_scale_down_step(),
             ignore_daemon_set_utilization: false,
@@ -640,8 +704,36 @@ fn default_utilization() -> u32 {
 fn default_unneeded() -> u64 {
     600
 }
-fn default_delay_after_scale_up() -> u64 {
-    600
+/// `scaleDown.holdAfterPowerOnSeconds` when neither name is set.
+pub const DEFAULT_HOLD_AFTER_POWER_ON_SECONDS: u64 = 600;
+
+impl ScaleDownSpec {
+    /// The effective `holdAfterPowerOnSeconds`: the new name, else the
+    /// deprecated `delayAfterScaleUpSeconds`, else the default.
+    pub fn hold_after_power_on(&self) -> u64 {
+        self.hold_after_power_on_seconds
+            .or(self.delay_after_scale_up_seconds)
+            .unwrap_or(DEFAULT_HOLD_AFTER_POWER_ON_SECONDS)
+    }
+
+    /// Why the spec's use of the deprecated `delayAfterScaleUpSeconds`
+    /// deserves a warning, if it does.
+    pub fn deprecation_warning(&self) -> Option<String> {
+        match (self.hold_after_power_on_seconds, self.delay_after_scale_up_seconds) {
+            (Some(new), Some(old)) if new != old => Some(format!(
+                "scaleDown.delayAfterScaleUpSeconds ({old}) is deprecated and ignored:                  scaleDown.holdAfterPowerOnSeconds ({new}) is also set and wins"
+            )),
+            (Some(_), Some(_)) => Some(
+                "scaleDown.delayAfterScaleUpSeconds is deprecated and ignored:                  scaleDown.holdAfterPowerOnSeconds is also set and wins; remove the old name"
+                    .to_string(),
+            ),
+            (None, Some(_)) => Some(
+                "scaleDown.delayAfterScaleUpSeconds is deprecated; rename it to scaleDown.holdAfterPowerOnSeconds"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
 }
 fn default_drain_backoff() -> u64 {
     1800
@@ -676,6 +768,75 @@ pub struct NodeScalingPoolStatus {
     pub unneeded_since: BTreeMap<String, DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// `PreferredNodesValid`: whether every `scaleUp.preferredNodes` entry
+    /// names an existing Node that this pool's `nodeSelector` selects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+    /// The last decisions of this pool's autoscaler, oldest first (at most
+    /// `MAX_RECENT_DECISIONS`): every power action, and every change in why
+    /// nothing is done. Kept here because Events expire after an hour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_decisions: Vec<DecisionRecord>,
+}
+
+/// How many entries `NodeScalingPool.status.recentDecisions` keeps.
+pub const MAX_RECENT_DECISIONS: usize = 20;
+
+pub const COND_PREFERRED_NODES_VALID: &str = "PreferredNodesValid";
+
+/// What a pool decided.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+pub enum DecisionAction {
+    PowerOn,
+    PowerOff,
+    NoAction,
+}
+
+/// One entry of `NodeScalingPool.status.recentDecisions`.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionRecord {
+    pub time: DateTime<Utc>,
+    pub action: DecisionAction,
+    /// The machine powered on or off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Why, including the rank and the rule that decided between candidates.
+    pub reason: String,
+    /// The ranked candidates, best first for power-on and first to go for
+    /// power-off: `name(w<weight> [s3] <cpu>c/<memory>Gi) > ...`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub candidates: String,
+}
+
+/// Sets a condition in `conditions`, keeping `lastTransitionTime` unless the status changed.
+pub fn set_condition(
+    conditions: &mut Vec<Condition>,
+    type_: &str,
+    status: &str,
+    reason: &str,
+    message: impl Into<String>,
+    now: DateTime<Utc>,
+) {
+    let status = status.to_string();
+    let message = message.into();
+    match conditions.iter_mut().find(|c| c.type_ == type_) {
+        Some(c) => {
+            if c.status != status {
+                c.last_transition_time = now;
+            }
+            c.status = status;
+            c.reason = reason.to_string();
+            c.message = message;
+        }
+        None => conditions.push(Condition {
+            type_: type_.to_string(),
+            status,
+            reason: reason.to_string(),
+            message,
+            last_transition_time: now,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +852,12 @@ mod tests {
         let values: Vec<String> = [
             serde_json::to_value([PowerPolicy::Auto, PowerPolicy::AlwaysOn, PowerPolicy::AlwaysOff]).unwrap(),
             serde_json::to_value([PowerOffMode::Shutdown, PowerOffMode::Standby, PowerOffMode::Auto]).unwrap(),
+            serde_json::to_value([
+                DecisionAction::PowerOn,
+                DecisionAction::PowerOff,
+                DecisionAction::NoAction,
+            ])
+            .unwrap(),
             serde_json::to_value([
                 InterfaceAction::Status,
                 InterfaceAction::PowerOn,
@@ -709,5 +876,84 @@ mod tests {
         for v in values {
             assert!(!YAML11_BOOLS.contains(&v.as_str()), "{v} is a YAML 1.1 boolean");
         }
+    }
+
+    fn scale_down(v: serde_json::Value) -> ScaleDownSpec {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn hold_after_power_on_accepts_the_deprecated_name() {
+        let new = scale_down(serde_json::json!({"holdAfterPowerOnSeconds": 120}));
+        assert_eq!(new.hold_after_power_on(), 120);
+        assert_eq!(new.deprecation_warning(), None);
+
+        let old = scale_down(serde_json::json!({"delayAfterScaleUpSeconds": 900}));
+        assert_eq!(old.hold_after_power_on(), 900);
+        assert!(old.deprecation_warning().unwrap().contains("rename"));
+
+        // Both: the new name wins, with a warning.
+        let both = scale_down(serde_json::json!({"holdAfterPowerOnSeconds": 120, "delayAfterScaleUpSeconds": 900}));
+        assert_eq!(both.hold_after_power_on(), 120);
+        assert!(both.deprecation_warning().unwrap().contains("wins"));
+
+        let neither = scale_down(serde_json::json!({}));
+        assert_eq!(neither.hold_after_power_on(), DEFAULT_HOLD_AFTER_POWER_ON_SECONDS);
+        assert_eq!(neither.deprecation_warning(), None);
+        // Neither name is written back when unset, so the CRD's `scaleDown`
+        // default does not pin one.
+        let written = serde_json::to_value(ScaleDownSpec::default()).unwrap();
+        assert!(written.get("holdAfterPowerOnSeconds").is_none());
+        assert!(written.get("delayAfterScaleUpSeconds").is_none());
+    }
+
+    fn pool_schema() -> serde_json::Value {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(NodeScalingPool::crd()).unwrap();
+        crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"].clone()
+    }
+
+    #[test]
+    fn crd_schema_keeps_both_names_without_defaults() {
+        let down = &pool_schema()["properties"]["scaleDown"];
+        for name in ["holdAfterPowerOnSeconds", "delayAfterScaleUpSeconds"] {
+            let field = &down["properties"][name];
+            assert_eq!(field["type"], "integer", "{name}");
+            // A schema default would be filled in by the API server and, for the
+            // new name, override an object's deprecated value.
+            assert!(field.get("default").is_none(), "{name} must not have a default");
+        }
+        assert!(
+            down["properties"]["delayAfterScaleUpSeconds"]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Deprecated")
+        );
+        assert!(down["default"].get("delayAfterScaleUpSeconds").is_none());
+    }
+
+    #[test]
+    fn preferred_nodes_are_validated_and_default_to_zero() {
+        let list = &pool_schema()["properties"]["scaleUp"]["properties"]["preferredNodes"];
+        assert_eq!(list["type"], "array");
+        assert_eq!(list["x-kubernetes-list-type"], "map", "names must be unique");
+        assert_eq!(list["x-kubernetes-list-map-keys"], serde_json::json!(["name"]));
+        let weight = &list["items"]["properties"]["weight"];
+        assert_eq!(weight["minimum"].as_f64(), Some(0.0));
+        assert_eq!(weight["maximum"].as_f64(), Some(100.0));
+
+        let up: ScaleUpSpec = serde_json::from_value(serde_json::json!({
+            "preferredNodes": [{"name": "devbox", "weight": 100}, {"name": "vulpes-zerda", "weight": 10}]
+        }))
+        .unwrap();
+        assert_eq!(up.node_weight("devbox"), 100);
+        assert_eq!(up.node_weight("vulpes-zerda"), 10);
+        assert_eq!(up.node_weight("unlisted"), 0);
+        assert!(
+            serde_json::from_value::<ScaleUpSpec>(
+                serde_json::json!({"preferredNodes": [{"name": "devbox", "weight": -1}]})
+            )
+            .is_err()
+        );
     }
 }

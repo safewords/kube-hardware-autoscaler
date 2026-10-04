@@ -71,10 +71,31 @@ spec:
             - name: KHA_LOG_JSON
               value: "true"
             {{- end }}
+            - name: KHA_DECISION_VERBOSITY
+              value: {{ .Values.operator.decisionVerbosity | default "summary" | quote }}
+            {{- if .Values.webhook.enabled }}
+            - name: KHA_WEBHOOK_ADDR
+              value: "0.0.0.0:{{ .Values.webhook.port }}"
+            - name: KHA_WEBHOOK_SERVICE
+              value: {{ include "kube-hardware-autoscaler.fullname" . }}-webhook
+            - name: KHA_WEBHOOK_SECRET
+              value: {{ include "kube-hardware-autoscaler.fullname" . }}-webhook-tls
+            - name: KHA_WEBHOOK_CONFIG_NAME
+              value: {{ include "kube-hardware-autoscaler.fullname" . }}
+            {{- if .Values.rbac.create }}
+            - name: KHA_WEBHOOK_OWNER_CLUSTER_ROLE
+              value: {{ include "kube-hardware-autoscaler.fullname" . }}
+            {{- end }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: {{ .Values.operator.metricsPort }}
               protocol: TCP
+            {{- if .Values.webhook.enabled }}
+            - name: webhook
+              containerPort: {{ .Values.webhook.port }}
+              protocol: TCP
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

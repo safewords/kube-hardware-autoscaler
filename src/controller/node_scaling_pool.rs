@@ -16,19 +16,20 @@ use kube::runtime::controller::Action;
 use kube::runtime::events::EventType;
 use kube::{Api, ResourceExt};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::node_power_management_config::s3_capable;
-use super::{Context, Error, node_ready, patch_status_diff};
+use super::{Context, DecisionVerbosity, Error, node_ready, patch_status_diff};
 use crate::crd::{
-    COND_POWER_STATE_CONSISTENT, NodePowerManagementConfig, NodeScalingPool, Phase, PowerPolicy, PowerTarget,
-    ResourceAmounts, ScalingDecision,
+    COND_POWER_STATE_CONSISTENT, COND_PREFERRED_NODES_VALID, DecisionAction, DecisionRecord, MAX_RECENT_DECISIONS,
+    NodePowerManagementConfig, NodeScalingPool, NodeScalingPoolStatus, Phase, PowerPolicy, PowerTarget,
+    ResourceAmounts, ScalingDecision, set_condition,
 };
 use crate::membership::{self, Membership};
 use crate::resources::{node_allocatable, pod_requests};
 use crate::scaling::{
-    DrainClass, ExternalNode, Member, MemberState, PodView, PoolSnapshot, drain_class, is_active, is_daemonset_pod,
-    is_unschedulable, plan,
+    DrainClass, ExternalNode, Member, MemberState, PlannedDecision, PodView, PoolSnapshot, drain_class, is_active,
+    is_daemonset_pod, is_unschedulable, plan,
 };
 
 const INTERVAL: Duration = Duration::from_secs(15);
@@ -182,11 +183,129 @@ async fn decide(
     Ok(())
 }
 
+/// Problems with `scaleUp.preferredNodes`: entries naming no Node, and entries
+/// naming a Node this pool's `nodeSelector` does not select. Such entries are
+/// harmless (they never match a member) but almost certainly a mistake.
+pub fn preferred_node_problems<'a>(
+    pool: &crate::crd::NodeScalingPoolSpec,
+    labels_of: impl Fn(&str) -> Option<&'a std::collections::BTreeMap<String, String>>,
+) -> (Vec<String>, Vec<String>) {
+    let (mut missing, mut outside) = (Vec::new(), Vec::new());
+    for p in &pool.scale_up.preferred_nodes {
+        match labels_of(&p.name) {
+            None => missing.push(p.name.clone()),
+            Some(labels) if !pool.node_selector.matches(labels) => outside.push(p.name.clone()),
+            Some(_) => {}
+        }
+    }
+    (missing, outside)
+}
+
+/// Sets `PreferredNodesValid` and logs (once per change) what is wrong.
+fn check_preferred_nodes(pool: &NodeScalingPool, ctx: &Context, st: &mut NodeScalingPoolStatus) {
+    let name = pool.name_any();
+    let nodes: Vec<Arc<k8s_openapi::api::core::v1::Node>> = pool
+        .spec
+        .scale_up
+        .preferred_nodes
+        .iter()
+        .filter_map(|p| ctx.node(&p.name))
+        .collect();
+    let (missing, outside) = preferred_node_problems(&pool.spec, |n| {
+        nodes.iter().find(|node| node.name_any() == n).map(|node| node.labels())
+    });
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("no such Node: {}", missing.join(", ")));
+    }
+    if !outside.is_empty() {
+        problems.push(format!(
+            "not selected by this pool's nodeSelector: {}",
+            outside.join(", ")
+        ));
+    }
+    let key = format!("{name}/preferredNodes");
+    if problems.is_empty() {
+        ctx.first_time(&key, None);
+        if pool.spec.scale_up.preferred_nodes.is_empty() {
+            st.conditions.retain(|c| c.type_ != COND_PREFERRED_NODES_VALID);
+        } else {
+            set_condition(
+                &mut st.conditions,
+                COND_PREFERRED_NODES_VALID,
+                "True",
+                "AllSelected",
+                "",
+                Utc::now(),
+            );
+        }
+        return;
+    }
+    let message = format!(
+        "scaleUp.preferredNodes entries ignored ({}); the other entries apply",
+        problems.join("; ")
+    );
+    if ctx.first_time(&key, Some(&message)) {
+        warn!(pool = %name, "{message}");
+    }
+    let reason = if missing.is_empty() {
+        "NotInPool"
+    } else {
+        "UnknownNodes"
+    };
+    set_condition(
+        &mut st.conditions,
+        COND_PREFERRED_NODES_VALID,
+        "False",
+        reason,
+        message,
+        Utc::now(),
+    );
+}
+
+/// Appends this cycle's decisions to `recent`: every power action, and a
+/// `NoAction` only when its reason differs from the latest `NoAction`'s.
+/// Returns the decisions that were new.
+fn record_decisions(
+    recent: &mut Vec<DecisionRecord>,
+    decisions: &[PlannedDecision],
+    now: chrono::DateTime<Utc>,
+) -> Vec<PlannedDecision> {
+    let mut new = Vec::new();
+    for d in decisions {
+        if d.action == DecisionAction::NoAction {
+            let latest = recent.last();
+            if latest.is_some_and(|r| r.action == DecisionAction::NoAction && r.reason == d.reason) {
+                continue;
+            }
+        }
+        recent.push(DecisionRecord {
+            time: now,
+            action: d.action,
+            node: d.node.clone(),
+            reason: d.reason.clone(),
+            candidates: d.candidates.clone(),
+        });
+        new.push(d.clone());
+    }
+    let excess = recent.len().saturating_sub(MAX_RECENT_DECISIONS);
+    recent.drain(..excess);
+    new
+}
+
 pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<Action, Error> {
     let name = pool.name_any();
     let now = Utc::now();
     let old = pool.status.clone().unwrap_or_default();
     let mut st = old.clone();
+
+    let deprecation = pool.spec.scale_down.deprecation_warning();
+    if ctx.first_time(&format!("{name}/deprecated"), deprecation.as_deref())
+        && let Some(message) = &deprecation
+    {
+        warn!(pool = %name, "{message}");
+    }
+    check_preferred_nodes(&pool, &ctx, &mut st);
 
     let pools = ctx.pools();
     let mut managed: Vec<Arc<NodePowerManagementConfig>> = Vec::new();
@@ -220,26 +339,60 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
     };
     let result = plan(&snapshot);
 
+    let new_decisions = record_decisions(&mut st.recent_decisions, &result.decisions, now);
+    let verbosity = ctx.decision_verbosity;
+    if !new_decisions.is_empty() {
+        for line in &result.live_details {
+            if verbosity == DecisionVerbosity::Detailed {
+                info!(pool = %name, "candidate {line}");
+            } else {
+                debug!(pool = %name, "candidate {line}");
+            }
+        }
+    }
     let mn_api: Api<NodePowerManagementConfig> = Api::all(ctx.client.clone());
-    for (member, target, reason, event) in result
-        .power_on
-        .iter()
-        .map(|(m, r)| (m, PowerTarget::On, r, "ScaleUp"))
-        .chain(
-            result
-                .power_off
-                .iter()
-                .map(|(m, r)| (m, PowerTarget::Off, r, "ScaleDown")),
-        )
-    {
-        info!(pool = %name, nodepowermanagementconfig = %member, %reason, ?target, "scaling decision");
-        decide(&mn_api, &name, member, target, reason).await?;
-        if let Some(mn) = managed.iter().find(|m| &m.name_any() == member) {
+    for d in &new_decisions {
+        let (target, event) = match d.action {
+            DecisionAction::PowerOn => (PowerTarget::On, "ScaleUpSelected"),
+            DecisionAction::PowerOff => (PowerTarget::Off, "ScaleDownSelected"),
+            DecisionAction::NoAction => {
+                if verbosity == DecisionVerbosity::Quiet {
+                    debug!(pool = %name, reason = %d.live_reason, candidates = %d.candidates, "no scaling action");
+                    continue;
+                }
+                info!(pool = %name, reason = %d.live_reason, candidates = %d.candidates, "no scaling action");
+                let event = if d.reason.starts_with("pod ") {
+                    Some("ScaleUpBlocked")
+                } else if d.reason.starts_with("scale-down held") {
+                    Some("ScaleDownBlocked")
+                } else {
+                    None
+                };
+                if let Some(event) = event {
+                    ctx.event(pool.as_ref(), EventType::Normal, event, d.reason.clone())
+                        .await;
+                }
+                continue;
+            }
+        };
+        let member = d.node.as_deref().unwrap_or_default();
+        info!(
+            pool = %name,
+            nodepowermanagementconfig = %member,
+            reason = %d.reason,
+            candidates = %d.candidates,
+            ?target,
+            "scaling decision"
+        );
+        decide(&mn_api, &name, member, target, &d.reason).await?;
+        let note = format!("{member}: {}", d.reason);
+        ctx.event(pool.as_ref(), EventType::Normal, event, note).await;
+        if let Some(mn) = managed.iter().find(|m| m.name_any() == member) {
             ctx.event(
                 mn.as_ref(),
                 EventType::Normal,
                 event,
-                format!("NodeScalingPool {name}: {reason}"),
+                format!("NodeScalingPool {name}: {}", d.reason),
             )
             .await;
         }
@@ -385,5 +538,81 @@ mod tests {
             Utc::now(),
         );
         assert_eq!(member_state(&m, "p"), MemberState::Unavailable);
+    }
+
+    fn decision(action: DecisionAction, node: Option<&str>, reason: &str) -> PlannedDecision {
+        PlannedDecision {
+            action,
+            node: node.map(String::from),
+            reason: reason.into(),
+            live_reason: reason.into(),
+            candidates: String::new(),
+        }
+    }
+
+    #[test]
+    fn records_actions_always_and_no_action_on_change_only() {
+        let now = Utc::now();
+        let mut recent = Vec::new();
+        let idle = [decision(
+            DecisionAction::NoAction,
+            None,
+            "1 online, nothing pending, nothing unneeded",
+        )];
+        assert_eq!(record_decisions(&mut recent, &idle, now).len(), 1);
+        assert!(
+            record_decisions(&mut recent, &idle, now).is_empty(),
+            "unchanged: not recorded again"
+        );
+        let on = [decision(
+            DecisionAction::PowerOn,
+            Some("devbox"),
+            "unschedulable pod a/b",
+        )];
+        assert_eq!(record_decisions(&mut recent, &on, now).len(), 1);
+        // The same reason for doing nothing after an action is a new decision.
+        assert_eq!(record_decisions(&mut recent, &idle, now).len(), 1);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[1].node.as_deref(), Some("devbox"));
+
+        // Bounded, oldest dropped first.
+        for i in 0..30 {
+            let d = [decision(DecisionAction::NoAction, None, &format!("reason {i}"))];
+            record_decisions(&mut recent, &d, now);
+        }
+        assert_eq!(recent.len(), MAX_RECENT_DECISIONS);
+        assert_eq!(recent.last().unwrap().reason, "reason 29");
+        assert_eq!(recent[0].reason, "reason 10");
+    }
+
+    #[test]
+    fn preferred_node_problems_names_missing_and_outside_nodes() {
+        use crate::crd::{NodeScalingPoolSpec, PreferredNode};
+        use std::collections::BTreeMap;
+        let spec: NodeScalingPoolSpec = serde_json::from_value(json!({
+            "nodeSelector": {"matchLabels": {"gpu": "true"}},
+            "scaleUp": {"preferredNodes": [
+                {"name": "devbox", "weight": 100},
+                {"name": "gone", "weight": 50},
+                {"name": "cpu-box", "weight": 10},
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.scale_up.preferred_nodes[0],
+            PreferredNode {
+                name: "devbox".into(),
+                weight: 100
+            }
+        );
+        let gpu = BTreeMap::from([("gpu".to_string(), "true".to_string())]);
+        let cpu = BTreeMap::new();
+        let (missing, outside) = preferred_node_problems(&spec, |n| match n {
+            "devbox" => Some(&gpu),
+            "cpu-box" => Some(&cpu),
+            _ => None,
+        });
+        assert_eq!(missing, ["gone"]);
+        assert_eq!(outside, ["cpu-box"]);
     }
 }

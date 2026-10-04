@@ -44,6 +44,22 @@ rules:
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  {{- if .Values.webhook.enabled }}
+  # The NodeScalingPool webhook: the operator registers its own
+  # ValidatingWebhookConfiguration (create cannot be limited by name), owned
+  # by this ClusterRole so an uninstall removes it.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    verbs: ["create"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    resourceNames: [{{ include "kube-hardware-autoscaler.fullname" . | quote }}]
+    verbs: ["get", "patch", "update", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: [{{ include "kube-hardware-autoscaler.fullname" . | quote }}]
+    verbs: ["get"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -76,6 +92,16 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete"]
+  {{- if .Values.webhook.enabled }}
+  # The webhook's CA and serving certificate, issued by the operator.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ printf "%s-webhook-tls" (include "kube-hardware-autoscaler.fullname" .) | quote }}]
+    verbs: ["update"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

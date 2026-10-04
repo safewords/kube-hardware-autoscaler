@@ -576,7 +576,6 @@
                   },
                   "scaleDown": {
                     "default": {
-                      "delayAfterScaleUpSeconds": 600,
                       "drainFailureBackoffSeconds": 1800,
                       "enabled": true,
                       "ignoreDaemonSetUtilization": false,
@@ -587,10 +586,10 @@
                     },
                     "properties": {
                       "delayAfterScaleUpSeconds": {
-                        "default": 600,
-                        "description": "Do not scale down within this many seconds after a scale up.",
+                        "description": "Deprecated: the old name of `holdAfterPowerOnSeconds`, still accepted\nwith the same meaning. When both are set, `holdAfterPowerOnSeconds`\nwins (and the operator logs a warning).",
                         "format": "uint64",
                         "minimum": 0.0,
+                        "nullable": true,
                         "type": "integer"
                       },
                       "drainFailureBackoffSeconds": {
@@ -603,6 +602,13 @@
                       "enabled": {
                         "default": true,
                         "type": "boolean"
+                      },
+                      "holdAfterPowerOnSeconds": {
+                        "description": "After this pool powers any machine on (for pending pods or for\n`minOnline`), power no machine in the pool off for this many seconds,\nhowever idle it looks. Pool-wide, and it only holds scale-down back:\nscale-up is never delayed by it. It covers the time between a machine\nbooting and its pods being scheduled and started. The equivalent of\ncluster-autoscaler's `--scale-down-delay-after-add`. 600 when neither\nthis nor the deprecated `delayAfterScaleUpSeconds` is set.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
                       },
                       "ignoreDaemonSetUtilization": {
                         "default": false,
@@ -667,8 +673,36 @@
                       },
                       "preferS3Capable": {
                         "default": false,
-                        "description": "Power on machines that can sleep in S3 before those that cannot\n(`powerOffMode: Auto`/`Standby`): they are back in seconds after the\nnext idle period instead of needing a full boot. A machine counts as\nS3-capable while it is in `Standby`, or when its last sleep probe found\nS3 and standby has not failed on it in the past day. Machine size only\nbreaks ties within each group.",
+                        "description": "Power on machines that can sleep in S3 before those that cannot\n(`powerOffMode: Auto`/`Standby`): they are back in seconds after the\nnext idle period instead of needing a full boot. A machine counts as\nS3-capable while it is in `Standby`, or when its last sleep probe found\nS3 and standby has not failed on it in the past day. Ranks after the\n`preferredNodes` weight and before machine size (see `preferredNodes`).",
                         "type": "boolean"
+                      },
+                      "preferredNodes": {
+                        "description": "Which machines this pool would rather use: a weight from 0 to 100 per\nmachine, by Node name. Machines not listed weigh 0; each name may\nappear once. Machines are powered on in this order, and powered off\nin exactly the reverse order:\n1. weight, highest first;\n2. with `preferS3Capable`, machines that can sleep in S3 first;\n3. size (CPU, then memory), largest first: fewer machines absorb the\n   pending pods, and on the way down the smallest goes first, taking\n   the least capacity away;\n4. Node name, ascending.\n\nScale-up gives each pending pod the first machine in this order that\nit fits on; `minOnline` takes the first machines that are off. When\nseveral machines are unneeded, scale-down powers off the last first.\nA weight never makes a machine eligible that otherwise is not, and\nnever keeps one on that is otherwise unneeded.",
+                        "items": {
+                          "properties": {
+                            "name": {
+                              "description": "Node name (equal to the machine's NodePowerManagementConfig name).",
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "weight": {
+                              "description": "0 to 100; higher wakes first and powers off last.",
+                              "maximum": 100.0,
+                              "minimum": 0.0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "weight"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "name"
+                        ],
+                        "x-kubernetes-list-type": "map"
                       },
                       "requireExplicitSelection": {
                         "default": false,
@@ -687,6 +721,39 @@
               "status": {
                 "nullable": true,
                 "properties": {
+                  "conditions": {
+                    "description": "`PreferredNodesValid`: whether every `scaleUp.preferredNodes` entry\nnames an existing Node that this pool's `nodeSelector` selects.",
+                    "items": {
+                      "description": "A status condition (the usual Kubernetes shape).",
+                      "properties": {
+                        "lastTransitionTime": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`True`, `False` or `Unknown`.",
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "lastTransitionTime",
+                        "reason",
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
                   "conflicts": {
                     "description": "NodePowerManagementConfigs whose Node also matches another pool; excluded from both.",
                     "items": {
@@ -728,6 +795,47 @@
                     "format": "uint32",
                     "minimum": 0.0,
                     "type": "integer"
+                  },
+                  "recentDecisions": {
+                    "description": "The last decisions of this pool's autoscaler, oldest first (at most\n`MAX_RECENT_DECISIONS`): every power action, and every change in why\nnothing is done. Kept here because Events expire after an hour.",
+                    "items": {
+                      "description": "One entry of `NodeScalingPool.status.recentDecisions`.",
+                      "properties": {
+                        "action": {
+                          "description": "What a pool decided.",
+                          "enum": [
+                            "PowerOn",
+                            "PowerOff",
+                            "NoAction"
+                          ],
+                          "type": "string"
+                        },
+                        "candidates": {
+                          "description": "The ranked candidates, best first for power-on and first to go for\npower-off: `name(w<weight> [s3] <cpu>c/<memory>Gi) > ...`.",
+                          "type": "string"
+                        },
+                        "node": {
+                          "description": "The machine powered on or off.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "description": "Why, including the rank and the rule that decided between candidates.",
+                          "type": "string"
+                        },
+                        "time": {
+                          "format": "date-time",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "action",
+                        "reason",
+                        "time"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
                   },
                   "totalNodes": {
                     "default": 0,

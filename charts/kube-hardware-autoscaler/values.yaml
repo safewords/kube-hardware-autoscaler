@@ -27,6 +27,21 @@ operator:
   logLevel: info,kube_runtime=warn,kube_client=warn
   # -- Port of the /metrics, /healthz and /readyz endpoints.
   metricsPort: 8080
+  # -- How much the operator says about scaling decisions: `quiet` (power
+  # actions only), `summary` (one info line and an Event per decision,
+  # including each change in why nothing is done; per-machine ranks at debug)
+  # or `detailed` (per-machine ranks at info too). Every decision is also kept
+  # in NodeScalingPool.status.recentDecisions.
+  decisionVerbosity: summary
+
+# -- Validating webhook for NodeScalingPools: refuses `scaleUp.preferredNodes`
+# entries naming no Node, warns about Nodes outside the pool. The operator
+# issues its own certificate (kept in a Secret), registers the
+# ValidatingWebhookConfiguration once it serves and removes it on shutdown.
+webhook:
+  enabled: true
+  # -- Port the operator serves HTTPS on (a host port with hostNetwork).
+  port: 9443
 
 # -- Run the operator in the host network namespace. Required for Wake-on-LAN
 # (broadcast packets must reach the machines' L2 segment) and often helpful when

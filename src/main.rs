@@ -16,10 +16,13 @@ use serde::de::DeserializeOwned;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use kube_hardware_autoscaler::controller::{Context, IdentityCache, node_power_management_config, node_scaling_pool};
+use kube_hardware_autoscaler::controller::{
+    Context, DecisionVerbosity, IdentityCache, node_power_management_config, node_scaling_pool,
+};
 use kube_hardware_autoscaler::crd::{NodePowerManagementConfig, NodeScalingPool};
 use kube_hardware_autoscaler::drivers::{self, CATALOG, DriverContext, PowerChain};
 use kube_hardware_autoscaler::metrics::{self, Metrics};
+use kube_hardware_autoscaler::webhook;
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +58,37 @@ struct DriverArgs {
     relay_image: String,
 }
 
+/// The NodeScalingPool validating webhook (off unless `--webhook-addr` is set).
+#[derive(clap::Args, Clone)]
+struct WebhookArgs {
+    /// Serve the validating webhook on this address (HTTPS) and register it.
+    #[arg(long, env = "KHA_WEBHOOK_ADDR")]
+    webhook_addr: Option<SocketAddr>,
+    /// The Service through which the API server reaches the webhook.
+    #[arg(
+        long,
+        env = "KHA_WEBHOOK_SERVICE",
+        default_value = "kube-hardware-autoscaler-webhook"
+    )]
+    webhook_service: String,
+    /// That Service's port.
+    #[arg(long, env = "KHA_WEBHOOK_SERVICE_PORT", default_value_t = 443)]
+    webhook_service_port: i32,
+    /// Secret (in the operator's namespace) holding the webhook's CA and certificate.
+    #[arg(
+        long,
+        env = "KHA_WEBHOOK_SECRET",
+        default_value = "kube-hardware-autoscaler-webhook-tls"
+    )]
+    webhook_secret: String,
+    /// Name of the ValidatingWebhookConfiguration the operator manages.
+    #[arg(long, env = "KHA_WEBHOOK_CONFIG_NAME", default_value = "kube-hardware-autoscaler")]
+    webhook_config_name: String,
+    /// ClusterRole that owns the ValidatingWebhookConfiguration (deleting it deletes the configuration).
+    #[arg(long, env = "KHA_WEBHOOK_OWNER_CLUSTER_ROLE")]
+    webhook_owner_cluster_role: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the operator.
@@ -67,6 +101,13 @@ enum Command {
         /// Log power actions instead of executing them.
         #[arg(long, env = "KHA_DRY_RUN")]
         dry_run: bool,
+        /// How much to say about scaling decisions: `quiet` (power actions only),
+        /// `summary` (one line and an Event per decision, including why nothing
+        /// is done) or `detailed` (also every machine's rank at info).
+        #[arg(long, env = "KHA_DECISION_VERBOSITY", value_enum, default_value_t = DecisionVerbosity::Summary)]
+        decision_verbosity: DecisionVerbosity,
+        #[command(flatten)]
+        webhook: WebhookArgs,
     },
     /// Send a Wake-on-LAN magic packet from this host (used by relay pods).
     Wake {
@@ -152,7 +193,13 @@ where
     reader
 }
 
-async fn run(args: DriverArgs, metrics_addr: SocketAddr, dry_run: bool) -> anyhow::Result<()> {
+async fn run(
+    args: DriverArgs,
+    metrics_addr: SocketAddr,
+    dry_run: bool,
+    decision_verbosity: DecisionVerbosity,
+    webhook_args: WebhookArgs,
+) -> anyhow::Result<()> {
     let client = Client::try_default().await.context("connecting to Kubernetes")?;
     let metrics = Metrics::new();
     tokio::spawn(metrics::serve(metrics_addr, metrics.clone()));
@@ -169,6 +216,32 @@ async fn run(args: DriverArgs, metrics_addr: SocketAddr, dry_run: bool) -> anyho
     metrics.ready.store(true, Ordering::Relaxed);
     info!(dry_run, namespace = %args.namespace, "caches synced; starting controllers");
 
+    // The webhook is registered only once it serves, and unregistered on shutdown.
+    let webhook = webhook_args.webhook_addr.map(|addr| webhook::Settings {
+        addr,
+        namespace: args.namespace.clone(),
+        service: webhook_args.webhook_service.clone(),
+        service_port: webhook_args.webhook_service_port,
+        secret: webhook_args.webhook_secret.clone(),
+        config_name: webhook_args.webhook_config_name.clone(),
+        owner_cluster_role: webhook_args.webhook_owner_cluster_role.clone(),
+    });
+    let webhook_shutdown = match &webhook {
+        Some(settings) => {
+            let tls = webhook::ensure_tls(&client, settings).await?;
+            webhook::serve(settings.addr, &tls, nodes.clone()).await?;
+            webhook::register(&client, settings, &tls).await?;
+            // Unregister as soon as the pod is told to stop, before the controllers
+            // wind down: a rollout should not leave pool changes refused.
+            let (client, settings) = (client.clone(), settings.clone());
+            Some(tokio::spawn(async move {
+                shutdown_signal().await;
+                webhook::unregister(&client, &settings).await;
+            }))
+        }
+        None => None,
+    };
+
     let reporter = Reporter {
         controller: "kube-hardware-autoscaler".into(),
         instance: std::env::var("POD_NAME").ok(),
@@ -184,6 +257,8 @@ async fn run(args: DriverArgs, metrics_addr: SocketAddr, dry_run: bool) -> anyho
         recorder: Recorder::new(client.clone(), reporter),
         metrics,
         dry_run,
+        decision_verbosity,
+        warned: Default::default(),
     });
 
     // NodePowerManagementConfig names equal their Node names, so a Node event maps 1:1 to
@@ -224,7 +299,25 @@ async fn run(args: DriverArgs, metrics_addr: SocketAddr, dry_run: bool) -> anyho
         .for_each(|r| async move { log_controller_result("nodescalingpool", r) });
     tokio::join!(mn_controller, pool_controller);
     info!("controllers stopped");
+    if let Some(task) = webhook_shutdown {
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
     Ok(())
+}
+
+/// SIGTERM or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn power(name: String, action: PowerAction, via: Option<String>, args: DriverArgs) -> anyhow::Result<()> {
@@ -289,7 +382,9 @@ async fn main() -> anyhow::Result<()> {
             drivers,
             metrics_addr,
             dry_run,
-        } => run(drivers, metrics_addr, dry_run).await,
+            decision_verbosity,
+            webhook,
+        } => run(drivers, metrics_addr, dry_run, decision_verbosity, webhook).await,
         Command::Wake { mac, port, broadcast } => {
             let mac_bytes = kube_hardware_autoscaler::wake::parse_mac(&mac).context("invalid --mac")?;
             let targets = kube_hardware_autoscaler::wake::targets(broadcast.as_deref(), port)?;

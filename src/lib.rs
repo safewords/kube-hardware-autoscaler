@@ -13,3 +13,4 @@ pub mod metrics;
 pub mod resources;
 pub mod scaling;
 pub mod wake;
+pub mod webhook;

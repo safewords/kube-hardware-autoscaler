@@ -225,9 +225,10 @@ In a pool that mixes machines with and without S3, set `scaleUp.preferS3Capable:
 the `NodeScalingPool` so scale-up picks the S3-capable ones first. After the next idle period
 they're back in seconds instead of after a full boot. A machine counts as S3-capable while
 it's in `Standby`, or when its last sleep probe found S3 and standby hasn't failed on it in
-the past day. Machine size only breaks ties within each group. A pod that only fits a
-machine without S3 still gets that machine. The option is off by default, so scale-up picks
-the largest machine first.
+the past day. A pod that only fits a machine without S3 still gets that machine. The option
+is off by default, so scale-up picks the largest machine first. `scaleUp.preferredNodes`
+weights rank before it and machine size after it; see
+[Preferred machines](#preferred-machines).
 
 - **Entering standby** is always in-band: after the drain, the operator runs a privileged
   pod on the node that calls `systemctl suspend` (the same kind of pod the `wakeOnLan`
@@ -605,17 +606,160 @@ scaleUp:
   pendingPodGraceSeconds: 30
   maxNodesPerStep: 3
   requireExplicitSelection: false   # see "Dedicated pools"
-  preferS3Capable: false            # power on S3-capable machines first (see below)
+  preferS3Capable: false            # power on S3-capable machines first (see "Standby")
+  preferredNodes: []                # [{name: <Node>, weight: 0-100}]; see "Preferred machines"
 scaleDown:
   enabled: true
   utilizationThresholdPercent: 50
   unneededSeconds: 600
-  delayAfterScaleUpSeconds: 600
+  holdAfterPowerOnSeconds: 600      # see "Holding after a power-on"
   drainFailureBackoffSeconds: 1800
   maxNodesPerStep: 1          # concurrent drains/power-offs
   ignoreDaemonSetUtilization: false
   ignoreNonSelectingPodUtilization: false
 ```
+
+### Preferred machines
+
+`scaleUp.preferredNodes` says which machines a pool would rather use, by Node name, with a
+weight from 0 to 100. Machines not listed weigh 0.
+
+```yaml
+scaleUp:
+  preferS3Capable: true
+  preferredNodes:
+    - name: devbox          # cheap to run, wakes from S3
+      weight: 100
+    - name: vulpes-zerda    # power-hungry server
+      weight: 10
+```
+
+Machines are ranked in this order:
+
+1. **Weight**, highest first.
+2. **S3 capability**, S3-capable first, only with `preferS3Capable: true`.
+3. **Size** (CPU, then memory), largest first. Fewer large machines absorb the pending
+   pods.
+4. **Node name**, ascending. Ranks are never tied, so the choice never depends on the
+   order the API server lists machines in.
+
+- **Scale-up:** each pending pod gets the highest-ranked machine that is off, `Auto`, and
+  that it fits on. `minOnline` takes the highest-ranked machines that are off. A preferred
+  machine the pod doesn't fit on is skipped.
+- **Scale-down:** when several machines are unneeded, they're powered off in exactly the
+  reverse order: lowest weight first, then (with `preferS3Capable`) machines without S3,
+  then the smallest, then the name descending. The smallest goes first because it takes the
+  least capacity away, and the larger machines left can take its pods.
+
+A weight only orders machines that are already candidates. It never makes a machine eligible
+that otherwise isn't, and it never keeps a machine on that is otherwise unneeded.
+
+Weight comes before S3 capability because it is the explicit choice for a named machine.
+`preferS3Capable` is a general rule about a class of machines. Where both should count, give
+the S3-capable machines the higher weight.
+
+A pod's own `preferredDuringSchedulingIgnoredDuringExecution` node affinity is not
+considered. Each name may appear once (the API server enforces it, and server-side apply
+merges entries by name). Names are checked:
+
+- **When the pool is saved,** the operator's [validating webhook](#validating-webhook)
+  refuses a name that matches no Node. It admits a name whose Node the pool's
+  `nodeSelector` doesn't select, with a warning.
+- **While the pool runs,** the `PreferredNodesValid` condition in `status.conditions` turns
+  `False` (reason `UnknownNodes` or `NotInPool`) and lists such names, for example after a
+  Node is deleted. The operator logs a warning once. Those entries are ignored, and the
+  others still apply.
+
+### Holding after a power-on
+
+`scaleDown.holdAfterPowerOnSeconds` (default 600): after this pool powers any machine on,
+for pending pods or for `minOnline`, no machine in the pool is powered off for this long,
+however idle it looks. It holds scale-down for the whole pool and never delays a scale-up.
+It covers the time between a machine booting and its pods being scheduled and started
+(image pulls, runner registration), when the machine looks idle but work is on its way. It
+is the equivalent of cluster-autoscaler's `--scale-down-delay-after-add`. While it holds,
+`status.message` says `scale down held: holding after power-on`.
+
+The field used to be called `delayAfterScaleUpSeconds`. The old name is still accepted with
+the same meaning, but it's deprecated:
+
+- The old name stays in the CRD schema, so existing objects still validate.
+- When both names are set, `holdAfterPowerOnSeconds` wins, and the operator logs a warning.
+- The webhook warns on save whenever the old name is used.
+
+Neither name has a schema default; the operator applies 600 when both are unset. A
+schema default for the new name would be filled in by the API server, and would then
+override a value set under the old one.
+
+### Scaling decisions
+
+Every pool decision explains itself: what was chosen, its rank, and the rule that decided
+between it and the next candidate (`weight`, `S3 capability`, `size` or `name`). When the pool
+does nothing, the explanation says why: pods waiting for `maxOnline`, a scale-down held by
+`holdAfterPowerOnSeconds`, or machines not yet unneeded for `unneededSeconds`. The
+explanation is published in several places:
+
+- **Events:** `ScaleUpSelected` and `ScaleDownSelected` on the pool and on the machine.
+  `ScaleUpBlocked` and `ScaleDownBlocked` on the pool, each time the reason for doing nothing
+  changes.
+- **`status.recentDecisions`:** the last 20 decisions, kept after the Events expire (about an
+  hour). Each records the time, the action (`PowerOn`, `PowerOff` or `NoAction`), the node,
+  the reason, and the ranked candidates in compact form:
+
+  ```yaml
+  - action: PowerOn
+    node: devbox
+    reason: "unschedulable pod ci/runner-x; #1 of 2 to power on, over vulpes-zerda by weight (100 vs 10)"
+    candidates: "devbox(w100 s3 16c/62Gi) > vulpes-zerda(w10 40c/125Gi)"
+    time: "2026-10-04T12:09:10Z"
+  ```
+
+  A `NoAction` entry is added only when the reason changes, and it uses absolute times
+  ("holding after power-on until 12:29:10Z"), so the status doesn't change on every cycle.
+- **Logs:** one info line per decision, with the seconds elapsed and remaining. The
+  per-machine ranking is logged at debug.
+
+`--decision-verbosity` (chart value `operator.decisionVerbosity`) sets how much is logged:
+
+| Value | Logs and Events |
+|---|---|
+| `quiet` | Power actions only. A change in why nothing is done is logged at debug, with no Event. |
+| `summary` (default) | Every decision at info, with an Event. |
+| `detailed` | Same as `summary`, plus each machine's rank and status at info. |
+
+### Validating webhook
+
+With `--webhook-addr` set (chart: `webhook.enabled`, default on), the operator serves a
+validating webhook for `NodeScalingPool` CREATE and UPDATE requests (`failurePolicy: Fail`,
+5 s timeout):
+
+- **Refused:** a `scaleUp.preferredNodes` name that matches no Node. On UPDATE, this applies
+  only to names being added, so a Node deleted later doesn't block other edits; the edit is
+  admitted with a warning instead.
+- **Admitted with a warning:** a Node that the pool's `nodeSelector` doesn't select, or use of
+  the deprecated `delayAfterScaleUpSeconds`.
+
+Duplicate names and the weight range are enforced by the CRD schema.
+
+The webhook needs no cert-manager. The operator manages it in four steps:
+
+1. **Certificate:** at startup, it issues a self-signed CA and a serving certificate for
+   `<service>.<namespace>.svc`, valid for five years and renewed at startup in the last 30
+   days. Both are stored in the Secret `<release>-webhook-tls`.
+2. **Registration:** once it's listening, it applies the `ValidatingWebhookConfiguration`
+   with the CA bundle. The first install therefore never waits on a webhook that isn't
+   there yet.
+3. **Removal:** on SIGTERM, it deletes that configuration, so an operator rollout doesn't
+   refuse pool changes while no pod serves.
+4. **Uninstall:** the configuration is owned by the operator's ClusterRole, so uninstalling
+   the chart removes it.
+
+With `hostNetwork: true`, `webhook.port` (default 9443) is a port on the node the operator
+runs on, so it must be free there.
+
+A crashed operator leaves the configuration in place. Pool changes are then refused until
+the operator is back, which is what `failurePolicy: Fail` is for. To change a pool while the
+operator is down, delete the `ValidatingWebhookConfiguration` by hand.
 
 ### Dedicated pools (standby GPUs and similar)
 
@@ -709,7 +853,10 @@ pick it up automatically. The CRD does not change.
 | `ipmi: authentication failed` | Wrong user/password/Kg, or the BMC does not allow cipher suite 3. |
 | `BootTimeout` event | The machine powered on but the node never became Ready: check BIOS boot order and kubelet. The operator retries. |
 | `DrainFailed` event | A PDB or blocking pod prevented eviction; see `status.message` for the pods. |
-| Machines never scale down | `kubectl get nodescalingpool -o yaml`: `status.message` explains holds (pods pending, recently scaled up, ...). Nodes with bare or `safe-to-evict=false` pods are never candidates. |
+| Machines never scale down | `kubectl get nodescalingpool -o yaml`: `status.recentDecisions` and `status.message` explain holds (pods pending, holding after power-on, ...). Nodes with bare or `safe-to-evict=false` pods are never candidates. |
+| The wrong machine was powered on or off | `status.recentDecisions` shows the ranked candidates and the rule that decided (weight, S3 capability, size, name). See "Preferred machines". |
+| Condition `PreferredNodesValid=False` | A `scaleUp.preferredNodes` entry names no Node, or a Node the pool's `nodeSelector` doesn't select. Fix or remove it; the other entries still apply. |
+| `kubectl apply` of a pool fails with `failed calling webhook` | The operator isn't serving (crashed or starting). Wait for it, or delete the `ValidatingWebhookConfiguration` to change pools without validation. |
 | Nothing happens at all | Check `operator.dryRun`, `powerPolicy: Auto`, and that the Node carries the pool's labels (`kubectl get npmc` shows the POOL; check the `PoolMembership` condition). |
 | `status.interfaceWarnings` is not empty | A higher-priority interface failed and a fallback took over. Fix the listed interface. |
 | JetKVM: `no retained state on .../atx/state` | MQTT disabled on the JetKVM, wrong `baseTopic` (it must include the device ID), or the ATX/DC extension is not active. |

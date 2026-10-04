@@ -42,6 +42,27 @@ pub struct Context {
     /// Identity check results per (NodePowerManagementConfig, generation), so BMCs are not
     /// queried for their UUID on every reconcile.
     pub identity_cache: IdentityCache,
+    /// How much the pool autoscaler says about its decisions.
+    pub decision_verbosity: DecisionVerbosity,
+    /// The last warning logged per key, so a standing problem is logged once
+    /// rather than on every reconcile.
+    pub warned: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+/// How much the pool autoscaler says about its decisions. Power actions are
+/// always logged at info and recorded as Events and in
+/// `NodeScalingPool.status.recentDecisions`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum DecisionVerbosity {
+    /// Only power actions; a changed reason for doing nothing is logged at debug, without an Event.
+    Quiet,
+    /// One info line per decision, including each change in why nothing is
+    /// done, with Events for it (`ScaleDownBlocked`, `ScaleUpBlocked`). The
+    /// per-machine breakdown is logged at debug.
+    #[default]
+    Summary,
+    /// `Summary`, plus the per-machine breakdown at info.
+    Detailed,
 }
 
 const IDENTITY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
@@ -78,6 +99,21 @@ impl Context {
 
     pub fn node(&self, name: &str) -> Option<Arc<Node>> {
         self.nodes.get(&kube::runtime::reflector::ObjectRef::new(name))
+    }
+
+    /// Whether `message` is new for `key` (and remembers it). Clearing a key
+    /// with `None` lets the same warning be logged again if it comes back.
+    pub fn first_time(&self, key: &str, message: Option<&str>) -> bool {
+        let Ok(mut warned) = self.warned.lock() else {
+            return true;
+        };
+        match message {
+            Some(m) => warned.insert(key.to_string(), m.to_string()).as_deref() != Some(m),
+            None => {
+                warned.remove(key);
+                false
+            }
+        }
     }
 
     pub fn pods_on(&self, node: &str) -> Vec<Arc<Pod>> {

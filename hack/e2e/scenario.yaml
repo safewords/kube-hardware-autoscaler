@@ -51,4 +51,4 @@ spec:
   scaleDown:
     utilizationThresholdPercent: 50
     unneededSeconds: 20
-    delayAfterScaleUpSeconds: 20
+    holdAfterPowerOnSeconds: 20

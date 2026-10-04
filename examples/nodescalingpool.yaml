@@ -24,10 +24,15 @@ spec:
     pendingPodGraceSeconds: 30  # ignore pods that have been unschedulable for less than this
     maxNodesPerStep: 3
     preferS3Capable: false      # true: power on machines that can sleep in S3 first
+    preferredNodes:             # by Node name, weight 0-100 (unlisted: 0): highest
+      - name: worker-1          # weight wakes first and powers off last
+        weight: 100
+      - name: worker-2
+        weight: 50
   scaleDown:
     enabled: true
     utilizationThresholdPercent: 50   # CPU and memory requests both below 50% => unneeded
     unneededSeconds: 600              # ... for 10 minutes => power off
-    delayAfterScaleUpSeconds: 600
+    holdAfterPowerOnSeconds: 600      # after any power-on, power nothing in the pool off for 10 minutes
     drainFailureBackoffSeconds: 1800
     maxNodesPerStep: 1

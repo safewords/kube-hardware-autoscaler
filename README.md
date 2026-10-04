@@ -62,6 +62,15 @@ spec:
 - **Demand-driven scaling:** unschedulable pods are bin-packed onto powered-off machines,
   checking resources, node selectors, node affinity and taints. Idle machines are drained
   through the eviction API, which respects PDBs. `safe-to-evict` annotations are honoured.
+- **Preferred machines:** `scaleUp.preferredNodes` gives named machines a weight (0-100).
+  Machines are powered on in a fixed order: weight (highest first), S3 capability (with
+  `preferS3Capable`), size (largest first), then Node name. They're powered off in exactly
+  the reverse order.
+- **Explained decisions:** every power-on, power-off, and reason for doing nothing is recorded
+  with its rank and deciding rule. It appears in Events, in the logs, and in the pool's
+  `status.recentDecisions`.
+- **Admission webhook:** refuses pools that prefer a Node that doesn't exist. The operator
+  issues its own certificate, so no cert-manager is needed.
 - **Operations:** dry-run mode, Kubernetes events, Prometheus metrics, and a `power` CLI to
   test each interface.
 

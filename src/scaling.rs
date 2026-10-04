@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Duration, Utc};
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, Pod, Taint, Toleration};
 
-use crate::crd::{NodeScalingPoolSpec, ResourceAmounts, SAFE_TO_EVICT_ANNOTATION};
+use crate::crd::{DecisionAction, NodeScalingPoolSpec, ResourceAmounts, SAFE_TO_EVICT_ANNOTATION};
 use crate::resources::pod_requests;
 
 /// Where a member currently is in its power lifecycle, from the autoscaler's
@@ -105,6 +105,26 @@ pub struct Plan {
     /// Members online or booting, before applying this plan.
     pub online: u32,
     pub message: String,
+    /// One decision per power action, or a single `NoAction` explaining why
+    /// nothing happens.
+    pub decisions: Vec<PlannedDecision>,
+    /// Per machine: its rank and why it is (not) a candidate. `details` is
+    /// stable (for status), `live_details` has seconds (for logs).
+    pub details: Vec<String>,
+    pub live_details: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedDecision {
+    pub action: DecisionAction,
+    pub node: Option<String>,
+    /// One line: why, the rank and the deciding rule. Stable while the
+    /// situation is (absolute times only), so it can be compared across cycles.
+    pub reason: String,
+    /// `reason` with elapsed and remaining seconds, for logs.
+    pub live_reason: String,
+    /// The ranked candidates, compact: `a(w100 s3 16c/64Gi) > b(w10 8c/32Gi)`.
+    pub candidates: String,
 }
 
 /// Taints that result from the node being powered off or cordoned by us, and
@@ -327,6 +347,26 @@ pub fn drain_class(pod: &Pod) -> DrainClass {
     }
 }
 
+/// The order in which a pool powers its machines on; scale-down uses the exact
+/// reverse. Total, so the choice never depends on the order members were listed:
+///
+/// 1. `scaleUp.preferredNodes` weight, highest first (unlisted machines weigh 0);
+/// 2. with `scaleUp.preferS3Capable`, machines that can sleep in S3 first;
+/// 3. size (CPU, then memory), largest first: fewer machines absorb the
+///    pending pods, and on the way down the smallest goes first, taking the
+///    least capacity away while the larger ones absorb its pods;
+/// 4. Node name, ascending (descending on the way down).
+pub fn power_on_order(spec: &NodeScalingPoolSpec, a: &Member, b: &Member) -> std::cmp::Ordering {
+    let key = |m: &Member| {
+        (
+            std::cmp::Reverse(spec.scale_up.node_weight(&m.name)),
+            spec.scale_up.prefer_s3_capable && !m.s3_capable,
+            std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)),
+        )
+    };
+    key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name))
+}
+
 /// Computes the scaling plan for one pool.
 pub fn plan(s: &PoolSnapshot) -> Plan {
     let mut plan = Plan::default();
@@ -371,106 +411,174 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         .iter()
         .filter(|m| m.auto && m.state == MemberState::Offline)
         .collect();
-    // Optionally S3-capable machines first; then the largest, so fewer are needed.
-    let prefer_s3 = spec.scale_up.prefer_s3_capable;
-    offline.sort_by_key(|m| {
-        (
-            prefer_s3 && !m.s3_capable,
-            std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)),
-        )
-    });
+    // Each pod takes the first machine in `power_on_order` it fits on.
+    offline.sort_by(|a, b| power_on_order(spec, a, b));
+    let ranked_up: Vec<&Member> = offline.clone();
+    let rank_up = |m: &Member| ranked_up.iter().position(|o| o.name == m.name).unwrap_or(0) + 1;
 
     let mut opened: Vec<(String, String)> = Vec::new();
+    // Why each machine was chosen, and why pods were left waiting.
+    let mut up_notes: Vec<(String, String)> = Vec::new();
+    let mut unplaced: Vec<(String, String)> = Vec::new();
     let can_open = |opened: &Vec<(String, String)>| {
-        online_now + opened.len() < max_online && (opened.len() as u32) < spec.scale_up.max_nodes_per_step.max(1)
+        if online_now + opened.len() >= max_online {
+            Err(format!("maxOnline ({max_online}) reached"))
+        } else if opened.len() as u32 >= spec.scale_up.max_nodes_per_step.max(1) {
+            Err(format!(
+                "maxNodesPerStep ({}) reached this cycle",
+                spec.scale_up.max_nodes_per_step.max(1)
+            ))
+        } else {
+            Ok(())
+        }
     };
-    if spec.scale_up.enabled {
-        for pod in &pending {
-            if let Some((_, free)) = bins.iter_mut().find(|(m, free)| pod_fits(pod, m, free)) {
-                *free = free.minus(&pod.requests);
-                continue;
-            }
-            if !can_open(&opened) {
-                continue;
-            }
-            if let Some(pos) = offline.iter().position(|m| pod_fits(pod, m, &m.allocatable)) {
-                let m = offline.remove(pos);
-                opened.push((
-                    m.name.clone(),
-                    format!("unschedulable pod {}/{}", pod.namespace, pod.name),
-                ));
-                bins.push((m, m.allocatable.minus(&pod.requests)));
-            }
+    for pod in &pending {
+        let pod_name = format!("{}/{}", pod.namespace, pod.name);
+        if !spec.scale_up.enabled {
+            unplaced.push((pod_name, "scale-up disabled".into()));
+            continue;
+        }
+        if let Some((_, free)) = bins.iter_mut().find(|(m, free)| pod_fits(pod, m, free)) {
+            *free = free.minus(&pod.requests);
+            continue;
+        }
+        if let Err(why) = can_open(&opened) {
+            unplaced.push((pod_name, why));
+            continue;
+        }
+        if let Some(pos) = offline.iter().position(|m| pod_fits(pod, m, &m.allocatable)) {
+            let m = offline.remove(pos);
+            // The machine it would have had otherwise: the next one it fits on.
+            let decided = match offline[pos..].iter().find(|o| pod_fits(pod, o, &o.allocatable)) {
+                Some(next) => format!("over {} by {}", next.name, deciding_rule(spec, m, next, false)),
+                None => "the only machine off that fits".into(),
+            };
+            let reason = format!(
+                "unschedulable pod {pod_name}; #{} of {} to power on, {decided}",
+                rank_up(m),
+                ranked_up.len()
+            );
+            up_notes.push((m.name.clone(), reason.clone()));
+            opened.push((m.name.clone(), reason));
+            bins.push((m, m.allocatable.minus(&pod.requests)));
+        } else {
+            unplaced.push((pod_name, "fits no machine that is off and Auto".into()));
         }
     }
     // minOnline is enforced even when scale-up is disabled.
     while online_now + opened.len() < spec.min_online as usize && online_now + opened.len() < max_online {
         let Some(m) = offline.first().copied() else { break };
         offline.remove(0);
-        opened.push((m.name.clone(), format!("pool below minOnline ({})", spec.min_online)));
+        let decided = match offline.first() {
+            Some(next) => format!("over {} by {}", next.name, deciding_rule(spec, m, next, false)),
+            None => "the only machine off".into(),
+        };
+        let reason = format!(
+            "pool below minOnline ({}); #{} of {} to power on, {decided}",
+            spec.min_online,
+            rank_up(m),
+            ranked_up.len()
+        );
+        up_notes.push((m.name.clone(), reason.clone()));
+        opened.push((m.name.clone(), reason));
     }
     plan.power_on = opened;
 
     // --- scale down --------------------------------------------------------
-    let candidates: Vec<&Member> = s
+    let mut candidates: Vec<&Member> = s
         .members
         .iter()
         .filter(|m| m.auto && m.state == MemberState::Online)
         .collect();
+    // The exact reverse of the power-on order.
+    candidates.sort_by(|a, b| power_on_order(spec, b, a));
     let threshold = spec.scale_down.utilization_threshold_percent as f64;
     let backoff = Duration::seconds(spec.scale_down.drain_failure_backoff_seconds as i64);
-    let is_unneeded = |m: &Member| {
-        m.allocatable.utilization_percent(&m.counted) < threshold
-            && m.blocking_pods.is_empty()
-            && m.drain_failed_at.is_none_or(|t| s.now - t >= backoff)
-    };
+    let unneeded_for = Duration::seconds(spec.scale_down.unneeded_seconds as i64);
+    let util = |m: &Member| m.allocatable.utilization_percent(&m.counted);
+    // Per online candidate: why it is not (yet) eligible to power off, in both renderings.
+    let mut down_notes: BTreeMap<String, Note> = BTreeMap::new();
     for m in &candidates {
-        if is_unneeded(m) {
+        let note = if !m.blocking_pods.is_empty() {
+            Note::same(format!("busy: blocked by {}", m.blocking_pods.join(", ")))
+        } else if let Some(t) = m.drain_failed_at.filter(|t| s.now - *t < backoff) {
+            Note {
+                stable: format!("drain failed; retry after {}", hhmmss(t + backoff)),
+                live: format!("drain failed; retry in {}s", (t + backoff - s.now).num_seconds()),
+            }
+        } else if util(m) >= threshold {
+            Note::same(format!("busy: utilization {:.0}% >= {:.0}%", util(m), threshold))
+        } else {
             let since = s.unneeded_since.get(&m.name).copied().unwrap_or(s.now);
             plan.unneeded_since.insert(m.name.clone(), since);
-        }
+            if s.now - since >= unneeded_for {
+                Note::same(format!("unneeded since {}", hhmmss(since)))
+            } else {
+                Note {
+                    stable: format!(
+                        "unneeded since {}, eligible at {}",
+                        hhmmss(since),
+                        hhmmss(since + unneeded_for)
+                    ),
+                    live: format!(
+                        "unneeded for {} of {}s",
+                        (s.now - since).num_seconds(),
+                        unneeded_for.num_seconds()
+                    ),
+                }
+            }
+        };
+        down_notes.insert(m.name.clone(), note);
     }
 
     let over_max = online_now.saturating_sub(max_online);
     let leaving = s.members.iter().filter(|m| m.state == MemberState::Leaving).count();
-    let recently_scaled_up = s
+    // `holdAfterPowerOnSeconds`: pool-wide, after this pool last powered a machine on.
+    let hold_until = s
         .last_scale_up
-        .is_some_and(|t| s.now - t < Duration::seconds(spec.scale_down.delay_after_scale_up_seconds as i64));
+        .map(|t| t + Duration::seconds(spec.scale_down.hold_after_power_on() as i64))
+        .filter(|until| s.now < *until);
     let booting = s.members.iter().any(|m| m.state == MemberState::Booting);
 
-    let blocked_reason = if !plan.power_on.is_empty() {
-        Some("scaling up")
+    let blocked_reason: Option<Note> = if !plan.power_on.is_empty() {
+        Some(Note::same("scaling up".into()))
     } else if over_max > 0 {
         None
     } else if !spec.scale_down.enabled {
-        Some("scale down disabled")
+        Some(Note::same("scale down disabled".into()))
     } else if plan.relevant_pending > 0 {
-        Some("pods pending")
+        Some(Note::same("pods pending".into()))
     } else if booting {
-        Some("nodes booting")
-    } else if recently_scaled_up {
-        Some("recently scaled up")
+        Some(Note::same("nodes booting".into()))
     } else {
-        None
+        hold_until.map(|until| Note {
+            stable: format!("holding after power-on until {}", hhmmss(until)),
+            live: format!("holding after power-on, {}s left", (until - s.now).num_seconds()),
+        })
     };
 
     let step = spec.scale_down.max_nodes_per_step.max(1) as usize;
+    let mut off_notes: BTreeMap<String, String> = BTreeMap::new();
+    let eligible: Vec<&Member> = candidates
+        .iter()
+        .copied()
+        .filter(|m| {
+            let expired = plan
+                .unneeded_since
+                .get(&m.name)
+                .is_some_and(|t| s.now - *t >= unneeded_for);
+            (over_max > 0 && m.blocking_pods.is_empty()) || expired
+        })
+        .collect();
+    if blocked_reason.is_none() && leaving >= step && over_max == 0 {
+        for m in &eligible {
+            off_notes.insert(
+                m.name.clone(),
+                format!("kept: maxNodesPerStep ({step}) already powering off"),
+            );
+        }
+    }
     if blocked_reason.is_none() && (leaving < step || over_max > 0) {
-        let unneeded_for = Duration::seconds(spec.scale_down.unneeded_seconds as i64);
-        let util = |m: &Member| m.allocatable.utilization_percent(&m.counted);
-        let mut eligible: Vec<&Member> = candidates
-            .iter()
-            .copied()
-            .filter(|m| {
-                let expired = plan
-                    .unneeded_since
-                    .get(&m.name)
-                    .is_some_and(|t| s.now - *t >= unneeded_for);
-                (over_max > 0 && m.blocking_pods.is_empty()) || expired
-            })
-            .collect();
-        eligible.sort_by(|a, b| util(a).total_cmp(&util(b)));
-
         let mut removed: BTreeSet<String> = BTreeSet::new();
         // Where evicted pods could go: online pool members, plus schedulable nodes
         // outside any scaling pool (e.g. an always-on base) that never power off.
@@ -489,9 +597,14 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             step - leaving
         };
 
-        for m in eligible {
-            if removed.len() >= budget || online_now - removed.len() <= spec.min_online as usize {
-                break;
+        for (i, m) in eligible.iter().enumerate() {
+            if removed.len() >= budget {
+                off_notes.insert(m.name.clone(), format!("kept: maxNodesPerStep ({step}) reached"));
+                continue;
+            }
+            if online_now - removed.len() <= spec.min_online as usize {
+                off_notes.insert(m.name.clone(), format!("kept: minOnline ({})", spec.min_online));
+                continue;
             }
             // Simulate moving this node's pods to the remaining online nodes.
             let mut trial = free.clone();
@@ -526,7 +639,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             if all_fit {
                 free = trial;
                 removed.insert(m.name.clone());
-                let reason = if over_max > 0 {
+                let why = if over_max > 0 {
                     format!("pool above maxOnline ({max_online})")
                 } else {
                     format!(
@@ -536,25 +649,255 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                         unneeded_for.num_seconds()
                     )
                 };
+                // The machine that would have gone otherwise: the next eligible one.
+                let decided = match eligible[i + 1..].iter().find(|o| !removed.contains(&o.name)) {
+                    Some(next) => format!("before {} by {}", next.name, deciding_rule(spec, m, next, true)),
+                    None => "the only machine eligible".into(),
+                };
+                let rank = candidates.iter().position(|o| o.name == m.name).unwrap_or(0) + 1;
+                let reason = format!("{why}; #{rank} of {} to power off, {decided}", candidates.len());
+                off_notes.insert(m.name.clone(), reason.clone());
                 plan.power_off.push((m.name.clone(), reason));
+            } else {
+                off_notes.insert(m.name.clone(), "kept: its pods would not fit elsewhere".into());
             }
         }
     }
 
-    plan.message = match (plan.power_on.len(), plan.power_off.len(), blocked_reason) {
-        (0, 0, Some(r)) if r != "scaling up" && !plan.unneeded_since.is_empty() => {
+    plan.message = match (plan.power_on.len(), plan.power_off.len(), &blocked_reason) {
+        (0, 0, Some(r)) if r.stable != "scaling up" && !plan.unneeded_since.is_empty() => {
+            // The message stays stable while the hold lasts (no seconds in it).
+            let r = r.stable.split(" until ").next().unwrap_or(&r.stable);
             format!("steady ({} unneeded; scale down held: {r})", plan.unneeded_since.len())
         }
         (0, 0, _) => "steady".to_string(),
         (on, off, _) => format!("powering on {on}, powering off {off}"),
     };
+
+    // --- explanation ---------------------------------------------------------
+    let compact = |list: &[&Member]| {
+        list.iter()
+            .map(|m| {
+                let mut tags = vec![format!("w{}", spec.scale_up.node_weight(&m.name))];
+                if m.s3_capable {
+                    tags.push("s3".into());
+                }
+                tags.push(size(m));
+                format!("{}({})", m.name, tags.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join(" > ")
+    };
+    let render = |live: bool| -> Vec<String> {
+        let mut lines = Vec::new();
+        for m in &ranked_up {
+            let mut line = format!("{}: #{} to power on ({})", m.name, rank_up(m), traits(spec, m));
+            match up_notes.iter().find(|(n, _)| *n == m.name) {
+                Some(_) => line.push_str("; chosen"),
+                None if !pending.iter().any(|p| pod_fits(p, m, &m.allocatable)) && !pending.is_empty() => {
+                    line.push_str("; no pending pod fits")
+                }
+                None => {}
+            }
+            lines.push(line);
+        }
+        for (i, m) in candidates.iter().enumerate() {
+            let note = &down_notes[&m.name];
+            let mut line = format!(
+                "{}: #{} to power off ({}); {}",
+                m.name,
+                i + 1,
+                traits(spec, m),
+                if live { &note.live } else { &note.stable }
+            );
+            if let Some(off) = off_notes.get(&m.name) {
+                if plan.power_off.iter().any(|(n, _)| n == &m.name) {
+                    line.push_str("; chosen");
+                } else {
+                    line.push_str(&format!("; {off}"));
+                }
+            }
+            lines.push(line);
+        }
+        let mut others: Vec<&Member> = s
+            .members
+            .iter()
+            .filter(|m| !ranked_up.iter().chain(candidates.iter()).any(|o| o.name == m.name))
+            .collect();
+        others.sort_by(|a, b| a.name.cmp(&b.name));
+        for m in others {
+            let why = match m.state {
+                _ if !m.auto => "excluded: powerPolicy is not Auto",
+                MemberState::Booting => "powering on",
+                MemberState::Leaving => "powering off",
+                MemberState::Unavailable => "excluded: state unknown or in error",
+                // Unreachable: Auto Online/Offline members are ranked above.
+                MemberState::Online | MemberState::Offline => "not ranked",
+            };
+            lines.push(format!("{}: {why}", m.name));
+        }
+        lines
+    };
+    plan.details = render(false);
+    plan.live_details = render(true);
+
+    let up_candidates = compact(&ranked_up);
+    let down_candidates = compact(&candidates);
+    for (name, reason) in &plan.power_on {
+        plan.decisions.push(PlannedDecision {
+            action: DecisionAction::PowerOn,
+            node: Some(name.clone()),
+            reason: reason.clone(),
+            live_reason: reason.clone(),
+            candidates: up_candidates.clone(),
+        });
+    }
+    for (name, reason) in &plan.power_off {
+        plan.decisions.push(PlannedDecision {
+            action: DecisionAction::PowerOff,
+            node: Some(name.clone()),
+            reason: reason.clone(),
+            live_reason: reason.clone(),
+            candidates: down_candidates.clone(),
+        });
+    }
+    if plan.decisions.is_empty() {
+        let unneeded: Vec<&str> = candidates
+            .iter()
+            .filter(|m| plan.unneeded_since.contains_key(&m.name))
+            .map(|m| m.name.as_str())
+            .collect();
+        let why = |live: bool| -> String {
+            if let Some((pod, why)) = unplaced.first() {
+                let more = match unplaced.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more)", n - 1),
+                };
+                format!("pod {pod}{more} waits: {why}")
+            } else if let (Some(r), false) = (&blocked_reason, unneeded.is_empty()) {
+                format!(
+                    "scale-down held ({}): {}",
+                    if live { &r.live } else { &r.stable },
+                    unneeded
+                        .iter()
+                        .map(|n| format!(
+                            "{n} {}",
+                            if live {
+                                &down_notes[*n].live
+                            } else {
+                                &down_notes[*n].stable
+                            }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            } else if !unneeded.is_empty() {
+                unneeded
+                    .iter()
+                    .map(|n| {
+                        let note = if live {
+                            &down_notes[*n].live
+                        } else {
+                            &down_notes[*n].stable
+                        };
+                        match off_notes.get(*n) {
+                            Some(kept) => format!("{n} {note}; {kept}"),
+                            None => format!("{n} {note}"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else if plan.relevant_pending > 0 {
+                format!(
+                    "{} pending pod(s) fit capacity already powering on",
+                    plan.relevant_pending
+                )
+            } else {
+                format!("{online_now} online, nothing pending, nothing unneeded")
+            }
+        };
+        plan.decisions.push(PlannedDecision {
+            action: DecisionAction::NoAction,
+            node: None,
+            reason: why(false),
+            live_reason: why(true),
+            candidates: if unneeded.is_empty() && unplaced.is_empty() {
+                String::new()
+            } else if unplaced.is_empty() {
+                down_candidates
+            } else {
+                up_candidates
+            },
+        });
+    }
     plan
+}
+
+/// Text in two renderings: `stable` for status and events (absolute times, so
+/// it only changes when the situation does), `live` for logs (seconds).
+#[derive(Clone, Debug)]
+struct Note {
+    stable: String,
+    live: String,
+}
+
+impl Note {
+    fn same(s: String) -> Self {
+        Note {
+            stable: s.clone(),
+            live: s,
+        }
+    }
+}
+
+fn hhmmss(t: DateTime<Utc>) -> String {
+    t.format("%H:%M:%SZ").to_string()
+}
+
+fn size(m: &Member) -> String {
+    let cpu = m.allocatable.cpu_millis as f64 / 1000.0;
+    let gib = m.allocatable.memory_bytes as f64 / (1u64 << 30) as f64;
+    format!("{cpu}c/{gib:.0}Gi")
+}
+
+fn traits(spec: &NodeScalingPoolSpec, m: &Member) -> String {
+    format!(
+        "weight {}, S3 {}, {}",
+        spec.scale_up.node_weight(&m.name),
+        if m.s3_capable { "yes" } else { "no" },
+        size(m)
+    )
+}
+
+/// The rule of `power_on_order` that puts `chosen` ahead of `other`: for
+/// scale-up (`down == false`) `chosen` ranks before `other`; for scale-down it
+/// ranks after it.
+pub fn deciding_rule(spec: &NodeScalingPoolSpec, chosen: &Member, other: &Member, down: bool) -> String {
+    let (wc, wo) = (
+        spec.scale_up.node_weight(&chosen.name),
+        spec.scale_up.node_weight(&other.name),
+    );
+    let size_key = |m: &Member| (m.allocatable.cpu_millis, m.allocatable.memory_bytes);
+    if wc != wo {
+        format!("weight ({wc} vs {wo})")
+    } else if spec.scale_up.prefer_s3_capable && chosen.s3_capable != other.s3_capable {
+        if down {
+            "S3 capability (not S3-capable)"
+        } else {
+            "S3 capability (S3-capable)"
+        }
+        .to_string()
+    } else if size_key(chosen) != size_key(other) {
+        format!("size ({} vs {})", size(chosen), size(other))
+    } else {
+        format!("name ({} {} {})", chosen.name, if down { ">" } else { "<" }, other.name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{ScaleDownSpec, ScaleUpSpec};
+    use crate::crd::{PreferredNode, ScaleDownSpec, ScaleUpSpec};
 
     const GI: i64 = 1 << 30;
 
@@ -569,12 +912,14 @@ mod tests {
                 max_nodes_per_step: 3,
                 require_explicit_selection: false,
                 prefer_s3_capable: false,
+                preferred_nodes: vec![],
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
                 utilization_threshold_percent: 50,
                 unneeded_seconds: 600,
-                delay_after_scale_up_seconds: 600,
+                hold_after_power_on_seconds: Some(600),
+                delay_after_scale_up_seconds: None,
                 drain_failure_backoff_seconds: 1800,
                 max_nodes_per_step: 1,
                 ignore_daemon_set_utilization: false,
@@ -692,6 +1037,366 @@ mod tests {
         assert_eq!(fallback.power_on[0].0, "big");
     }
 
+    fn prefer(spec: &mut NodeScalingPoolSpec, weights: &[(&str, u32)]) {
+        spec.scale_up.preferred_nodes = weights
+            .iter()
+            .map(|(name, weight)| PreferredNode {
+                name: name.to_string(),
+                weight: *weight,
+            })
+            .collect();
+    }
+
+    #[test]
+    fn preferred_nodes_order_scale_up_before_s3_and_size() {
+        let now = Utc::now();
+        let mut big = member("big", MemberState::Offline, 0);
+        big.allocatable.cpu_millis = 16000;
+        let mut sleeper = member("sleeper", MemberState::Offline, 0);
+        sleeper.s3_capable = true;
+        let plain = member("plain", MemberState::Offline, 0);
+        let members = vec![big, sleeper, plain];
+        let pods = vec![pod("p1", 1000, 60, now)];
+        let first = |spec: &NodeScalingPoolSpec, pods: Vec<PodView>| {
+            plan(&snapshot(spec, members.clone(), pods, now)).power_on[0].0.clone()
+        };
+
+        let mut spec = spec();
+        spec.scale_up.prefer_s3_capable = true;
+        assert_eq!(first(&spec, pods.clone()), "sleeper", "no weights: S3, then size");
+
+        // The weight comes before S3 capability and size.
+        prefer(&mut spec, &[("plain", 10)]);
+        assert_eq!(first(&spec, pods.clone()), "plain");
+        prefer(&mut spec, &[("plain", 10), ("big", 50)]);
+        assert_eq!(first(&spec, pods.clone()), "big");
+
+        // Equal weights fall back to S3 capability, then size.
+        prefer(&mut spec, &[("plain", 50), ("big", 50), ("sleeper", 50)]);
+        assert_eq!(first(&spec, pods.clone()), "sleeper");
+        spec.scale_up.prefer_s3_capable = false;
+        assert_eq!(first(&spec, pods.clone()), "big");
+
+        // A preferred machine the pod does not fit on is skipped, not forced.
+        prefer(&mut spec, &[("plain", 100), ("sleeper", 90)]);
+        assert_eq!(first(&spec, vec![pod("huge", 12000, 60, now)]), "big");
+    }
+
+    #[test]
+    fn preferred_nodes_order_min_online() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.min_online = 1;
+        prefer(&mut spec, &[("b", 100), ("a", 10)]);
+        let members = vec![
+            member("a", MemberState::Offline, 0),
+            member("b", MemberState::Offline, 0),
+            member("c", MemberState::Offline, 0),
+        ];
+        let p = plan(&snapshot(&spec, members, vec![], now));
+        assert_eq!(p.power_on.len(), 1);
+        assert_eq!(p.power_on[0].0, "b");
+    }
+
+    /// Every member unneeded for long enough; returns the one powered off first.
+    fn first_off(spec: &NodeScalingPoolSpec, members: Vec<Member>, now: DateTime<Utc>) -> String {
+        let mut s = snapshot(spec, members, vec![], now);
+        s.unneeded_since = s
+            .members
+            .iter()
+            .map(|m| (m.name.clone(), now - Duration::seconds(700)))
+            .collect();
+        let p = plan(&s);
+        assert_eq!(p.power_off.len(), 1, "one per step");
+        p.power_off[0].0.clone()
+    }
+
+    #[test]
+    fn preferred_nodes_power_off_lightest_first() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.min_online = 0;
+        let members = vec![
+            member("a", MemberState::Online, 300),
+            member("b", MemberState::Online, 200),
+            member("c", MemberState::Online, 100),
+        ];
+        // All alike: the last name goes first.
+        assert_eq!(first_off(&spec, members.clone(), now), "c");
+        // Unlisted machines weigh 0 and go before any listed one.
+        prefer(&mut spec, &[("c", 100), ("b", 50)]);
+        assert_eq!(first_off(&spec, members.clone(), now), "a");
+        prefer(&mut spec, &[("c", 100), ("a", 10), ("b", 20)]);
+        assert_eq!(first_off(&spec, members, now), "a");
+    }
+
+    #[test]
+    fn ties_break_by_s3_then_size_then_name_and_scale_down_is_the_reverse() {
+        let now = Utc::now();
+        let mk = |name: &str, state, cpu: i64, s3: bool| {
+            let mut m = member(name, state, 0);
+            m.allocatable.cpu_millis = cpu;
+            m.s3_capable = s3;
+            m
+        };
+        let mut spec = spec();
+        spec.max_online = None;
+        spec.min_online = 0;
+        spec.scale_up.prefer_s3_capable = true;
+        prefer(&mut spec, &[("w-small", 50), ("w-big", 50)]);
+        let fleet = |state| {
+            vec![
+                mk("z-s3-big", state, 8000, true),
+                mk("plain-big", state, 8000, false),
+                mk("a-s3-big", state, 8000, true),
+                mk("w-small", state, 2000, false),
+                mk("s3-small", state, 2000, true),
+                mk("w-big", state, 8000, false),
+            ]
+        };
+        let expected_up = ["w-big", "w-small", "a-s3-big", "z-s3-big", "s3-small", "plain-big"];
+
+        let mut sorted = fleet(MemberState::Offline);
+        sorted.sort_by(|a, b| power_on_order(&spec, a, b));
+        let names: Vec<&str> = sorted.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, expected_up);
+
+        // The plan follows it: minOnline powers machines on in this order...
+        spec.min_online = 6;
+        spec.scale_up.max_nodes_per_step = 6;
+        let p = plan(&snapshot(&spec, fleet(MemberState::Offline), vec![], now));
+        let on: Vec<&str> = p.power_on.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(on, expected_up);
+        // ...and the input order does not matter.
+        let mut reversed = fleet(MemberState::Offline);
+        reversed.reverse();
+        let p = plan(&snapshot(&spec, reversed, vec![], now));
+        let on: Vec<&str> = p.power_on.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(on, expected_up);
+
+        // Scale-down takes them in the exact reverse order.
+        spec.min_online = 0;
+        spec.scale_down.max_nodes_per_step = 6;
+        let mut s = snapshot(&spec, fleet(MemberState::Online), vec![], now);
+        s.unneeded_since = s
+            .members
+            .iter()
+            .map(|m| (m.name.clone(), now - Duration::seconds(700)))
+            .collect();
+        let p = plan(&s);
+        let off: Vec<&str> = p.power_off.iter().map(|(n, _)| n.as_str()).collect();
+        let mut expected_down = expected_up.to_vec();
+        expected_down.reverse();
+        assert_eq!(off, expected_down);
+
+        // Without preferS3Capable, S3 capability plays no part.
+        spec.scale_up.prefer_s3_capable = false;
+        let mut sorted = fleet(MemberState::Offline);
+        sorted.sort_by(|a, b| power_on_order(&spec, a, b));
+        let names: Vec<&str> = sorted.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["w-big", "w-small", "a-s3-big", "plain-big", "z-s3-big", "s3-small"]
+        );
+    }
+
+    #[test]
+    fn deprecated_delay_name_still_holds_scale_down() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.scale_down.hold_after_power_on_seconds = None;
+        spec.scale_down.delay_after_scale_up_seconds = Some(30);
+        let s = |spec| PoolSnapshot {
+            last_scale_up: Some(now - Duration::seconds(60)),
+            unneeded_since: BTreeMap::from([("b".to_string(), now - Duration::seconds(700))]),
+            ..snapshot(
+                spec,
+                vec![member("a", MemberState::Online, 0), member("b", MemberState::Online, 0)],
+                vec![],
+                now,
+            )
+        };
+        assert_eq!(plan(&s(&spec)).power_off.len(), 1, "a 30 s hold has passed after 60 s");
+        // The new name wins over the old one.
+        let mut spec = spec.clone();
+        spec.scale_down.hold_after_power_on_seconds = Some(120);
+        let p = plan(&s(&spec));
+        assert!(p.power_off.is_empty());
+        assert!(p.message.contains("holding after power-on"), "{}", p.message);
+    }
+
+    #[test]
+    fn scale_up_decision_explains_rank_and_rule() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.scale_up.prefer_s3_capable = true;
+        prefer(&mut spec, &[("devbox", 100), ("vulpes-zerda", 10)]);
+        let mut devbox = member("devbox", MemberState::Offline, 0);
+        devbox.s3_capable = true;
+        let mut fixed = member("fixed", MemberState::Offline, 0);
+        fixed.auto = false;
+        let members = vec![
+            member("vulpes-zerda", MemberState::Offline, 0),
+            devbox,
+            fixed,
+            member("a", MemberState::Online, 3900),
+        ];
+        let p = plan(&snapshot(&spec, members, vec![pod("p1", 1000, 60, now)], now));
+        assert_eq!(p.decisions.len(), 1);
+        let d = &p.decisions[0];
+        assert_eq!(d.action, DecisionAction::PowerOn);
+        assert_eq!(d.node.as_deref(), Some("devbox"));
+        assert_eq!(
+            d.reason,
+            "unschedulable pod default/p1; #1 of 2 to power on, over vulpes-zerda by weight (100 vs 10)"
+        );
+        assert_eq!(d.candidates, "devbox(w100 s3 4c/16Gi) > vulpes-zerda(w10 4c/16Gi)");
+        assert!(
+            p.details
+                .contains(&"devbox: #1 to power on (weight 100, S3 yes, 4c/16Gi); chosen".to_string())
+        );
+        assert!(
+            p.details
+                .contains(&"vulpes-zerda: #2 to power on (weight 10, S3 no, 4c/16Gi)".to_string())
+        );
+        assert!(
+            p.details
+                .contains(&"fixed: excluded: powerPolicy is not Auto".to_string())
+        );
+
+        // Equal weights: S3 capability decides, then size, then name.
+        prefer(&mut spec, &[]);
+        let p = plan(&snapshot(
+            &spec,
+            vec![
+                member("y", MemberState::Offline, 0),
+                member("x", MemberState::Offline, 0),
+            ],
+            vec![pod("p1", 1000, 60, now)],
+            now,
+        ));
+        assert_eq!(
+            p.decisions[0].reason,
+            "unschedulable pod default/p1; #1 of 2 to power on, over y by name (x < y)"
+        );
+    }
+
+    #[test]
+    fn scale_down_decision_explains_rank_and_rule() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.min_online = 0;
+        prefer(&mut spec, &[("devbox", 100), ("vulpes-zerda", 10)]);
+        let mut s = snapshot(
+            &spec,
+            vec![
+                member("devbox", MemberState::Online, 100),
+                member("vulpes-zerda", MemberState::Online, 100),
+            ],
+            vec![],
+            now,
+        );
+        s.unneeded_since = BTreeMap::from([
+            ("devbox".to_string(), now - Duration::seconds(700)),
+            ("vulpes-zerda".to_string(), now - Duration::seconds(700)),
+        ]);
+        let p = plan(&s);
+        let d = &p.decisions[0];
+        assert_eq!(d.action, DecisionAction::PowerOff);
+        assert_eq!(d.node.as_deref(), Some("vulpes-zerda"));
+        assert_eq!(
+            d.reason,
+            "utilization 2% below 50% for 600s; #1 of 2 to power off, before devbox by weight (10 vs 100)"
+        );
+        assert_eq!(d.candidates, "vulpes-zerda(w10 4c/16Gi) > devbox(w100 4c/16Gi)");
+        assert!(
+            p.details
+                .iter()
+                .any(|l| l.starts_with("devbox: #2 to power off") && l.ends_with("kept: maxNodesPerStep (1) reached")),
+            "{:?}",
+            p.details
+        );
+    }
+
+    #[test]
+    fn no_action_explains_the_hold_stably_and_live() {
+        let now = Utc::now();
+        let spec = spec();
+        let scaled_up = now - Duration::seconds(100);
+        let unneeded = now - Duration::seconds(700);
+        let s = PoolSnapshot {
+            last_scale_up: Some(scaled_up),
+            unneeded_since: BTreeMap::from([("b".to_string(), unneeded)]),
+            ..snapshot(
+                &spec,
+                vec![
+                    member("a", MemberState::Online, 3000),
+                    member("b", MemberState::Online, 0),
+                ],
+                vec![],
+                now,
+            )
+        };
+        let p = plan(&s);
+        assert_eq!(p.decisions.len(), 1);
+        let d = &p.decisions[0];
+        assert_eq!(d.action, DecisionAction::NoAction);
+        let until = hhmmss(scaled_up + Duration::seconds(600));
+        assert_eq!(
+            d.reason,
+            format!(
+                "scale-down held (holding after power-on until {until}): b unneeded since {}",
+                hhmmss(unneeded)
+            )
+        );
+        assert_eq!(
+            d.live_reason,
+            format!(
+                "scale-down held (holding after power-on, 500s left): b unneeded since {}",
+                hhmmss(unneeded)
+            )
+        );
+        // The same situation a little later explains itself identically in status.
+        let later = PoolSnapshot {
+            now: now + Duration::seconds(15),
+            last_scale_up: Some(scaled_up),
+            unneeded_since: BTreeMap::from([("b".to_string(), unneeded)]),
+            ..snapshot(
+                &spec,
+                vec![
+                    member("a", MemberState::Online, 3000),
+                    member("b", MemberState::Online, 0),
+                ],
+                vec![],
+                now + Duration::seconds(15),
+            )
+        };
+        assert_eq!(plan(&later).decisions[0].reason, d.reason);
+        assert_eq!(plan(&later).details, p.details);
+        assert!(
+            p.details
+                .contains(&"a: #2 to power off (weight 0, S3 no, 4c/16Gi); busy: utilization 75% >= 50%".to_string())
+        );
+    }
+
+    #[test]
+    fn no_action_explains_waiting_pods() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.max_online = Some(1);
+        let p = plan(&snapshot(
+            &spec,
+            vec![
+                member("a", MemberState::Online, 3900),
+                member("b", MemberState::Offline, 0),
+            ],
+            vec![pod("p1", 1000, 60, now)],
+            now,
+        ));
+        assert_eq!(p.decisions[0].action, DecisionAction::NoAction);
+        assert_eq!(p.decisions[0].reason, "pod default/p1 waits: maxOnline (1) reached");
+    }
+
     #[test]
     fn ignores_young_pending_pods() {
         let now = Utc::now();
@@ -745,7 +1450,10 @@ mod tests {
         );
         assert_eq!(
             plan(&s).power_on,
-            vec![("gpu".to_string(), "unschedulable pod default/needs-gpu".to_string())]
+            vec![(
+                "gpu".to_string(),
+                "unschedulable pod default/needs-gpu; #2 of 2 to power on, the only machine off that fits".to_string()
+            )]
         );
 
         let s = snapshot(
@@ -1022,12 +1730,14 @@ mod dedicated_pool_tests {
                 max_nodes_per_step: 1,
                 require_explicit_selection: true,
                 prefer_s3_capable: false,
+                preferred_nodes: vec![],
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
                 utilization_threshold_percent: 10,
                 unneeded_seconds: 900,
-                delay_after_scale_up_seconds: 900,
+                hold_after_power_on_seconds: Some(900),
+                delay_after_scale_up_seconds: None,
                 drain_failure_backoff_seconds: 1800,
                 max_nodes_per_step: 1,
                 ignore_daemon_set_utilization: true,

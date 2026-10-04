@@ -36,3 +36,23 @@ spec:
     - port: metrics
       interval: {{ .Values.metrics.serviceMonitor.interval }}
 {{- end }}
+{{- if .Values.webhook.enabled }}
+---
+# The API server calls the NodeScalingPool webhook through this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "kube-hardware-autoscaler.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+      protocol: TCP
+{{- end }}
