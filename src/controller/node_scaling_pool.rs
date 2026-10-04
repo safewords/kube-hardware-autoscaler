@@ -4,8 +4,10 @@
 //! the `NodePowerManagementConfig` controller then carries out.
 //!
 //! Membership is resolved from Node labels with the same function the
-//! `NodePowerManagementConfig` controller uses, so both always agree. Machines selected by
-//! more than one pool are conflicts and belong to none.
+//! `NodePowerManagementConfig` controller uses, so both always agree. Pools may overlap:
+//! a machine selected by several pools is a member of each. Any of them may power it on;
+//! one powers it off only when every other pool selecting it lists it in
+//! `status.releasable` (otherwise its decision says which pool needs it and why).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,9 +36,10 @@ use crate::scaling::{
 
 const INTERVAL: Duration = Duration::from_secs(15);
 
-/// Maps a member NodePowerManagementConfig to its autoscaler state. `pool` is this pool's
-/// name: decisions made by any other pool are ignored.
-pub fn member_state(mn: &NodePowerManagementConfig, pool: &str) -> MemberState {
+/// Maps a member NodePowerManagementConfig to its autoscaler state. `pools` are
+/// the pools the machine belongs to: a decision by any of them counts (a
+/// machine another pool woke is booting for this one too), others are ignored.
+pub fn member_state(mn: &NodePowerManagementConfig, pools: &[String]) -> MemberState {
     let st = mn.status.clone().unwrap_or_default();
     // A machine failing the power-state consistency gate is never touched.
     if st
@@ -55,7 +58,7 @@ pub fn member_state(mn: &NodePowerManagementConfig, pool: &str) -> MemberState {
     let decision = st
         .scaling_decision
         .as_ref()
-        .filter(|d| d.pool == pool)
+        .filter(|d| pools.contains(&d.pool))
         .map(|d| d.target);
     match decision {
         Some(PowerTarget::Off) if matches!(st.phase, Phase::Off | Phase::Standby) => MemberState::Offline,
@@ -73,8 +76,12 @@ pub fn member_state(mn: &NodePowerManagementConfig, pool: &str) -> MemberState {
     }
 }
 
-fn build_member(mn: &NodePowerManagementConfig, pool: &NodeScalingPool, ctx: &Context) -> Option<Member> {
-    let pool_name = pool.name_any();
+fn build_member(
+    mn: &NodePowerManagementConfig,
+    member_of: &[String],
+    pool: &NodeScalingPool,
+    ctx: &Context,
+) -> Option<Member> {
     let down = &pool.spec.scale_down;
     let st = mn.status.clone().unwrap_or_default();
     // Membership requires a live Node, so it exists here.
@@ -137,7 +144,12 @@ fn build_member(mn: &NodePowerManagementConfig, pool: &NodeScalingPool, ctx: &Co
 
     Some(Member {
         name: mn.name_any(),
-        state: member_state(mn, &pool_name),
+        state: member_state(mn, member_of),
+        woken_by: st
+            .scaling_decision
+            .as_ref()
+            .filter(|d| d.target == PowerTarget::On && member_of.contains(&d.pool))
+            .map(|d| d.pool.clone()),
         auto: mn.spec.power_policy == PowerPolicy::Auto,
         labels: node.labels().clone(),
         taints,
@@ -205,6 +217,37 @@ async fn decide(
     )
     .await?;
     Ok(())
+}
+
+/// The other pools selecting machine `member` that do not (yet) agree to power
+/// it off, with their reason: those not listing it in `status.releasable`.
+/// A pool that has not evaluated it yet keeps it on.
+pub fn other_pools_holding(
+    member: &str,
+    member_of: &[String],
+    this_pool: &str,
+    pools: &[Arc<NodeScalingPool>],
+) -> Vec<(String, String)> {
+    member_of
+        .iter()
+        .filter(|p| p.as_str() != this_pool)
+        .filter_map(|other| {
+            let st = pools
+                .iter()
+                .find(|p| p.name_any() == *other)
+                .and_then(|p| p.status.clone())
+                .unwrap_or_default();
+            if st.releasable.iter().any(|m| m == member) {
+                return None;
+            }
+            let why = st
+                .needed
+                .get(member)
+                .cloned()
+                .unwrap_or_else(|| "not evaluated yet".into());
+            Some((other.clone(), why))
+        })
+        .collect()
 }
 
 /// Problems with `scaleUp.preferredNodes`: entries naming no Node, and entries
@@ -333,16 +376,27 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
 
     let pools = ctx.pools();
     let mut managed: Vec<Arc<NodePowerManagementConfig>> = Vec::new();
-    let mut conflicts: Vec<String> = Vec::new();
+    let mut members: Vec<Member> = Vec::new();
+    let mut kept_by_others: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
     for mn in ctx.node_power_management_configs.state() {
         let node = ctx.node(&mn.spec.node_name);
-        match membership::resolve(node.as_deref().map(|n| n.labels()), pools.iter().map(|p| p.as_ref())) {
-            Membership::Member(p) if p == name => managed.push(mn),
-            Membership::Conflict(ps) if ps.contains(&name) => conflicts.push(mn.name_any()),
-            _ => {}
+        let Membership::Member(member_of) =
+            membership::resolve(node.as_deref().map(|n| n.labels()), pools.iter().map(|p| p.as_ref()))
+        else {
+            continue;
+        };
+        if !member_of.contains(&name) {
+            continue;
         }
+        let holds = other_pools_holding(&mn.name_any(), &member_of, &name, &pools);
+        if !holds.is_empty() {
+            kept_by_others.insert(mn.name_any(), holds);
+        }
+        if let Some(m) = build_member(&mn, &member_of, &pool, &ctx) {
+            members.push(m);
+        }
+        managed.push(mn);
     }
-    let members: Vec<Member> = managed.iter().filter_map(|mn| build_member(mn, &pool, &ctx)).collect();
     let external = external_nodes(&ctx);
     let pending: Vec<PodView> = ctx
         .pods
@@ -360,6 +414,7 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
         last_scale_up: old.last_scale_up_time,
         unneeded_since: old.unneeded_since.clone(),
         external,
+        kept_by_others,
     };
     let result = plan(&snapshot);
 
@@ -426,22 +481,15 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
         result.online as usize + result.power_on.len() - result.power_off.len().min(result.online as usize);
     let mut member_names: Vec<String> = managed.iter().map(|m| m.name_any()).collect();
     member_names.sort();
-    conflicts.sort();
     st.members = member_names;
-    st.conflicts = conflicts;
+    st.conflicts = Vec::new();
+    st.releasable = result.releasable.clone();
+    st.needed = result.needed.clone();
     st.total_nodes = managed.len() as u32;
     st.online_nodes = online_after as u32;
     st.pending_pods = result.relevant_pending;
     st.unneeded_since = result.unneeded_since;
-    st.message = Some(if st.conflicts.is_empty() {
-        result.message
-    } else {
-        format!(
-            "{} (excluded, selected by several pools: {})",
-            result.message,
-            st.conflicts.join(", ")
-        )
-    });
+    st.message = Some(result.message);
     if !result.power_on.is_empty() {
         st.last_scale_up_time = Some(now);
     }
@@ -506,7 +554,7 @@ mod tests {
     #[test]
     fn maps_member_states() {
         use MemberState::*;
-        let s = |m: NodePowerManagementConfig| member_state(&m, "p");
+        let s = |m: NodePowerManagementConfig| member_state(&m, &["p".to_string()]);
         assert_eq!(s(mn(PowerPolicy::Auto, Phase::On, true, None)), Online);
         assert_eq!(s(mn(PowerPolicy::Auto, Phase::Off, false, None)), Offline);
         assert_eq!(
@@ -548,7 +596,7 @@ mod tests {
             true,
             Some(("deleted-pool", PowerTarget::Off)),
         );
-        assert_eq!(member_state(&m, "p"), MemberState::Online);
+        assert_eq!(member_state(&m, &["p".to_string()]), MemberState::Online);
     }
 
     #[test]
@@ -561,7 +609,7 @@ mod tests {
             "",
             Utc::now(),
         );
-        assert_eq!(member_state(&m, "p"), MemberState::Unavailable);
+        assert_eq!(member_state(&m, &["p".to_string()]), MemberState::Unavailable);
     }
 
     fn decision(action: DecisionAction, node: Option<&str>, reason: &str) -> PlannedDecision {
@@ -638,5 +686,41 @@ mod tests {
         });
         assert_eq!(missing, ["gone"]);
         assert_eq!(outside, ["cpu-box"]);
+    }
+
+    #[test]
+    fn other_pools_hold_a_machine_until_they_release_it() {
+        use crate::crd::{NodeScalingPoolSpec, NodeScalingPoolStatus};
+        use std::collections::BTreeMap;
+        let mk = |name: &str, status: Option<NodeScalingPoolStatus>| {
+            let spec: NodeScalingPoolSpec =
+                serde_json::from_value(json!({"nodeSelector": {"matchLabels": {name: "true"}}})).unwrap();
+            let mut p = NodeScalingPool::new(name, spec);
+            p.status = status;
+            Arc::new(p)
+        };
+        let member_of = vec!["ci".to_string(), "gpu".to_string()];
+        let busy = NodeScalingPoolStatus {
+            needed: BTreeMap::from([("zerda".to_string(), "busy: utilization 50% >= 10%".to_string())]),
+            ..Default::default()
+        };
+        let pools = vec![mk("gpu", None), mk("ci", Some(busy))];
+        assert_eq!(
+            other_pools_holding("zerda", &member_of, "gpu", &pools),
+            vec![("ci".to_string(), "busy: utilization 50% >= 10%".to_string())]
+        );
+        // From ci's side, gpu has not evaluated it yet: it keeps it on too.
+        assert_eq!(
+            other_pools_holding("zerda", &member_of, "ci", &pools),
+            vec![("gpu".to_string(), "not evaluated yet".to_string())]
+        );
+        let releases = NodeScalingPoolStatus {
+            releasable: vec!["zerda".into()],
+            ..Default::default()
+        };
+        let pools = vec![mk("gpu", None), mk("ci", Some(releases))];
+        assert!(other_pools_holding("zerda", &member_of, "gpu", &pools).is_empty());
+        // A machine in one pool only is never held by another.
+        assert!(other_pools_holding("zerda", &["gpu".to_string()], "gpu", &pools).is_empty());
     }
 }

@@ -282,7 +282,8 @@ pub enum PowerTarget {
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScalingDecision {
-    /// The `NodeScalingPool` that made the decision. A decision is ignored (and
+    /// The `NodeScalingPool` that made the decision (with overlapping pools,
+    /// the one that woke or powered off the machine). A decision is ignored (and
     /// cleared) once the machine is no longer a member of that pool, e.g.
     /// because the pool was deleted or the Node's labels changed.
     #[serde(default)]
@@ -342,10 +343,15 @@ pub struct NodePowerManagementConfigStatus {
     /// Whether the Kubernetes node currently reports `Ready`.
     #[serde(default)]
     pub node_ready: bool,
-    /// The `NodeScalingPool` whose `nodeSelector` matches this machine's Node, if
-    /// exactly one does.
+    /// The `NodeScalingPool`s whose `nodeSelector` matches this machine's Node,
+    /// comma-separated (for display; see `pools`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// The `NodeScalingPool`s whose `nodeSelector` matches this machine's
+    /// Node, sorted. Pools may overlap: any of them may power the machine on,
+    /// and it is powered off only when all of them agree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
     /// Latest decision from the pool autoscaler (only honoured with
     /// `powerPolicy: Auto`, and only while the machine is still a member of
     /// the pool that made it).
@@ -441,8 +447,10 @@ pub struct ResourceAmounts {
 
 /// A class of machines, selected by the labels of their Kubernetes Nodes, that
 /// are powered on and off together based on demand. Every `NodePowerManagementConfig` whose
-/// Node matches `nodeSelector` is a member; a Node matched by more than one
-/// pool is a conflict and belongs to none.
+/// Node matches `nodeSelector` is a member. Pools may overlap: a machine
+/// selected by several pools is a member of each; any of them may power it on
+/// for its own pending pods, and it is powered off only when every one of them
+/// considers it unneeded (`status.releasable`).
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[kube(
     group = "hardware-autoscaler.safewords.com",
@@ -755,9 +763,20 @@ pub struct NodeScalingPoolStatus {
     /// NodePowerManagementConfigs currently in this pool.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
-    /// NodePowerManagementConfigs whose Node also matches another pool; excluded from both.
+    /// Unused since pools may overlap (always empty); kept so older objects validate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<String>,
+    /// Members this pool agrees may be powered off now: unneeded for
+    /// `unneededSeconds`, with nothing holding the pool's scale-down (pending
+    /// pods, `holdAfterPowerOnSeconds`, machines booting, `minOnline`). Another
+    /// pool selecting the same machine powers it off only if it is listed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub releasable: Vec<String>,
+    /// Why this pool keeps each other online member on ("busy: utilization
+    /// 40% >= 10%", "2 pending pod(s)", "unneeded since ..."); what another pool
+    /// selecting the same machine reports as "needed by pool <this>".
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub needed: BTreeMap<String, String>,
     #[serde(default)]
     pub total_nodes: u32,
     /// Machines that are on or powering on.

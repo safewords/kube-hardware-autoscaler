@@ -12,7 +12,7 @@
 #      PowerOn via jetkvm -> uncordon -> pod runs
 #   3. safety gates: an interface that reports Off for a live Node, and a
 #      NodePowerManagementConfig without a Node, are observed but never acted on
-#   4. a Node selected by two pools is a conflict and belongs to neither
+#   4. a Node selected by two pools is a member of both
 #   5. demand removed -> scaled down again; deleting the pool clears its decision
 #
 # Prerequisites: docker, minikube, kubectl, helm, and the image built with
@@ -117,11 +117,11 @@ sleep 20   # give the operator several reconciles to (wrongly) act
 echo "ok: AlwaysOn with an Off-reporting interface and AlwaysOff without a Node took no action"
 k delete -f hack/e2e/safety.yaml
 
-step "4. a Node selected by two pools belongs to neither"
+step "4. a Node selected by two pools is a member of both"
 printf '%s\n' 'apiVersion: hardware-autoscaler.safewords.com/v1alpha1' 'kind: NodeScalingPool' 'metadata: {name: e2e-dup}' \
   'spec: {nodeSelector: {matchLabels: {hardware-autoscaler.safewords.com/pool: e2e}}}' | k apply -f -
-wait_for "worker reported as conflict" 60 cond_is "$W" PoolMembership False/Conflict
-wait_for "pool e2e lists the conflict" 60 sh -c "kubectl --context $P get nodescalingpool e2e -o jsonpath='{.status.conflicts}' | grep -q $W"
+wait_for "worker in both pools" 60 sh -c "kubectl --context $P get npmc $W -o jsonpath='{.status.pools}' | grep -q e2e-dup"
+wait_for "pool e2e-dup lists the worker" 60 sh -c "kubectl --context $P get nodescalingpool e2e-dup -o jsonpath='{.status.members}' | grep -q $W"
 k delete nodescalingpool e2e-dup
 wait_for "worker back in pool e2e" 60 cond_is "$W" PoolMembership True/InPool
 

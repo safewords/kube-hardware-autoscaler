@@ -29,8 +29,8 @@ The operator has two custom resources (cluster-scoped, group `hardware-autoscale
 
 **Which machines a pool controls** is explicit: a machine is in a pool when it has a
 `NodePowerManagementConfig` **and** its Node's labels match the pool's `nodeSelector`. The
-selector is required and can't be empty. A Node matched by two pools is a conflict and
-belongs to neither. Label a node to enroll it, and remove the label to take it out.
+selector is required and can't be empty. Label a node to enroll it, and remove the label
+to take it out. Pools may overlap; see [Overlapping pools](#overlapping-pools).
 
 The **NodeScalingPool controller** runs every 15 seconds. It:
 
@@ -63,7 +63,7 @@ and takes no action.
 | Condition | Guards against |
 |---|---|
 | `NodeFound` | A typo in `spec.nodeName`. Without a live Node the machine can't be drained, so it's never touched. |
-| `PoolMembership` | A machine in no pool, or in two (`Conflict`). Decisions only count while the machine is still in the pool that made them. Deleting a pool, or relabelling a Node, drops its old decisions instead of leaving a stale "off". |
+| `PoolMembership` | Which pools select the machine (`status.pools`), or none. Decisions only count while the machine is still in the pool that made them. Deleting a pool, or relabelling a Node, drops its old decisions instead of leaving a stale "off". |
 | `IdentityVerified` | An interface pointing at the **wrong machine**. Redfish (`UUID`) and IPMI (Get System GUID) report a hardware ID that's compared with the Node's SMBIOS `systemUUID`. On a mismatch, that interface is disabled for every operation. Drivers that can't report an ID show `Unknown`. |
 | `PowerStateConsistent` | The same mistake, for drivers without an ID: an interface reporting **Off** while the Node is Ready and its kubelet lease was renewed seconds ago can't be controlling this machine. All power actions are refused until it's resolved. |
 
@@ -375,9 +375,9 @@ kubectl get nodepowermanagementconfigs
 # worker-1   workers   Auto     ipmi   On      On
 ```
 
-`status.members` and `status.conflicts` on the pool list exactly which machines it controls.
-Each machine's `status.pool` and its `PoolMembership` condition show the same from the
-machine's side.
+`status.members` on the pool lists exactly which machines it controls. Each machine's
+`status.pools` (and `status.pool`, comma-separated, in the POOL column) and its
+`PoolMembership` condition show the same from the machine's side.
 
 Watch the decisions in dry-run mode (`kubectl -n kube-hardware-autoscaler logs deploy/kube-hardware-autoscaler -f`
 and `kubectl get events --field-selector involvedObject.kind=NodePowerManagementConfig`).
@@ -618,6 +618,36 @@ scaleDown:
   ignoreDaemonSetUtilization: false
   ignoreNonSelectingPodUtilization: false
 ```
+
+### Overlapping pools
+
+A machine whose Node matches several pools' `nodeSelector`s is a member of each. It still has
+exactly one `NodePowerManagementConfig`, named after its Node, so one object holds its power
+state whichever pool acts on it. Each pool keeps its own rules:
+
+- **Power-on:** any pool can power the machine on, for its own pending pods. Which pods
+  count is decided by the pool's own `requireExplicitSelection`, and the pool's own
+  `preferredNodes` ranks the candidates. The pool that woke the machine is recorded as the
+  machine's `status.scalingDecision.pool`. Other pools show it as `powering on (woken by
+  pool ...)`.
+- **`maxOnline`:** each pool counts every member that is on or booting, whichever pool woke
+  it.
+- **Power-off:** each pool judges the machine by its own rules (`utilizationThresholdPercent`,
+  `ignore*Utilization`, `unneededSeconds`, its pending pods, `holdAfterPowerOnSeconds`,
+  `minOnline`). The machine is powered off only when every pool selecting it agrees. Each
+  pool publishes its side:
+  - `status.releasable`: the members it would let go now.
+  - `status.needed`: why it keeps each of the others, for example `busy: utilization 40% >=
+    10%`, `2 pending pod(s)`, `holding after power-on until 13:12:56Z` or `unneeded since
+    13:04:57Z, eligible at 13:09:57Z`.
+
+  A pool powers a machine off only if every other pool selecting it lists it as
+  releasable. Otherwise the decision says `kept: needed by pool ci: busy: utilization 50% >=
+  10%`. A pool that hasn't evaluated the machine yet keeps it on.
+
+For example, a `gpu` pool (only pods selecting `gpu=true` count) and a `ci` pool (only pods
+selecting `ci=true` count) can share a machine. A CI job running on it keeps it on through
+`ci`, although `gpu` ignores that job.
 
 ### Preferred machines
 
@@ -878,6 +908,6 @@ pick it up automatically. The CRD does not change.
 | JetKVM: `no retained state on .../atx/state` | MQTT disabled on the JetKVM, wrong `baseTopic` (it must include the device ID), or the ATX/DC extension is not active. |
 | JetKVM: commands have no effect | "Enable actions" is off in the JetKVM MQTT settings. |
 | Condition `NodeFound=False` | `spec.nodeName` doesn't match any Node. Fix the name (it must also equal `metadata.name`). |
-| Condition `PoolMembership=False, reason Conflict` | Two pools' `nodeSelector`s both match this Node. Narrow one of them. |
+| A machine stays on although one pool finds it idle | Another pool selecting it still needs it: the decision says `kept: needed by pool <name>: <reason>`, and that pool's `status.needed` has the reason. See "Overlapping pools". |
 | Condition `IdentityVerified=False` | An interface reports a different system UUID than the Node: it points at another machine. That interface is disabled. Fix its address. |
 | Condition `PowerStateConsistent=False` | An interface reports Off although the Node is alive, so it's probably wired to another machine. No power actions are taken until it agrees. |

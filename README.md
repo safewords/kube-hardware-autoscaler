@@ -48,8 +48,11 @@ spec:
   catalog line, and the CRD doesn't change.
 - **Several interfaces per machine:** tried in priority order, with per-interface timeouts
   and per-operation `actions`. Degraded interfaces show up in status.
-- **Explicit membership:** pools select machines by Node label. A machine matched by two
-  pools belongs to neither, and deleting a pool drops its decisions.
+- **Explicit membership:** pools select machines by Node label, and deleting a pool drops
+  its decisions.
+- **Overlapping pools:** a machine selected by several pools is a member of each. Any of
+  them can power it on for its own pending pods. It's powered off only when every pool
+  selecting it considers it unneeded and is past its own hold.
 - **Safety gates before every power action:**
   - The Node must exist.
   - BMCs must report the same system UUID as the Node, or that interface is disabled.
@@ -118,7 +121,7 @@ the chart or the controllers. It runs the real image and chart against a real AP
 with a fake JetKVM speaking JetKVM's MQTT protocol in place of real hardware. It covers:
 - scale-down and scale-up through the fallback chain;
 - the CEL admission rules;
-- label-based membership and pool conflicts;
+- label-based membership and overlapping pools;
 - the safety gates: a wrong-machine interface and a missing Node are never acted on.
 
 ## License

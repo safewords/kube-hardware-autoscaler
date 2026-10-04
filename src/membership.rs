@@ -1,6 +1,11 @@
-//! Pool membership: which `NodeScalingPool` (if any) a machine belongs to, derived
-//! from the labels of its Kubernetes Node. Used identically by both
-//! controllers so they can never disagree.
+//! Pool membership: which `NodeScalingPool`s a machine belongs to, derived from
+//! the labels of its Kubernetes Node. Used identically by both controllers so
+//! they can never disagree.
+//!
+//! Pools may overlap: a machine belongs to every pool whose `nodeSelector`
+//! matches its Node. Any of them may power it on; it is powered off only when
+//! all of them agree (see `NodeScalingPool.status.releasable`). A machine still
+//! has exactly one `NodePowerManagementConfig`, named after its Node.
 
 use std::collections::BTreeMap;
 
@@ -14,17 +19,16 @@ pub enum Membership {
     NoNode,
     /// No pool selects this Node.
     NotInPool,
-    /// Exactly one pool selects this Node.
-    Member(String),
-    /// Several pools select this Node; it belongs to none of them.
-    Conflict(Vec<String>),
+    /// The pools selecting this Node (at least one), sorted by name.
+    Member(Vec<String>),
 }
 
 impl Membership {
-    pub fn pool(&self) -> Option<&str> {
+    /// The pools this machine belongs to (empty unless `Member`).
+    pub fn pools(&self) -> &[String] {
         match self {
-            Membership::Member(p) => Some(p),
-            _ => None,
+            Membership::Member(p) => p,
+            _ => &[],
         }
     }
 }
@@ -43,10 +47,10 @@ pub fn resolve<'a>(
         .map(|p| p.name_any())
         .collect();
     matching.sort();
-    match matching.len() {
-        0 => Membership::NotInPool,
-        1 => Membership::Member(matching.remove(0)),
-        _ => Membership::Conflict(matching),
+    if matching.is_empty() {
+        Membership::NotInPool
+    } else {
+        Membership::Member(matching)
     }
 }
 
@@ -68,19 +72,23 @@ mod tests {
     }
 
     #[test]
-    fn resolves_membership() {
+    fn resolves_membership_including_overlap() {
         let gpu = pool("gpu", &[("example.com/gpu", "true")]);
-        let big = pool("big", &[("size", "large")]);
-        let pools = [gpu, big];
+        let ci = pool("ci", &[("example.com/ci", "true")]);
+        let pools = [gpu, ci];
         assert_eq!(resolve(None, &pools), Membership::NoNode);
         assert_eq!(resolve(Some(&labels(&[("x", "y")])), &pools), Membership::NotInPool);
         assert_eq!(
             resolve(Some(&labels(&[("example.com/gpu", "true")])), &pools),
-            Membership::Member("gpu".into())
+            Membership::Member(vec!["gpu".into()])
         );
+        // Selected by both: a member of both.
         assert_eq!(
-            resolve(Some(&labels(&[("example.com/gpu", "true"), ("size", "large")])), &pools),
-            Membership::Conflict(vec!["big".into(), "gpu".into()])
+            resolve(
+                Some(&labels(&[("example.com/gpu", "true"), ("example.com/ci", "true")])),
+                &pools
+            ),
+            Membership::Member(vec!["ci".into(), "gpu".into()])
         );
     }
 

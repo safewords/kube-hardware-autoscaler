@@ -5,8 +5,9 @@
 #   kubectl label node worker-1 worker-2 worker-3 worker-4 hardware-autoscaler.safewords.com/pool=workers
 #
 # Any Node label works (e.g. a hardware-type label such as `gpu=true`); a
-# dedicated opt-in label makes enrolment deliberate. A Node matched by two
-# pools belongs to neither (see NodeScalingPool.status.conflicts).
+# dedicated opt-in label makes enrolment deliberate. Pools may overlap: a Node
+# matched by two pools is in both, either may power it on, and it is powered
+# off only when both agree (see NodeScalingPool.status.releasable / needed).
 apiVersion: hardware-autoscaler.safewords.com/v1alpha1
 kind: NodeScalingPool
 metadata:

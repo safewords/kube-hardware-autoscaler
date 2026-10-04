@@ -358,9 +358,16 @@
                     "type": "string"
                   },
                   "pool": {
-                    "description": "The `NodeScalingPool` whose `nodeSelector` matches this machine's Node, if\nexactly one does.",
+                    "description": "The `NodeScalingPool`s whose `nodeSelector` matches this machine's Node,\ncomma-separated (for display; see `pools`).",
                     "nullable": true,
                     "type": "string"
+                  },
+                  "pools": {
+                    "description": "The `NodeScalingPool`s whose `nodeSelector` matches this machine's\nNode, sorted. Pools may overlap: any of them may power the machine on,\nand it is powered off only when all of them agree.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
                   },
                   "powerState": {
                     "default": "Unknown",
@@ -378,7 +385,7 @@
                     "properties": {
                       "pool": {
                         "default": "",
-                        "description": "The `NodeScalingPool` that made the decision. A decision is ignored (and\ncleared) once the machine is no longer a member of that pool, e.g.\nbecause the pool was deleted or the Node's labels changed.",
+                        "description": "The `NodeScalingPool` that made the decision (with overlapping pools,\nthe one that woke or powered off the machine). A decision is ignored (and\ncleared) once the machine is no longer a member of that pool, e.g.\nbecause the pool was deleted or the Node's labels changed.",
                         "type": "string"
                       },
                       "reason": {
@@ -524,7 +531,7 @@
             "description": "Auto-generated derived type for NodeScalingPoolSpec via `CustomResource`",
             "properties": {
               "spec": {
-                "description": "A class of machines, selected by the labels of their Kubernetes Nodes, that\nare powered on and off together based on demand. Every `NodePowerManagementConfig` whose\nNode matches `nodeSelector` is a member; a Node matched by more than one\npool is a conflict and belongs to none.",
+                "description": "A class of machines, selected by the labels of their Kubernetes Nodes, that\nare powered on and off together based on demand. Every `NodePowerManagementConfig` whose\nNode matches `nodeSelector` is a member. Pools may overlap: a machine\nselected by several pools is a member of each; any of them may power it on\nfor its own pending pods, and it is powered off only when every one of them\nconsiders it unneeded (`status.releasable`).",
                 "properties": {
                   "maxOnline": {
                     "description": "Maximum number of machines powered on. Unlimited when omitted.",
@@ -763,7 +770,7 @@
                     "type": "array"
                   },
                   "conflicts": {
-                    "description": "NodePowerManagementConfigs whose Node also matches another pool; excluded from both.",
+                    "description": "Unused since pools may overlap (always empty); kept so older objects validate.",
                     "items": {
                       "type": "string"
                     },
@@ -789,6 +796,13 @@
                   "message": {
                     "nullable": true,
                     "type": "string"
+                  },
+                  "needed": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Why this pool keeps each other online member on (\"busy: utilization\n40% >= 10%\", \"2 pending pod(s)\", \"unneeded since ...\"); what another pool\nselecting the same machine reports as \"needed by pool <this>\".",
+                    "type": "object"
                   },
                   "onlineNodes": {
                     "default": 0,
@@ -842,6 +856,13 @@
                         "time"
                       ],
                       "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "releasable": {
+                    "description": "Members this pool agrees may be powered off now: unneeded for\n`unneededSeconds`, with nothing holding the pool's scale-down (pending\npods, `holdAfterPowerOnSeconds`, machines booting, `minOnline`). Another\npool selecting the same machine powers it off only if it is listed here.",
+                    "items": {
+                      "type": "string"
                     },
                     "type": "array"
                   },

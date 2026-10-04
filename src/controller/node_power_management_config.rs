@@ -63,7 +63,7 @@ const STANDBY_BACKOFF_SECS: i64 = 24 * 3600;
 /// (`powerOffMode: Auto`).
 const PROBE_WAIT_SECS: i64 = 60;
 
-/// The state to drive towards. With `Auto`, only a decision from the pool the
+/// The state to drive towards. With `Auto`, only a decision from a pool the
 /// machine currently belongs to counts (stale decisions are cleared earlier).
 pub fn desired_target(policy: PowerPolicy, st: &NodePowerManagementConfigStatus) -> Option<PowerTarget> {
     match policy {
@@ -72,7 +72,7 @@ pub fn desired_target(policy: PowerPolicy, st: &NodePowerManagementConfigStatus)
         PowerPolicy::Auto => st
             .scaling_decision
             .as_ref()
-            .filter(|d| st.pool.as_deref() == Some(d.pool.as_str()))
+            .filter(|d| st.pools.contains(&d.pool))
             .map(|d| d.target),
     }
 }
@@ -535,7 +535,13 @@ impl Reconciler<'_> {
         if self.mn.spec.power_policy == PowerPolicy::Auto {
             // Abort the scale down; the pool backs off from this machine for a while.
             self.st.scaling_decision = Some(ScalingDecision {
-                pool: self.st.pool.clone().unwrap_or_default(),
+                pool: self
+                    .st
+                    .scaling_decision
+                    .as_ref()
+                    .map(|d| d.pool.clone())
+                    .or_else(|| self.st.pools.first().cloned())
+                    .unwrap_or_default(),
                 target: PowerTarget::On,
                 reason: "scale down aborted: drain failed".into(),
                 time: self.now,
@@ -677,13 +683,20 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
     // --- gate 2: pool membership from the Node's labels ----------------------
     let pools = ctx.pools();
     let membership = membership::resolve(node.as_deref().map(|n| n.labels()), pools.iter().map(|p| p.as_ref()));
-    st.pool = membership.pool().map(String::from);
+    st.pools = membership.pools().to_vec();
+    st.pool = (!st.pools.is_empty()).then(|| st.pools.join(","));
     match &membership {
-        Membership::Member(p) => st.set_condition(
+        Membership::Member(ps) => st.set_condition(
             COND_POOL_MEMBERSHIP,
             "True",
             "InPool",
-            format!("selected by NodeScalingPool {p}"),
+            match ps.len() {
+                1 => format!("selected by NodeScalingPool {}", ps[0]),
+                _ => format!(
+                    "selected by NodeScalingPools {} (any may power it on; all must agree to power it off)",
+                    ps.join(", ")
+                ),
+            },
             now,
         ),
         Membership::NotInPool => st.set_condition(
@@ -693,23 +706,13 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
             "no NodeScalingPool selects this Node",
             now,
         ),
-        Membership::Conflict(ps) => st.set_condition(
-            COND_POOL_MEMBERSHIP,
-            "False",
-            "Conflict",
-            format!(
-                "selected by several NodeScalingPools ({}); member of none",
-                ps.join(", ")
-            ),
-            now,
-        ),
         Membership::NoNode => st.set_condition(COND_POOL_MEMBERSHIP, "False", "NodeNotFound", "", now),
     }
     // A decision only counts while the machine is still in the pool that made it.
     if st
         .scaling_decision
         .as_ref()
-        .is_some_and(|d| Some(d.pool.as_str()) != st.pool.as_deref())
+        .is_some_and(|d| !st.pools.contains(&d.pool))
     {
         info!(nodepowermanagementconfig = %name, "clearing scaling decision from a pool this machine no longer belongs to");
         st.scaling_decision = None;
@@ -951,16 +954,20 @@ mod tests {
     }
 
     #[test]
-    fn only_decisions_from_the_current_pool_count() {
+    fn only_decisions_from_the_current_pools_count() {
         let mut st = NodePowerManagementConfigStatus {
-            pool: Some("gpu".into()),
+            pool: Some("ci,gpu".into()),
+            pools: vec!["ci".into(), "gpu".into()],
             ..Default::default()
         };
+        st.scaling_decision = Some(decision("ci", PowerTarget::On));
+        assert_eq!(desired_target(PowerPolicy::Auto, &st), Some(PowerTarget::On));
         st.scaling_decision = Some(decision("gpu", PowerTarget::Off));
         assert_eq!(desired_target(PowerPolicy::Auto, &st), Some(PowerTarget::Off));
         st.scaling_decision = Some(decision("old-pool", PowerTarget::Off));
         assert_eq!(desired_target(PowerPolicy::Auto, &st), None);
         st.pool = None;
+        st.pools.clear();
         st.scaling_decision = Some(decision("gpu", PowerTarget::Off));
         assert_eq!(desired_target(PowerPolicy::Auto, &st), None);
         assert_eq!(desired_target(PowerPolicy::AlwaysOn, &st), Some(PowerTarget::On));
