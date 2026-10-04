@@ -389,6 +389,13 @@ pub struct NodePowerManagementConfigStatus {
     /// Last-known labels of the node (kept while it is off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_labels: Option<BTreeMap<String, String>>,
+    /// Last-known non-zero allocatable of each extended resource (a device
+    /// plugin's, such as `gpu.intel.com/i915`). Kept while the machine is off
+    /// and while, after a boot, its device plugin has not registered the
+    /// devices again: a machine woken for pods waiting for such a device is
+    /// not taken for unneeded meanwhile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extended_resources: BTreeMap<String, i64>,
     /// Human-readable details about the current state or the last error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

@@ -41,6 +41,8 @@ pub struct PodView {
     pub affinity_terms: Vec<Vec<NodeSelectorRequirement>>,
     pub tolerations: Vec<Toleration>,
     pub created: Option<DateTime<Utc>>,
+    /// Extended resource requests (e.g. `gpu.intel.com/i915`).
+    pub extended_requests: BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,10 @@ pub struct Member {
     pub drain_failed_at: Option<DateTime<Utc>>,
     /// Whether the machine can sleep in S3 (see `scaleUp.preferS3Capable`).
     pub s3_capable: bool,
+    /// Extended resources (e.g. `gpu.intel.com/i915`) the machine had before
+    /// and reports as 0 shortly after booting, with their last-known amounts:
+    /// its device plugin has not registered them yet.
+    pub registering: BTreeMap<String, i64>,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -240,6 +246,7 @@ impl PodView {
             node_selector: spec.and_then(|s| s.node_selector.clone()).unwrap_or_default(),
             affinity_terms,
             tolerations: spec.and_then(|s| s.tolerations.clone()).unwrap_or_default(),
+            extended_requests: crate::resources::pod_extended_requests(pod),
             created: pod
                 .metadata
                 .creation_timestamp
@@ -382,11 +389,17 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
 
     // --- scale up ----------------------------------------------------------
     let grace = Duration::seconds(spec.scale_up.pending_pod_grace_seconds as i64);
-    let mut pending: Vec<&PodView> = s
+    // Pending pods this pool cares about (past the grace period, and targeting
+    // the pool where that is required).
+    let selected: Vec<&PodView> = s
         .pending
         .iter()
         .filter(|p| p.created.is_none_or(|c| s.now - c >= grace))
         .filter(|p| !spec.scale_up.require_explicit_selection || p.explicitly_selects(&spec.node_selector))
+        .collect();
+    let mut pending: Vec<&PodView> = selected
+        .iter()
+        .copied()
         .filter(|p| {
             s.members.iter().any(|m| {
                 m.allocatable.fits(&p.requests)
@@ -498,8 +511,13 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     let util = |m: &Member| m.allocatable.utilization_percent(&m.counted);
     // Per online candidate: why it is not (yet) eligible to power off, in both renderings.
     let mut down_notes: BTreeMap<String, Note> = BTreeMap::new();
+    let mut waiting_notes: Vec<String> = Vec::new();
     for m in &candidates {
-        let note = if !m.blocking_pods.is_empty() {
+        let waiting = waiting_for_registration(m, &selected);
+        let note = if let Some(note) = waiting {
+            waiting_notes.push(format!("{} {note}", m.name));
+            Note::same(note)
+        } else if !m.blocking_pods.is_empty() {
             Note::same(format!("busy: blocked by {}", m.blocking_pods.join(", ")))
         } else if let Some(t) = m.drain_failed_at.filter(|t| s.now - *t < backoff) {
             Note {
@@ -807,6 +825,8 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                     })
                     .collect::<Vec<_>>()
                     .join("; ")
+            } else if !waiting_notes.is_empty() {
+                waiting_notes.join("; ")
             } else if plan.relevant_pending > 0 {
                 format!(
                     "{} pending pod(s) fit capacity already powering on",
@@ -831,6 +851,37 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         });
     }
     plan
+}
+
+/// Why `m` is needed although it may look idle: pending pods of this pool
+/// that would fit it once the extended resources its device plugin is still
+/// registering (see `Member::registering`) appear. `None` when there are none.
+fn waiting_for_registration(m: &Member, selected: &[&PodView]) -> Option<String> {
+    if m.registering.is_empty() {
+        return None;
+    }
+    let free = m.allocatable.minus(&m.requested);
+    let mut resources: BTreeSet<&str> = BTreeSet::new();
+    let mut count = 0;
+    for p in selected {
+        let waits_for: Vec<&str> = p
+            .extended_requests
+            .iter()
+            .filter(|(k, v)| m.registering.get(*k).is_some_and(|have| have >= *v))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if waits_for.is_empty() || !free.fits(&p.requests) || !pod_matches_node(p, &m.labels, &m.taints) {
+            continue;
+        }
+        count += 1;
+        resources.extend(waits_for);
+    }
+    (count > 0).then(|| {
+        format!(
+            "needed: {count} pending pod(s) waiting for its {} to register",
+            resources.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
 }
 
 /// Text in two renderings: `stable` for status and events (absolute times, so
@@ -962,6 +1013,7 @@ mod tests {
             blocking_pods: vec![],
             drain_failed_at: None,
             s3_capable: false,
+            registering: BTreeMap::new(),
         }
     }
 
@@ -1398,6 +1450,58 @@ mod tests {
     }
 
     #[test]
+    fn a_node_whose_gpus_are_still_registering_is_needed_by_the_pods_waiting_for_them() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.min_online = 0;
+        let i915 = "gpu.intel.com/i915".to_string();
+        // Woken for the runner; Ready, but its device plugin reports 0 cards so far.
+        let mut gpu = member("vulpes-zerda", MemberState::Online, 0);
+        gpu.registering = BTreeMap::from([(i915.clone(), 1)]);
+        let mut runner = pod("runner", 1000, 120, now);
+        runner.extended_requests = BTreeMap::from([(i915.clone(), 1)]);
+        let snap = |gpu: Member, pending: Vec<PodView>| {
+            let mut s = snapshot(
+                &spec,
+                vec![member("devbox", MemberState::Online, 3000), gpu],
+                pending,
+                now,
+            );
+            s.unneeded_since = BTreeMap::from([("vulpes-zerda".to_string(), now - Duration::seconds(700))]);
+            s
+        };
+
+        let p = plan(&snap(gpu.clone(), vec![runner.clone()]));
+        assert!(p.power_off.is_empty(), "the node the runner waits for stays on");
+        assert!(
+            !p.unneeded_since.contains_key("vulpes-zerda"),
+            "and is not even unneeded"
+        );
+        assert_eq!(
+            p.decisions[0].reason,
+            "vulpes-zerda needed: 1 pending pod(s) waiting for its gpu.intel.com/i915 to register"
+        );
+        assert!(p.details.iter().any(|l| l.starts_with("vulpes-zerda: #1 to power off")
+            && l.ends_with("needed: 1 pending pod(s) waiting for its gpu.intel.com/i915 to register")));
+
+        // A pod that needs more cards than the node ever had does not hold it.
+        let mut greedy = runner.clone();
+        greedy.extended_requests = BTreeMap::from([(i915.clone(), 2)]);
+        assert_eq!(plan(&snap(gpu.clone(), vec![greedy])).power_off.len(), 1);
+        // Neither does a pod not waiting for a device.
+        assert_eq!(
+            plan(&snap(gpu.clone(), vec![pod("cpu-only", 1000, 120, now)]))
+                .power_off
+                .len(),
+            1
+        );
+        // Once the plugin has registered the cards (nothing registering), the usual rules apply.
+        let mut registered = gpu;
+        registered.registering.clear();
+        assert_eq!(plan(&snap(registered, vec![runner])).power_off.len(), 1);
+    }
+
+    #[test]
     fn ignores_young_pending_pods() {
         let now = Utc::now();
         let spec = spec();
@@ -1772,6 +1876,7 @@ mod dedicated_pool_tests {
             blocking_pods: vec![],
             drain_failed_at: None,
             s3_capable: false,
+            registering: BTreeMap::new(),
         }
     }
 

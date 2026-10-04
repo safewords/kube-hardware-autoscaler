@@ -670,6 +670,22 @@ merges entries by name). Names are checked:
   Node is deleted. The operator logs a warning once. Those entries are ignored, and the
   others still apply.
 
+### Devices that register after boot
+
+A device plugin (for example Intel's GPU plugin, `gpu.intel.com/i915`) reports its devices
+only some time after the Node is Ready. Until then the Node's allocatable count for them
+is 0, and the machine can look idle while the pods it was woken for are still pending.
+
+The operator remembers each machine's last non-zero extended resources in
+`NodePowerManagementConfig.status.extendedResources`. Within `bootTimeoutSeconds` of the
+Node becoming Ready, a machine that still reports 0 of such a resource counts as
+**needed** while a pending pod of its pool would fit it once that resource registers. It is
+not counted as unneeded, so neither `unneededSeconds` nor `holdAfterPowerOnSeconds` is what
+keeps it on. The decision log says so: `vulpes-zerda needed: 1 pending pod(s) waiting for its
+gpu.intel.com/i915 to register`. A pending pod "of its pool" means one that targets the pool
+when `requireExplicitSelection` is set. A pod asking for more devices than the machine ever
+had doesn't count.
+
 ### Holding after a power-on
 
 `scaleDown.holdAfterPowerOnSeconds` (default 600): after this pool powers any machine on,

@@ -52,6 +52,58 @@ fn amounts(map: &BTreeMap<String, Quantity>) -> ResourceAmounts {
     }
 }
 
+/// Whether `name` is an extended resource (a device plugin's, such as
+/// `gpu.intel.com/i915`): domain-prefixed and outside `kubernetes.io/`.
+pub fn is_extended_resource(name: &str) -> bool {
+    name.contains('/') && !name.starts_with("kubernetes.io/") && !name.starts_with("requests.")
+}
+
+fn extended(map: &BTreeMap<String, Quantity>) -> BTreeMap<String, i64> {
+    map.iter()
+        .filter(|(k, _)| is_extended_resource(k))
+        .filter_map(|(k, q)| parse_quantity(&q.0, 1.0).map(|v| (k.clone(), v)))
+        .collect()
+}
+
+/// A node's allocatable extended resources (0 while their device plugin has
+/// not registered them, e.g. just after boot).
+pub fn node_extended(node: &Node) -> BTreeMap<String, i64> {
+    node.status
+        .as_ref()
+        .and_then(|s| s.allocatable.as_ref())
+        .map(extended)
+        .unwrap_or_default()
+}
+
+/// A pod's extended resource requests: per container its requests, or its
+/// limits where no request is given (for extended resources they must be
+/// equal); max(sum(containers), max(init containers)).
+pub fn pod_extended_requests(pod: &Pod) -> BTreeMap<String, i64> {
+    let Some(spec) = pod.spec.as_ref() else {
+        return BTreeMap::new();
+    };
+    let of = |c: &k8s_openapi::api::core::v1::Container| {
+        let r = c.resources.as_ref();
+        let mut out = r.and_then(|r| r.limits.as_ref()).map(extended).unwrap_or_default();
+        out.extend(r.and_then(|r| r.requests.as_ref()).map(extended).unwrap_or_default());
+        out
+    };
+    let mut sum: BTreeMap<String, i64> = BTreeMap::new();
+    for c in &spec.containers {
+        for (k, v) in of(c) {
+            *sum.entry(k).or_default() += v;
+        }
+    }
+    for c in spec.init_containers.iter().flatten() {
+        for (k, v) in of(c) {
+            let e = sum.entry(k).or_default();
+            *e = (*e).max(v);
+        }
+    }
+    sum.retain(|_, v| *v > 0);
+    sum
+}
+
 /// Allocatable resources of a node (falls back to capacity).
 pub fn node_allocatable(node: &Node) -> ResourceAmounts {
     let status = node.status.as_ref();
@@ -161,5 +213,29 @@ mod tests {
         assert_eq!(r.cpu_millis, 1000);
         assert_eq!(r.memory_bytes, 64 * 1024 * 1024);
         assert_eq!(r.pods, 1);
+    }
+
+    #[test]
+    fn extended_resources_of_pods_and_nodes() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({"spec": {"containers": [
+            {"name": "runner", "resources": {"limits": {"gpu.intel.com/i915": "1", "cpu": "2"}}},
+            {"name": "sidecar", "resources": {"requests": {"cpu": "100m"}}}
+        ]}}))
+        .unwrap();
+        assert_eq!(
+            pod_extended_requests(&pod),
+            BTreeMap::from([("gpu.intel.com/i915".to_string(), 1)])
+        );
+        let node: Node = serde_json::from_value(serde_json::json!({"status": {"allocatable": {
+            "cpu": "4", "gpu.intel.com/i915": "0", "hugepages-2Mi": "0", "devices.kubevirt.io/kvm": "1k"
+        }}}))
+        .unwrap();
+        assert_eq!(
+            node_extended(&node),
+            BTreeMap::from([
+                ("devices.kubevirt.io/kvm".to_string(), 1000),
+                ("gpu.intel.com/i915".to_string(), 0)
+            ])
+        );
     }
 }

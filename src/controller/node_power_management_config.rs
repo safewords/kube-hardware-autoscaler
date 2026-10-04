@@ -655,6 +655,13 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
             if alloc.cpu_millis > 0 {
                 st.allocatable = Some(alloc);
             }
+            // Only non-zero values: right after a boot a device plugin reports 0
+            // until it has registered its devices again.
+            for (name, amount) in crate::resources::node_extended(n) {
+                if amount > 0 {
+                    st.extended_resources.insert(name, amount);
+                }
+            }
             st.node_labels = Some(n.labels().clone());
             st.set_condition(COND_NODE_FOUND, "True", "NodeFound", "", now);
         }

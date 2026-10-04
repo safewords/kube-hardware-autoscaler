@@ -26,7 +26,7 @@ use crate::crd::{
     ResourceAmounts, ScalingDecision, set_condition,
 };
 use crate::membership::{self, Membership};
-use crate::resources::{node_allocatable, pod_requests};
+use crate::resources::{node_allocatable, node_extended, pod_requests};
 use crate::scaling::{
     DrainClass, ExternalNode, Member, MemberState, PlannedDecision, PodView, PoolSnapshot, drain_class, is_active,
     is_daemonset_pod, is_unschedulable, plan,
@@ -112,6 +112,29 @@ fn build_member(mn: &NodePowerManagementConfig, pool: &NodeScalingPool, ctx: &Co
         }
     }
 
+    // Extended resources the machine had before and reports as 0 now, within
+    // its boot timeout of becoming Ready: its device plugin is still
+    // registering them.
+    let ready_since = node
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.type_ == "Ready" && c.status == "True"))
+        .and_then(|c| c.last_transition_time.as_ref())
+        .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0));
+    let booting_window = chrono::Duration::seconds(mn.spec.lifecycle.boot_timeout_seconds as i64);
+    let registering = match ready_since {
+        Some(t) if Utc::now() - t < booting_window => {
+            let current = node_extended(&node);
+            st.extended_resources
+                .iter()
+                .filter(|(k, v)| **v > 0 && current.get(*k).copied().unwrap_or(0) == 0)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        }
+        _ => Default::default(),
+    };
+
     Some(Member {
         name: mn.name_any(),
         state: member_state(mn, &pool_name),
@@ -125,6 +148,7 @@ fn build_member(mn: &NodePowerManagementConfig, pool: &NodeScalingPool, ctx: &Co
         blocking_pods,
         drain_failed_at: st.drain_failed_at,
         s3_capable: s3_capable(&st, Utc::now()),
+        registering,
     })
 }
 
