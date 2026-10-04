@@ -721,10 +721,10 @@ impl ScaleDownSpec {
     pub fn deprecation_warning(&self) -> Option<String> {
         match (self.hold_after_power_on_seconds, self.delay_after_scale_up_seconds) {
             (Some(new), Some(old)) if new != old => Some(format!(
-                "scaleDown.delayAfterScaleUpSeconds ({old}) is deprecated and ignored:                  scaleDown.holdAfterPowerOnSeconds ({new}) is also set and wins"
+                "scaleDown.delayAfterScaleUpSeconds ({old}) is deprecated and ignored: scaleDown.holdAfterPowerOnSeconds ({new}) is also set and wins"
             )),
             (Some(_), Some(_)) => Some(
-                "scaleDown.delayAfterScaleUpSeconds is deprecated and ignored:                  scaleDown.holdAfterPowerOnSeconds is also set and wins; remove the old name"
+                "scaleDown.delayAfterScaleUpSeconds is deprecated and ignored: scaleDown.holdAfterPowerOnSeconds is also set and wins; remove the old name"
                     .to_string(),
             ),
             (None, Some(_)) => Some(
@@ -896,6 +896,15 @@ mod tests {
         let both = scale_down(serde_json::json!({"holdAfterPowerOnSeconds": 120, "delayAfterScaleUpSeconds": 900}));
         assert_eq!(both.hold_after_power_on(), 120);
         assert!(both.deprecation_warning().unwrap().contains("wins"));
+
+        for spec in [&old, &both] {
+            let w = spec.deprecation_warning().unwrap();
+            assert!(!w.contains("  "), "{w:?}");
+        }
+        let both_same =
+            scale_down(serde_json::json!({"holdAfterPowerOnSeconds": 900, "delayAfterScaleUpSeconds": 900}));
+        let w = both_same.deprecation_warning().unwrap();
+        assert!(w.contains("wins") && !w.contains("  "), "{w:?}");
 
         let neither = scale_down(serde_json::json!({}));
         assert_eq!(neither.hold_after_power_on(), DEFAULT_HOLD_AFTER_POWER_ON_SECONDS);
