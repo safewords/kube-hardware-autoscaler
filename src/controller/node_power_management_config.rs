@@ -38,9 +38,10 @@ use super::{
     Context, Error, clear_powered_off, cordon, mark_powered_off, node_ready, patch_status_diff, uncordon_if_ours,
 };
 use crate::crd::{
-    COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
-    NodePowerManagementConfig, NodePowerManagementConfigStatus, Phase, PowerActionRecord, PowerOffMode, PowerPolicy,
-    PowerState, PowerTarget, ScalingDecision, SleepSupport,
+    BootFailure, COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
+    ManualPowerChange, ManualPowerOnPolicy, NodePowerManagementConfig, NodePowerManagementConfigStatus,
+    NodeScalingPool, Phase, PowerActionRecord, PowerOffMode, PowerPolicy, PowerState, PowerTarget, ScalingDecision,
+    SleepSupport, effective_boot_timeout, effective_manual_power_on_policy,
 };
 use crate::drivers::inband::{self, HostCommand, Probe};
 use crate::drivers::{Outcome, PowerChain};
@@ -77,6 +78,134 @@ pub fn desired_target(policy: PowerPolicy, st: &NodePowerManagementConfigStatus)
     }
 }
 
+/// Waking up this soon after being suspended counts as standby not holding
+/// (spontaneous) rather than as a manual power-on.
+const SPONTANEOUS_WAKE_SECS: i64 = 300;
+
+/// A power change the autoscaler did not make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualChange {
+    None,
+    /// Was off (or in standby), is on now, and no PowerOn of ours explains it.
+    PoweredOn,
+    /// Was on, reads off now, and no power-off of ours explains it.
+    PoweredOff,
+}
+
+/// Compares the previous status with the fresh readings in `st` (power state,
+/// Node readiness, last power action) to find power changes made by someone
+/// else. Our own transitions always pass through `PoweringOn`/`PoweringOff`
+/// (and are recorded in `lastPowerAction`), so they are never taken for manual.
+pub fn detect_manual_change(
+    old: &NodePowerManagementConfigStatus,
+    st: &NodePowerManagementConfigStatus,
+    now: DateTime<Utc>,
+    boot_timeout_secs: u64,
+    shutdown_timeout_secs: u64,
+) -> ManualChange {
+    let age = |actions: &[&str]| {
+        st.last_power_action
+            .as_ref()
+            .filter(|a| actions.contains(&a.action.as_str()))
+            .map(|a| (now - a.time).num_seconds())
+    };
+    let our_on = age(&["PowerOn"]).is_some_and(|s| s <= boot_timeout_secs as i64);
+    let our_off = age(&["PowerOff", "ForceOff", "Standby"]).is_some_and(|s| s <= shutdown_timeout_secs as i64 + 300);
+    let on_now = st.power_state == PowerState::On || st.node_ready;
+    let off_now = st.power_state == PowerState::Off && !st.node_ready;
+    match old.phase {
+        Phase::Off if on_now && !our_on => ManualChange::PoweredOn,
+        Phase::Standby
+            if st.node_ready
+                && !our_on
+                && old
+                    .standby_since
+                    .is_none_or(|t| (now - t).num_seconds() > SPONTANEOUS_WAKE_SECS) =>
+        {
+            ManualChange::PoweredOn
+        }
+        Phase::On | Phase::PoweringOn | Phase::BootFailed
+            if old.power_state == PowerState::On && off_now && !our_off =>
+        {
+            ManualChange::PoweredOff
+        }
+        _ => ManualChange::None,
+    }
+}
+
+/// What `track_boot` found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootEvent {
+    None,
+    /// Powered on, Node not Ready past the boot timeout (just now).
+    Failed,
+    /// The Node of a machine that had failed to boot is Ready after all.
+    Recovered,
+}
+
+/// Tracks how long the machine has been powered on without its Node being
+/// Ready, however it was powered on, and records a boot failure past
+/// `boot_timeout_secs`. A new boot after a failure (it was off in between)
+/// can fail again.
+pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, boot_timeout_secs: u64) -> BootEvent {
+    if st.node_ready {
+        st.powered_on_not_ready_since = None;
+        return match st.boot_failure.take() {
+            Some(_) => BootEvent::Recovered,
+            None => BootEvent::None,
+        };
+    }
+    let booting = st.power_state == PowerState::On
+        && st.standby_since.is_none()
+        && !matches!(st.phase, Phase::PoweringOff | Phase::Draining | Phase::Standby);
+    if !booting {
+        if st.power_state == PowerState::Off {
+            st.powered_on_not_ready_since = None;
+        }
+        return BootEvent::None;
+    }
+    // First seen booting: since our own PowerOn if one started this phase.
+    let start = match st.phase {
+        Phase::PoweringOn | Phase::BootFailed => st.phase_since.unwrap_or(now).min(now),
+        _ => now,
+    };
+    let since = *st.powered_on_not_ready_since.get_or_insert(start);
+    let new_boot = st.boot_failure.as_ref().is_none_or(|f| since > f.time);
+    if new_boot && (now - since).num_seconds() > boot_timeout_secs as i64 {
+        st.boot_failure = Some(BootFailure {
+            time: now,
+            left_on: false,
+        });
+        return BootEvent::Failed;
+    }
+    BootEvent::None
+}
+
+/// Whether a boot failure leaves the machine on: only when it was powered on
+/// by hand (not by us) and the policy is `LeaveOn`; a human may be at it.
+pub fn boot_failure_leaves_on(st: &NodePowerManagementConfigStatus, policy: ManualPowerOnPolicy) -> bool {
+    let since = st.powered_on_not_ready_since;
+    let ours = st
+        .last_power_action
+        .as_ref()
+        .is_some_and(|a| a.action == "PowerOn" && since.is_none_or(|s| a.time >= s - chrono::Duration::seconds(120)));
+    !ours && policy == ManualPowerOnPolicy::LeaveOn
+}
+
+/// The state to drive towards, after the manual power-on policy: a machine
+/// powered on by hand under `LeaveOn` is only observed, whatever decision is
+/// stored.
+pub fn managed_target(
+    policy: PowerPolicy,
+    st: &NodePowerManagementConfigStatus,
+    manual: ManualPowerOnPolicy,
+) -> Option<PowerTarget> {
+    if policy == PowerPolicy::Auto && st.manual_power_on.is_some() && manual == ManualPowerOnPolicy::LeaveOn {
+        return None;
+    }
+    desired_target(policy, st)
+}
+
 struct Reconciler<'a> {
     mn: &'a NodePowerManagementConfig,
     ctx: &'a Context,
@@ -84,6 +213,10 @@ struct Reconciler<'a> {
     node: Option<Arc<Node>>,
     st: NodePowerManagementConfigStatus,
     now: DateTime<Utc>,
+    /// Effective `lifecycle.bootTimeoutSeconds` (machine, else pools, else default).
+    boot_timeout: u64,
+    /// Effective `manualPowerOnPolicy`.
+    manual_policy: ManualPowerOnPolicy,
 }
 
 impl Reconciler<'_> {
@@ -207,7 +340,7 @@ impl Reconciler<'_> {
             }
             return Ok(SLOW);
         }
-        let boot_timeout = self.mn.spec.lifecycle.boot_timeout_seconds as i64;
+        let boot_timeout = self.boot_timeout as i64;
         match self.st.phase {
             Phase::PoweringOn => {
                 if self.in_phase_for() > boot_timeout && self.st.standby_since.is_some() {
@@ -221,19 +354,6 @@ impl Reconciler<'_> {
                     self.st.message = Some(format!(
                         "did not wake from standby within {boot_timeout}s; forced off for a cold boot"
                     ));
-                } else if self.in_phase_for() > boot_timeout {
-                    self.set_phase(Phase::Error);
-                    self.st.message = Some(format!(
-                        "node did not become Ready within {boot_timeout}s of powering on"
-                    ));
-                    self.ctx
-                        .event(
-                            self.mn,
-                            EventType::Warning,
-                            "BootTimeout",
-                            self.st.message.clone().unwrap(),
-                        )
-                        .await;
                 } else if (power == PowerState::Off || self.st.standby_since.is_some())
                     && self.since_last_action("PowerOn") > RETRY_ACTION_AFTER
                 {
@@ -557,6 +677,127 @@ impl Reconciler<'_> {
         Ok(NORMAL)
     }
 
+    /// Reacts to a power change made by someone else. Clearing the stored
+    /// decision is what keeps a stale one from fighting the change: an old
+    /// "Off" would power a manually started machine straight back off, an old
+    /// "On" would wake a manually stopped one.
+    async fn manual_change(&mut self, change: ManualChange) {
+        let node = self.mn.spec.node_name.clone();
+        match change {
+            ManualChange::None => {}
+            ManualChange::PoweredOn => {
+                let policy = self.manual_policy;
+                self.st.manual_power_on = Some(ManualPowerChange {
+                    time: self.now,
+                    policy: Some(policy),
+                });
+                self.st.scaling_decision = None;
+                self.st.standby_since = None;
+                if self.st.boot_failure.as_ref().is_some_and(|f| f.left_on) {
+                    self.st.boot_failure = None;
+                }
+                let what = match policy {
+                    ManualPowerOnPolicy::LeaveOn => "not managing it while it stays on",
+                    ManualPowerOnPolicy::Adopt => "managing it as if its pool had powered it on",
+                    ManualPowerOnPolicy::PowerOff => "powering it off again after the pool's grace period",
+                };
+                let note = format!("{node} powered on outside the autoscaler; policy {policy:?}: {what}");
+                info!(nodepowermanagementconfig = %self.mn.name_any(), ?policy, "manual power-on");
+                self.ctx.event(self.mn, EventType::Normal, "ManualPowerOn", note).await;
+            }
+            ManualChange::PoweredOff => {
+                self.st.manual_power_on = None;
+                self.st.manual_power_off = Some(ManualPowerChange {
+                    time: self.now,
+                    policy: None,
+                });
+                self.st.scaling_decision = None;
+                if self.st.boot_failure.as_ref().is_some_and(|f| f.left_on) {
+                    self.st.boot_failure = None;
+                }
+                info!(nodepowermanagementconfig = %self.mn.name_any(), "manual power-off");
+                self.ctx
+                    .event(
+                        self.mn,
+                        EventType::Normal,
+                        "ManualPowerOff",
+                        format!("{node} powered off outside the autoscaler; back under management"),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Handles a machine that is powered on without its Node becoming Ready.
+    /// Returns `Some(requeue)` while it is boot-failed and still powered (the
+    /// normal state machine is skipped), `None` otherwise.
+    async fn boot(&mut self, event: BootEvent) -> Option<Duration> {
+        let node = self.mn.spec.node_name.clone();
+        match event {
+            BootEvent::Recovered => {
+                info!(nodepowermanagementconfig = %self.mn.name_any(), "node Ready after a boot failure");
+                self.ctx
+                    .event(
+                        self.mn,
+                        EventType::Normal,
+                        "BootRecovered",
+                        format!("{node} is Ready after all; managed normally again"),
+                    )
+                    .await;
+                return None;
+            }
+            BootEvent::Failed => {
+                let leave = boot_failure_leaves_on(&self.st, self.manual_policy);
+                if let Some(f) = self.st.boot_failure.as_mut() {
+                    f.left_on = leave;
+                }
+                self.st.scaling_decision = None;
+                let minutes = self.boot_timeout / 60;
+                let what = if leave {
+                    "left on: it was powered on by hand and the policy is LeaveOn".to_string()
+                } else {
+                    "powering it off; it is not woken again for the pools' bootFailureBackoffSeconds".to_string()
+                };
+                let note =
+                    format!("{node} powered on {minutes}m+ without its Node becoming Ready; boot failed, {what}");
+                warn!(nodepowermanagementconfig = %self.mn.name_any(), boot_timeout = self.boot_timeout, left_on = leave, "boot failed");
+                self.st.message = Some(note.clone());
+                self.set_phase(Phase::BootFailed);
+                self.ctx.event(self.mn, EventType::Warning, "BootFailed", note).await;
+                if !leave {
+                    if !self.ctx.dry_run
+                        && let Err(e) = mark_powered_off(&self.ctx.client, &node, self.now).await
+                    {
+                        warn!(node = %node, error = %e, "cannot annotate node as powered off");
+                    }
+                    self.act("PowerOff").await;
+                }
+                return Some(FAST);
+            }
+            BootEvent::None => {}
+        }
+        let failure = self.st.boot_failure.clone()?;
+        if self.st.node_ready || self.st.power_state != PowerState::On {
+            return None;
+        }
+        // Still powered and not Ready after a boot failure.
+        self.set_phase(Phase::BootFailed);
+        if !failure.left_on {
+            let since_failure = (self.now - failure.time).num_seconds();
+            let shutdown_timeout = self.mn.spec.lifecycle.shutdown_timeout_seconds as i64;
+            let since_force = self.st.forced_off_at.map(|t| (self.now - t).num_seconds());
+            if since_failure > shutdown_timeout.min(STANDBY_SETTLE_SECS)
+                && since_force.is_none_or(|s| s > RETRY_ACTION_AFTER)
+            {
+                // The graceful request did nothing (a machine with nothing to
+                // boot ignores ACPI): cut the power.
+                self.act("ForceOff").await;
+                self.st.forced_off_at = Some(self.now);
+            }
+        }
+        Some(FAST)
+    }
+
     /// Without a desired state, only mirror what the interface reports.
     fn observe(&mut self) -> Duration {
         if in_standby(self.st.phase, self.st.standby_since.is_some(), self.st.node_ready) {
@@ -857,6 +1098,23 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
         );
     }
 
+    // Settings that can come from the machine's pools.
+    let member_pools: Vec<&Arc<NodeScalingPool>> = pools.iter().filter(|p| st.pools.contains(&p.name_any())).collect();
+    let manual_policy = effective_manual_power_on_policy(
+        mn.spec.manual_power_on_policy,
+        member_pools.iter().map(|p| p.spec.manual_power_on_policy),
+    );
+    let boot_timeout = effective_boot_timeout(
+        mn.spec.lifecycle.boot_timeout_seconds,
+        member_pools.iter().map(|p| p.spec.scale_up.boot_timeout_seconds),
+    );
+    let change = detect_manual_change(&old, &st, now, boot_timeout, mn.spec.lifecycle.shutdown_timeout_seconds);
+    // A machine seen off is under normal management again, whoever turned it off.
+    if st.power_state == PowerState::Off && !st.node_ready && change != ManualChange::PoweredOn {
+        st.manual_power_on = None;
+    }
+    let boot_event = track_boot(&mut st, now, boot_timeout);
+
     let node_found = node.is_some();
     let mut r = Reconciler {
         mn: &mn,
@@ -865,8 +1123,14 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
         node,
         st,
         now,
+        boot_timeout,
+        manual_policy,
     };
-    let requeue = if !node_found || !consistent {
+    r.manual_change(change).await;
+    let boot_requeue = r.boot(boot_event).await;
+    let requeue = if let Some(requeue) = boot_requeue {
+        requeue
+    } else if !node_found || !consistent {
         // Safety gates failed: never act, only report.
         r.st.message = Some(if !node_found {
             format!("Node {} not found: observing only, no power actions", mn.spec.node_name)
@@ -875,7 +1139,7 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
         });
         r.observe()
     } else {
-        match desired_target(mn.spec.power_policy, &r.st) {
+        match managed_target(mn.spec.power_policy, &r.st, manual_policy) {
             None => r.observe(),
             Some(PowerTarget::On) => r.ensure_on().await?,
             Some(PowerTarget::Off) => r.ensure_off().await?,
@@ -971,5 +1235,152 @@ mod tests {
         st.scaling_decision = Some(decision("gpu", PowerTarget::Off));
         assert_eq!(desired_target(PowerPolicy::Auto, &st), None);
         assert_eq!(desired_target(PowerPolicy::AlwaysOn, &st), Some(PowerTarget::On));
+    }
+
+    fn status(phase: Phase, power: PowerState, ready: bool) -> NodePowerManagementConfigStatus {
+        NodePowerManagementConfigStatus {
+            phase,
+            power_state: power,
+            node_ready: ready,
+            ..Default::default()
+        }
+    }
+
+    fn action(name: &str, secs_ago: i64, now: DateTime<Utc>) -> Option<PowerActionRecord> {
+        Some(PowerActionRecord {
+            action: name.into(),
+            time: now - chrono::Duration::seconds(secs_ago),
+            succeeded: true,
+            via: None,
+        })
+    }
+
+    #[test]
+    fn manual_power_changes_are_told_apart_from_ours() {
+        let now = Utc::now();
+        let off = status(Phase::Off, PowerState::Off, false);
+        let detect = |old: &NodePowerManagementConfigStatus, new: &NodePowerManagementConfigStatus| {
+            detect_manual_change(old, new, now, 1200, 300)
+        };
+        // Off before, on now, nothing of ours: manual.
+        let mut on = status(Phase::Off, PowerState::On, false);
+        assert_eq!(detect(&off, &on), ManualChange::PoweredOn);
+        // Our own PowerOn a minute ago explains it.
+        on.last_power_action = action("PowerOn", 60, now);
+        assert_eq!(detect(&off, &on), ManualChange::None);
+        // While we power on, the interface may still read Off: not a manual power-off.
+        let powering_on = status(Phase::PoweringOn, PowerState::Off, false);
+        assert_eq!(
+            detect(&powering_on, &status(Phase::PoweringOn, PowerState::Off, false)),
+            ManualChange::None
+        );
+
+        // Waking from standby: right after suspending it is standby not holding;
+        // later it is someone waking it.
+        let mut asleep = status(Phase::Standby, PowerState::Off, false);
+        asleep.standby_since = Some(now - chrono::Duration::seconds(60));
+        let awake = status(Phase::Standby, PowerState::On, true);
+        assert_eq!(detect(&asleep, &awake), ManualChange::None);
+        asleep.standby_since = Some(now - chrono::Duration::hours(2));
+        assert_eq!(detect(&asleep, &awake), ManualChange::PoweredOn);
+
+        // On before, off now, no power-off of ours: manual.
+        let running = status(Phase::On, PowerState::On, true);
+        let mut down = status(Phase::On, PowerState::Off, false);
+        assert_eq!(detect(&running, &down), ManualChange::PoweredOff);
+        down.last_power_action = action("ForceOff", 30, now);
+        assert_eq!(detect(&running, &down), ManualChange::None);
+        // A machine that failed to boot and that someone switched off.
+        let failed = status(Phase::BootFailed, PowerState::On, false);
+        assert_eq!(
+            detect(&failed, &status(Phase::BootFailed, PowerState::Off, false)),
+            ManualChange::PoweredOff
+        );
+    }
+
+    #[test]
+    fn a_machine_that_never_becomes_ready_fails_to_boot_once_and_recovers() {
+        let t0 = Utc::now();
+        let at = |m: i64| t0 + chrono::Duration::minutes(m);
+        // Powered on (by anyone), Node never Ready: "no bootable device".
+        let mut st = status(Phase::PoweringOn, PowerState::On, false);
+        assert_eq!(track_boot(&mut st, at(0), 1200), BootEvent::None);
+        assert_eq!(track_boot(&mut st, at(19), 1200), BootEvent::None);
+        assert_eq!(track_boot(&mut st, at(21), 1200), BootEvent::Failed);
+        assert_eq!(st.boot_failure.as_ref().unwrap().time, at(21));
+        // Reported once, not on every reconcile.
+        assert_eq!(track_boot(&mut st, at(40), 1200), BootEvent::None);
+
+        // Powered off, then a new boot that fails again is a new failure.
+        st.power_state = PowerState::Off;
+        st.phase = Phase::Off;
+        assert_eq!(track_boot(&mut st, at(41), 1200), BootEvent::None);
+        assert!(st.powered_on_not_ready_since.is_none());
+        st.power_state = PowerState::On;
+        st.phase = Phase::PoweringOn;
+        assert_eq!(track_boot(&mut st, at(80), 1200), BootEvent::None);
+        assert_eq!(track_boot(&mut st, at(101), 1200), BootEvent::Failed);
+
+        // The Node goes Ready after all: recovered.
+        st.node_ready = true;
+        assert_eq!(track_boot(&mut st, at(102), 1200), BootEvent::Recovered);
+        assert!(st.boot_failure.is_none());
+        assert_eq!(track_boot(&mut st, at(103), 1200), BootEvent::None);
+    }
+
+    #[test]
+    fn a_suspended_machine_reading_on_is_not_booting() {
+        let now = Utc::now();
+        let mut st = status(Phase::Standby, PowerState::On, false);
+        st.standby_since = Some(now - chrono::Duration::hours(5));
+        assert_eq!(track_boot(&mut st, now, 60), BootEvent::None);
+        assert!(st.powered_on_not_ready_since.is_none());
+    }
+
+    #[test]
+    fn only_a_manual_power_on_under_leave_on_is_left_on_after_a_boot_failure() {
+        let now = Utc::now();
+        let mut st = status(Phase::PoweringOn, PowerState::On, false);
+        st.powered_on_not_ready_since = Some(now - chrono::Duration::minutes(21));
+        // Nothing of ours started this boot.
+        assert!(boot_failure_leaves_on(&st, ManualPowerOnPolicy::LeaveOn));
+        assert!(!boot_failure_leaves_on(&st, ManualPowerOnPolicy::Adopt));
+        assert!(!boot_failure_leaves_on(&st, ManualPowerOnPolicy::PowerOff));
+        // We powered it on: powered off again whatever the policy.
+        st.last_power_action = action("PowerOn", 21 * 60 + 5, now);
+        assert!(!boot_failure_leaves_on(&st, ManualPowerOnPolicy::LeaveOn));
+    }
+
+    #[test]
+    fn a_stale_decision_never_fights_a_manual_power_on_under_leave_on() {
+        let mut st = NodePowerManagementConfigStatus {
+            pools: vec!["gpu".into()],
+            scaling_decision: Some(decision("gpu", PowerTarget::Off)),
+            manual_power_on: Some(ManualPowerChange {
+                time: Utc::now(),
+                policy: Some(ManualPowerOnPolicy::LeaveOn),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            managed_target(PowerPolicy::Auto, &st, ManualPowerOnPolicy::LeaveOn),
+            None
+        );
+        // Manual overrides still apply.
+        assert_eq!(
+            managed_target(PowerPolicy::AlwaysOff, &st, ManualPowerOnPolicy::LeaveOn),
+            Some(PowerTarget::Off)
+        );
+        // Adopt / PowerOff follow the pools (whose old decision is cleared when
+        // the manual power-on is seen; see manual_change).
+        assert_eq!(
+            managed_target(PowerPolicy::Auto, &st, ManualPowerOnPolicy::Adopt),
+            Some(PowerTarget::Off)
+        );
+        st.manual_power_on = None;
+        assert_eq!(
+            managed_target(PowerPolicy::Auto, &st, ManualPowerOnPolicy::LeaveOn),
+            Some(PowerTarget::Off)
+        );
     }
 }

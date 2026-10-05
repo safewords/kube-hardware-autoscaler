@@ -60,7 +60,6 @@
                 "properties": {
                   "lifecycle": {
                     "default": {
-                      "bootTimeoutSeconds": 900,
                       "drainTimeoutSeconds": 300,
                       "forceAfterDrainTimeout": false,
                       "powerOffMode": "Shutdown",
@@ -69,10 +68,10 @@
                     "description": "Timeouts and drain behaviour for power transitions.",
                     "properties": {
                       "bootTimeoutSeconds": {
-                        "default": 900,
-                        "description": "Seconds to wait for the node to become `Ready` after powering on.",
+                        "description": "Seconds a powered-on machine may take for its Node to become `Ready`,\nhowever it was powered on. Past it the machine counts as boot-failed\n(phase `BootFailed`): it no longer holds its pools' scale-down, is not\ncounted as capacity, and is powered off (unless it was powered on by\nhand under `manualPowerOnPolicy: LeaveOn`) and not woken again for its\npools' `scaleUp.bootFailureBackoffSeconds`. When unset, the longest of\nits pools' `scaleUp.bootTimeoutSeconds`, else 1200.",
                         "format": "uint64",
                         "minimum": 0.0,
+                        "nullable": true,
                         "type": "integer"
                       },
                       "drainTimeoutSeconds": {
@@ -106,6 +105,23 @@
                       }
                     },
                     "type": "object"
+                  },
+                  "manualPowerOffCooldownSeconds": {
+                    "description": "After the machine is powered off outside the autoscaler, do not wake it\nagain for this many seconds. Overrides the pools'\n`manualPowerOffCooldownSeconds`; 0 (the default) disables it.",
+                    "format": "uint64",
+                    "minimum": 0.0,
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "manualPowerOnPolicy": {
+                    "description": "What the autoscaler does with a machine powered on outside it.\n\nWhatever the policy, a stale scaling decision never acts on a manually\npowered-on machine: it is cleared when the manual power-on is seen.",
+                    "enum": [
+                      "LeaveOn",
+                      "Adopt",
+                      "PowerOff"
+                    ],
+                    "nullable": true,
+                    "type": "string"
                   },
                   "nodeName": {
                     "description": "Name of the Kubernetes `Node` object this machine registers as. Must\nequal `metadata.name`. Pool membership follows from this Node's labels\n(see `NodeScalingPool.spec.nodeSelector`).",
@@ -229,6 +245,25 @@
                     ],
                     "type": "object"
                   },
+                  "bootFailure": {
+                    "description": "The last boot failure (powered on, Node not Ready within the boot\ntimeout). Cleared once the Node is Ready.",
+                    "nullable": true,
+                    "properties": {
+                      "leftOn": {
+                        "default": false,
+                        "description": "Left powered on (powered on by hand under `LeaveOn`) rather than\npowered off.",
+                        "type": "boolean"
+                      },
+                      "time": {
+                        "format": "date-time",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "time"
+                    ],
+                    "type": "object"
+                  },
                   "conditions": {
                     "description": "Safety checks gating power actions: `NodeFound`, `PoolMembership`,\n`IdentityVerified`, `PowerStateConsistent`.",
                     "items": {
@@ -318,6 +353,54 @@
                     ],
                     "type": "object"
                   },
+                  "manualPowerOff": {
+                    "description": "The last time the machine was seen powered off outside the autoscaler.",
+                    "nullable": true,
+                    "properties": {
+                      "policy": {
+                        "description": "What the autoscaler does with a machine powered on outside it.\n\nWhatever the policy, a stale scaling decision never acts on a manually\npowered-on machine: it is cleared when the manual power-on is seen.",
+                        "enum": [
+                          "LeaveOn",
+                          "Adopt",
+                          "PowerOff"
+                        ],
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "time": {
+                        "format": "date-time",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "time"
+                    ],
+                    "type": "object"
+                  },
+                  "manualPowerOn": {
+                    "description": "Set when the machine was seen powered on outside the autoscaler\n(powered off or in standby before, on now, and no PowerOn of ours).\nCleared when it is next seen off. Clear it by hand to put a `LeaveOn`\nmachine back under management while it is on:\n`kubectl patch npmc <name> --subresource=status --type=merge -p '{\"status\":{\"manualPowerOn\":null}}'`.",
+                    "nullable": true,
+                    "properties": {
+                      "policy": {
+                        "description": "What the autoscaler does with a machine powered on outside it.\n\nWhatever the policy, a stale scaling decision never acts on a manually\npowered-on machine: it is cleared when the manual power-on is seen.",
+                        "enum": [
+                          "LeaveOn",
+                          "Adopt",
+                          "PowerOff"
+                        ],
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "time": {
+                        "format": "date-time",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "time"
+                    ],
+                    "type": "object"
+                  },
                   "message": {
                     "description": "Human-readable details about the current state or the last error.",
                     "nullable": true,
@@ -347,7 +430,8 @@
                       "PoweringOff",
                       "Off",
                       "Error",
-                      "Standby"
+                      "Standby",
+                      "BootFailed"
                     ],
                     "type": "string"
                   },
@@ -377,6 +461,12 @@
                       "Off",
                       "Unknown"
                     ],
+                    "type": "string"
+                  },
+                  "poweredOnNotReadySince": {
+                    "description": "Since when the machine has been powered on without its Node being Ready.",
+                    "format": "date-time",
+                    "nullable": true,
                     "type": "string"
                   },
                   "scalingDecision": {
@@ -533,6 +623,30 @@
               "spec": {
                 "description": "A class of machines, selected by the labels of their Kubernetes Nodes, that\nare powered on and off together based on demand. Every `NodePowerManagementConfig` whose\nNode matches `nodeSelector` is a member. Pools may overlap: a machine\nselected by several pools is a member of each; any of them may power it on\nfor its own pending pods, and it is powered off only when every one of them\nconsiders it unneeded (`status.releasable`).",
                 "properties": {
+                  "manualPowerOffCooldownSeconds": {
+                    "description": "Default `manualPowerOffCooldownSeconds` for this pool's machines: after\na machine is powered off by hand, do not wake it for this long. 0 (the\ndefault) disables it.",
+                    "format": "uint64",
+                    "minimum": 0.0,
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "manualPowerOnGraceSeconds": {
+                    "default": 600,
+                    "description": "Under `manualPowerOnPolicy: PowerOff`, how long a manually powered-on\nmachine may stay on before it is powered off again.",
+                    "format": "uint64",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  },
+                  "manualPowerOnPolicy": {
+                    "description": "What the autoscaler does with a machine powered on outside it.\n\nWhatever the policy, a stale scaling decision never acts on a manually\npowered-on machine: it is cleared when the manual power-on is seen.",
+                    "enum": [
+                      "LeaveOn",
+                      "Adopt",
+                      "PowerOff"
+                    ],
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "maxOnline": {
                     "description": "Maximum number of machines powered on. Unlimited when omitted.",
                     "format": "uint32",
@@ -661,6 +775,7 @@
                   },
                   "scaleUp": {
                     "default": {
+                      "bootFailureBackoffSeconds": 1800,
                       "enabled": true,
                       "maxNodesPerStep": 3,
                       "pendingPodGraceSeconds": 30,
@@ -668,6 +783,20 @@
                       "requireExplicitSelection": false
                     },
                     "properties": {
+                      "bootFailureBackoffSeconds": {
+                        "default": 1800,
+                        "description": "After a machine fails to boot, do not power it on again for this long.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "bootTimeoutSeconds": {
+                        "description": "Default `lifecycle.bootTimeoutSeconds` for this pool's machines (a\nmachine's own setting wins; with overlapping pools the longest\napplies). 1200 when unset everywhere.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "enabled": {
                         "default": true,
                         "type": "boolean"

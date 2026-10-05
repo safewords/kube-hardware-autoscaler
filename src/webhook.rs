@@ -419,24 +419,24 @@ mod tests {
         let gpu = BTreeMap::from([("gpu".to_string(), "true".to_string())]);
         let cpu = BTreeMap::new();
         let labels = |n: &str| match n {
-            "devbox" => Some(&gpu),
+            "gpu-node-1" => Some(&gpu),
             "cpu-box" => Some(&cpu),
             _ => None,
         };
-        let ok = pool(json!([{"name": "devbox", "weight": 100}]));
+        let ok = pool(json!([{"name": "gpu-node-1", "weight": 100}]));
         assert_eq!(review_pool(&ok, None, labels), Ok(vec![]));
 
         let typo = pool(json!([{"name": "devbx", "weight": 100}]));
         let err = review_pool(&typo, None, labels).unwrap_err();
         assert!(err.contains("no Node named \"devbx\""), "{err}");
 
-        let outside = pool(json!([{"name": "devbox", "weight": 100}, {"name": "cpu-box", "weight": 5}]));
+        let outside = pool(json!([{"name": "gpu-node-1", "weight": 100}, {"name": "cpu-box", "weight": 5}]));
         let warnings = review_pool(&outside, None, labels).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("\"cpu-box\" is not selected"), "{}", warnings[0]);
 
         // A Node that disappeared after the entry was saved does not block other edits.
-        let gone = pool(json!([{"name": "devbox", "weight": 100}, {"name": "retired", "weight": 5}]));
+        let gone = pool(json!([{"name": "gpu-node-1", "weight": 100}, {"name": "retired", "weight": 5}]));
         let warnings = review_pool(&gone, Some(&gone), labels).unwrap();
         assert!(warnings[0].contains("\"retired\" no longer exists"), "{}", warnings[0]);
         // ...but adding it anew does.

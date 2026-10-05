@@ -24,8 +24,9 @@ use super::node_power_management_config::s3_capable;
 use super::{Context, DecisionVerbosity, Error, node_ready, patch_status_diff};
 use crate::crd::{
     COND_POWER_STATE_CONSISTENT, COND_PREFERRED_NODES_VALID, DecisionAction, DecisionRecord, MAX_RECENT_DECISIONS,
-    NodePowerManagementConfig, NodeScalingPool, NodeScalingPoolStatus, Phase, PowerPolicy, PowerTarget,
-    ResourceAmounts, ScalingDecision, set_condition,
+    ManualPowerOnPolicy, NodePowerManagementConfig, NodePowerManagementConfigStatus, NodeScalingPool,
+    NodeScalingPoolStatus, Phase, PowerPolicy, PowerTarget, ResourceAmounts, ScalingDecision, effective_boot_timeout,
+    effective_manual_power_off_cooldown, effective_manual_power_on_policy, set_condition,
 };
 use crate::membership::{self, Membership};
 use crate::resources::{node_allocatable, node_extended, pod_requests};
@@ -64,15 +65,143 @@ pub fn member_state(mn: &NodePowerManagementConfig, pools: &[String]) -> MemberS
         Some(PowerTarget::Off) if matches!(st.phase, Phase::Off | Phase::Standby) => MemberState::Offline,
         Some(PowerTarget::Off) => MemberState::Leaving,
         Some(PowerTarget::On) if ready_on => MemberState::Online,
-        Some(PowerTarget::On) if st.phase == Phase::Error => MemberState::Unavailable,
+        Some(PowerTarget::On) if matches!(st.phase, Phase::Error | Phase::BootFailed) => MemberState::Unavailable,
         Some(PowerTarget::On) => MemberState::Booting,
         None => match st.phase {
             Phase::On if st.node_ready => MemberState::Online,
             Phase::On | Phase::PoweringOn => MemberState::Booting,
             Phase::Off | Phase::Standby => MemberState::Offline,
             Phase::Draining | Phase::PoweringOff => MemberState::Leaving,
-            Phase::Unknown | Phase::Error => MemberState::Unavailable,
+            Phase::Unknown | Phase::Error | Phase::BootFailed => MemberState::Unavailable,
         },
+    }
+}
+
+/// How boot failures and manual power changes shape a member, for one pool.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Special {
+    /// Replaces the state from `member_state`.
+    pub state: Option<MemberState>,
+    /// Why, for the decision log.
+    pub note: Option<String>,
+    /// `Adopt`: counts as this pool's power-on at that time.
+    pub adopted_at: Option<chrono::DateTime<Utc>>,
+    /// `PowerOff`: powered off once this time has passed.
+    pub release_after: Option<chrono::DateTime<Utc>>,
+}
+
+/// Applies boot failures, the boot failure backoff, manual power-ons (by
+/// `policy`) and the manual power-off cooldown to a member whose plain state
+/// is `base`. Notes use absolute times so the decision log only changes when
+/// the situation does.
+#[allow(clippy::too_many_arguments)]
+pub fn classify(
+    st: &NodePowerManagementConfigStatus,
+    base: MemberState,
+    policy: ManualPowerOnPolicy,
+    spec: &crate::crd::NodeScalingPoolSpec,
+    boot_timeout_secs: u64,
+    cooldown_secs: u64,
+    now: chrono::DateTime<Utc>,
+) -> Special {
+    let at = |t: chrono::DateTime<Utc>| t.format("%H:%M:%SZ").to_string();
+    let secs = |n: u64| chrono::Duration::seconds(n as i64);
+    if st.phase == Phase::BootFailed
+        && let Some(f) = &st.boot_failure
+    {
+        let then = if f.left_on {
+            "left on (powered on by hand, LeaveOn)"
+        } else {
+            "powering off"
+        };
+        return Special {
+            state: Some(MemberState::Unavailable),
+            note: Some(format!(
+                "boot failed at {}: on {}m+ without Ready; released hold; {then}",
+                at(f.time),
+                boot_timeout_secs / 60
+            )),
+            ..Default::default()
+        };
+    }
+    if base == MemberState::Offline {
+        if let Some(f) = st.boot_failure.as_ref().filter(|f| !f.left_on)
+            && now < f.time + secs(spec.scale_up.boot_failure_backoff_seconds)
+        {
+            return Special {
+                state: Some(MemberState::Unavailable),
+                note: Some(format!(
+                    "boot failed at {}; not woken again until {}",
+                    at(f.time),
+                    at(f.time + secs(spec.scale_up.boot_failure_backoff_seconds))
+                )),
+                ..Default::default()
+            };
+        }
+        if let Some(off) = &st.manual_power_off {
+            if cooldown_secs > 0 && now < off.time + secs(cooldown_secs) {
+                return Special {
+                    state: Some(MemberState::Unavailable),
+                    note: Some(format!(
+                        "manually powered off at {}; not woken again until {}",
+                        at(off.time),
+                        at(off.time + secs(cooldown_secs))
+                    )),
+                    ..Default::default()
+                };
+            }
+            if now < off.time + chrono::Duration::minutes(10) {
+                return Special {
+                    note: Some(format!(
+                        "manually powered off at {}; back under management",
+                        at(off.time)
+                    )),
+                    ..Default::default()
+                };
+            }
+        }
+        return Special::default();
+    }
+    let Some(on) = &st.manual_power_on else {
+        return Special::default();
+    };
+    match policy {
+        ManualPowerOnPolicy::LeaveOn if st.node_ready => Special {
+            state: Some(MemberState::Manual),
+            note: Some(format!(
+                "manually powered on at {}; policy LeaveOn; not managing",
+                at(on.time)
+            )),
+            ..Default::default()
+        },
+        ManualPowerOnPolicy::LeaveOn => Special {
+            state: Some(MemberState::Unavailable),
+            note: Some(format!(
+                "manually powered on at {}, not Ready yet; policy LeaveOn; not managing",
+                at(on.time)
+            )),
+            ..Default::default()
+        },
+        ManualPowerOnPolicy::Adopt => Special {
+            note: Some(format!(
+                "manually powered on at {}; policy Adopt; managed as if this pool woke it",
+                at(on.time)
+            )),
+            adopted_at: Some(on.time),
+            ..Default::default()
+        },
+        ManualPowerOnPolicy::PowerOff => {
+            let after = on.time + secs(spec.manual_power_on_grace_seconds);
+            Special {
+                note: Some(format!(
+                    "manually powered on at {}; policy PowerOff; powered off after {}",
+                    at(on.time),
+                    at(after)
+                )),
+                release_after: Some(after),
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -80,6 +209,7 @@ fn build_member(
     mn: &NodePowerManagementConfig,
     member_of: &[String],
     pool: &NodeScalingPool,
+    all_pools: &[Arc<NodeScalingPool>],
     ctx: &Context,
 ) -> Option<Member> {
     let down = &pool.spec.scale_down;
@@ -129,7 +259,21 @@ fn build_member(
         .and_then(|c| c.iter().find(|c| c.type_ == "Ready" && c.status == "True"))
         .and_then(|c| c.last_transition_time.as_ref())
         .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0));
-    let booting_window = chrono::Duration::seconds(mn.spec.lifecycle.boot_timeout_seconds as i64);
+    let member_pools: Vec<&Arc<NodeScalingPool>> =
+        all_pools.iter().filter(|p| member_of.contains(&p.name_any())).collect();
+    let boot_timeout = effective_boot_timeout(
+        mn.spec.lifecycle.boot_timeout_seconds,
+        member_pools.iter().map(|p| p.spec.scale_up.boot_timeout_seconds),
+    );
+    let manual_policy = effective_manual_power_on_policy(
+        mn.spec.manual_power_on_policy,
+        member_pools.iter().map(|p| p.spec.manual_power_on_policy),
+    );
+    let cooldown = effective_manual_power_off_cooldown(
+        mn.spec.manual_power_off_cooldown_seconds,
+        member_pools.iter().map(|p| p.spec.manual_power_off_cooldown_seconds),
+    );
+    let booting_window = chrono::Duration::seconds(boot_timeout as i64);
     let registering = match ready_since {
         Some(t) if Utc::now() - t < booting_window => {
             let current = node_extended(&node);
@@ -142,9 +286,14 @@ fn build_member(
         _ => Default::default(),
     };
 
+    let base = member_state(mn, member_of);
+    let special = classify(&st, base, manual_policy, &pool.spec, boot_timeout, cooldown, Utc::now());
     Some(Member {
         name: mn.name_any(),
-        state: member_state(mn, member_of),
+        state: special.state.unwrap_or(base),
+        note: special.note,
+        adopted_at: special.adopted_at,
+        release_after: special.release_after,
         woken_by: st
             .scaling_decision
             .as_ref()
@@ -392,7 +541,7 @@ pub async fn reconcile(pool: Arc<NodeScalingPool>, ctx: Arc<Context>) -> Result<
         if !holds.is_empty() {
             kept_by_others.insert(mn.name_any(), holds);
         }
-        if let Some(m) = build_member(&mn, &member_of, &pool, &ctx) {
+        if let Some(m) = build_member(&mn, &member_of, &pool, &pools, &ctx) {
             members.push(m);
         }
         managed.push(mn);
@@ -535,6 +684,8 @@ mod tests {
                     config: json!({}),
                 }],
                 lifecycle: Default::default(),
+                manual_power_on_policy: None,
+                manual_power_off_cooldown_seconds: None,
             },
         );
         m.status = Some(NodePowerManagementConfigStatus {
@@ -638,14 +789,14 @@ mod tests {
         );
         let on = [decision(
             DecisionAction::PowerOn,
-            Some("devbox"),
+            Some("gpu-node-1"),
             "unschedulable pod a/b",
         )];
         assert_eq!(record_decisions(&mut recent, &on, now).len(), 1);
         // The same reason for doing nothing after an action is a new decision.
         assert_eq!(record_decisions(&mut recent, &idle, now).len(), 1);
         assert_eq!(recent.len(), 3);
-        assert_eq!(recent[1].node.as_deref(), Some("devbox"));
+        assert_eq!(recent[1].node.as_deref(), Some("gpu-node-1"));
 
         // Bounded, oldest dropped first.
         for i in 0..30 {
@@ -664,7 +815,7 @@ mod tests {
         let spec: NodeScalingPoolSpec = serde_json::from_value(json!({
             "nodeSelector": {"matchLabels": {"gpu": "true"}},
             "scaleUp": {"preferredNodes": [
-                {"name": "devbox", "weight": 100},
+                {"name": "gpu-node-1", "weight": 100},
                 {"name": "gone", "weight": 50},
                 {"name": "cpu-box", "weight": 10},
             ]}
@@ -673,14 +824,14 @@ mod tests {
         assert_eq!(
             spec.scale_up.preferred_nodes[0],
             PreferredNode {
-                name: "devbox".into(),
+                name: "gpu-node-1".into(),
                 weight: 100
             }
         );
         let gpu = BTreeMap::from([("gpu".to_string(), "true".to_string())]);
         let cpu = BTreeMap::new();
         let (missing, outside) = preferred_node_problems(&spec, |n| match n {
-            "devbox" => Some(&gpu),
+            "gpu-node-1" => Some(&gpu),
             "cpu-box" => Some(&cpu),
             _ => None,
         });
@@ -701,26 +852,176 @@ mod tests {
         };
         let member_of = vec!["ci".to_string(), "gpu".to_string()];
         let busy = NodeScalingPoolStatus {
-            needed: BTreeMap::from([("zerda".to_string(), "busy: utilization 50% >= 10%".to_string())]),
+            needed: BTreeMap::from([("gpu-node-2".to_string(), "busy: utilization 50% >= 10%".to_string())]),
             ..Default::default()
         };
         let pools = vec![mk("gpu", None), mk("ci", Some(busy))];
         assert_eq!(
-            other_pools_holding("zerda", &member_of, "gpu", &pools),
+            other_pools_holding("gpu-node-2", &member_of, "gpu", &pools),
             vec![("ci".to_string(), "busy: utilization 50% >= 10%".to_string())]
         );
         // From ci's side, gpu has not evaluated it yet: it keeps it on too.
         assert_eq!(
-            other_pools_holding("zerda", &member_of, "ci", &pools),
+            other_pools_holding("gpu-node-2", &member_of, "ci", &pools),
             vec![("gpu".to_string(), "not evaluated yet".to_string())]
         );
         let releases = NodeScalingPoolStatus {
-            releasable: vec!["zerda".into()],
+            releasable: vec!["gpu-node-2".into()],
             ..Default::default()
         };
         let pools = vec![mk("gpu", None), mk("ci", Some(releases))];
-        assert!(other_pools_holding("zerda", &member_of, "gpu", &pools).is_empty());
+        assert!(other_pools_holding("gpu-node-2", &member_of, "gpu", &pools).is_empty());
         // A machine in one pool only is never held by another.
-        assert!(other_pools_holding("zerda", &["gpu".to_string()], "gpu", &pools).is_empty());
+        assert!(other_pools_holding("gpu-node-2", &["gpu".to_string()], "gpu", &pools).is_empty());
+    }
+
+    mod special {
+        use super::super::*;
+        use crate::crd::{BootFailure, ManualPowerChange, NodeScalingPoolSpec};
+
+        fn pool() -> NodeScalingPoolSpec {
+            serde_json::from_value(json!({"nodeSelector": {"matchLabels": {"example.com/gpu": "true"}}})).unwrap()
+        }
+
+        fn st(phase: Phase, ready: bool) -> NodePowerManagementConfigStatus {
+            NodePowerManagementConfigStatus {
+                phase,
+                node_ready: ready,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_boot_failure_is_unavailable_then_backed_off_then_wakeable() {
+            let now = Utc::now();
+            let spec = pool();
+            let mut s = st(Phase::BootFailed, false);
+            s.boot_failure = Some(BootFailure {
+                time: now,
+                left_on: false,
+            });
+            let c = classify(
+                &s,
+                MemberState::Booting,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.state, Some(MemberState::Unavailable));
+            assert!(
+                c.note
+                    .unwrap()
+                    .contains("on 20m+ without Ready; released hold; powering off")
+            );
+
+            // Powered off: not woken again within the backoff...
+            s.phase = Phase::Off;
+            let c = classify(
+                &s,
+                MemberState::Offline,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.state, Some(MemberState::Unavailable));
+            assert!(c.note.unwrap().contains("not woken again until"));
+            // ...and wakeable after it.
+            let later = now + chrono::Duration::seconds(1801);
+            let c = classify(
+                &s,
+                MemberState::Offline,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                later,
+            );
+            assert_eq!(c, Special::default());
+        }
+
+        #[test]
+        fn manual_power_on_under_each_policy() {
+            let now = Utc::now();
+            let spec = pool();
+            let mut s = st(Phase::On, true);
+            s.manual_power_on = Some(ManualPowerChange {
+                time: now,
+                policy: None,
+            });
+            let c = classify(
+                &s,
+                MemberState::Online,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.state, Some(MemberState::Manual));
+            assert!(c.note.unwrap().ends_with("policy LeaveOn; not managing"));
+            // Not Ready yet under LeaveOn: neither booting nor capacity.
+            s.node_ready = false;
+            let c = classify(
+                &s,
+                MemberState::Booting,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.state, Some(MemberState::Unavailable));
+            s.node_ready = true;
+
+            let c = classify(&s, MemberState::Online, ManualPowerOnPolicy::Adopt, &spec, 1200, 0, now);
+            assert_eq!((c.state, c.adopted_at), (None, Some(now)));
+
+            let c = classify(
+                &s,
+                MemberState::Online,
+                ManualPowerOnPolicy::PowerOff,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.release_after, Some(now + chrono::Duration::seconds(600)));
+        }
+
+        #[test]
+        fn manual_power_off_returns_to_management_with_an_optional_cooldown() {
+            let now = Utc::now();
+            let spec = pool();
+            let mut s = st(Phase::Off, false);
+            s.manual_power_off = Some(ManualPowerChange {
+                time: now,
+                policy: None,
+            });
+            let c = classify(
+                &s,
+                MemberState::Offline,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.state, None, "no cooldown: can be woken on demand");
+            assert!(c.note.unwrap().ends_with("back under management"));
+            let c = classify(
+                &s,
+                MemberState::Offline,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                900,
+                now,
+            );
+            assert_eq!(c.state, Some(MemberState::Unavailable));
+        }
     }
 }

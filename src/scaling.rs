@@ -26,8 +26,13 @@ pub enum MemberState {
     Offline,
     /// Draining or powering off (or asked to).
     Leaving,
-    /// State unknown or errored; not touched by the autoscaler.
+    /// State unknown or errored, failed to boot, or held back (boot failure
+    /// backoff, manual power-off cooldown); not touched by the autoscaler.
     Unavailable,
+    /// Powered on by hand under `manualPowerOnPolicy: LeaveOn`, and Ready: never
+    /// powered off, not counted as booting or towards `maxOnline`, but room for
+    /// pods evicted elsewhere.
+    Manual,
 }
 
 /// Scheduling-relevant view of a pod.
@@ -74,6 +79,13 @@ pub struct Member {
     /// The pool whose power-on decision is in force for this machine, if any
     /// (with overlapping pools, possibly another pool than the one planning).
     pub woken_by: Option<String>,
+    /// Why the member is in a special state (boot failure, manual power
+    /// change), for the decision log.
+    pub note: Option<String>,
+    /// Powered on by hand under `Adopt`: counts as this pool's power-on then.
+    pub adopted_at: Option<DateTime<Utc>>,
+    /// Powered on by hand under `PowerOff`: powered off once this has passed.
+    pub release_after: Option<DateTime<Utc>>,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -561,9 +573,14 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
 
     let over_max = online_now.saturating_sub(max_online);
     let leaving = s.members.iter().filter(|m| m.state == MemberState::Leaving).count();
-    // `holdAfterPowerOnSeconds`: pool-wide, after this pool last powered a machine on.
-    let hold_until = s
+    // `holdAfterPowerOnSeconds`: pool-wide, after this pool last powered a
+    // machine on, or a machine was powered on by hand under `Adopt`.
+    let last_power_on = s
         .last_scale_up
+        .into_iter()
+        .chain(s.members.iter().filter_map(|m| m.adopted_at))
+        .max();
+    let hold_until = last_power_on
         .map(|t| t + Duration::seconds(spec.scale_down.hold_after_power_on() as i64))
         .filter(|until| s.now < *until);
     let booting = s.members.iter().any(|m| m.state == MemberState::Booting);
@@ -587,6 +604,9 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
 
     let step = spec.scale_down.max_nodes_per_step.max(1) as usize;
     let mut off_notes: BTreeMap<String, String> = BTreeMap::new();
+    // `manualPowerOnPolicy: PowerOff` past its grace: powered off busy or not
+    // (pods are still drained; safe-to-evict=false pods still block).
+    let released = |m: &Member| m.release_after.is_some_and(|t| s.now >= t) && m.blocking_pods.is_empty();
     let eligible: Vec<&Member> = candidates
         .iter()
         .copied()
@@ -595,7 +615,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                 .unneeded_since
                 .get(&m.name)
                 .is_some_and(|t| s.now - *t >= unneeded_for);
-            (over_max > 0 && m.blocking_pods.is_empty()) || expired
+            (over_max > 0 && m.blocking_pods.is_empty()) || expired || released(m)
         })
         .collect();
     if blocked_reason.is_none() && leaving >= step && over_max == 0 {
@@ -613,7 +633,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         let mut free: BTreeMap<String, ResourceAmounts> = s
             .members
             .iter()
-            .filter(|m| m.state == MemberState::Online)
+            .filter(|m| matches!(m.state, MemberState::Online | MemberState::Manual))
             .map(|m| (m.name.clone(), m.allocatable.minus(&m.requested)))
             .collect();
         for e in &s.external {
@@ -649,7 +669,11 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             let mut targets: Vec<(String, &BTreeMap<String, String>, &[Taint])> = s
                 .members
                 .iter()
-                .filter(|o| o.state == MemberState::Online && o.name != m.name && !removed.contains(&o.name))
+                .filter(|o| {
+                    matches!(o.state, MemberState::Online | MemberState::Manual)
+                        && o.name != m.name
+                        && !removed.contains(&o.name)
+                })
                 .map(|o| (o.name.clone(), &o.labels, o.taints.as_slice()))
                 .collect();
             targets.extend(
@@ -676,8 +700,14 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             if all_fit {
                 free = trial;
                 removed.insert(m.name.clone());
+                let expired = plan
+                    .unneeded_since
+                    .get(&m.name)
+                    .is_some_and(|t| s.now - *t >= unneeded_for);
                 let why = if over_max > 0 {
                     format!("pool above maxOnline ({max_online})")
+                } else if released(m) && !expired {
+                    "manually powered on; policy PowerOff, grace over".to_string()
                 } else {
                     format!(
                         "utilization {:.0}% below {:.0}% for {}s",
@@ -719,7 +749,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             .unneeded_since
             .get(&m.name)
             .is_some_and(|t| s.now - *t >= unneeded_for);
-        let held = if !expired {
+        let held = if !expired && !released(m) {
             Some(down_notes[&m.name].stable.clone())
         } else if let Some(r) = &blocked_reason {
             Some(r.stable.clone())
@@ -765,6 +795,9 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                 }
                 None => {}
             }
+            if let Some(n) = &m.note {
+                line.push_str(&format!("; {n}"));
+            }
             lines.push(line);
         }
         for (i, m) in candidates.iter().enumerate() {
@@ -787,6 +820,9 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                     line.push_str(&format!("; {off}"));
                 }
             }
+            if let Some(n) = &m.note {
+                line.push_str(&format!("; {n}"));
+            }
             lines.push(line);
         }
         let mut others: Vec<&Member> = s
@@ -798,6 +834,8 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         for m in others {
             let why = match m.state {
                 _ if !m.auto => "excluded: powerPolicy is not Auto".to_string(),
+                _ if m.note.is_some() => m.note.clone().unwrap_or_default(),
+                MemberState::Manual => "powered on by hand; not managing".to_string(),
                 MemberState::Booting => match &m.woken_by {
                     Some(p) => format!("powering on (woken by pool {p})"),
                     None => "powering on".to_string(),
@@ -891,11 +929,25 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                 format!("{online_now} online, nothing pending, nothing unneeded")
             }
         };
+        // Members in a special state explain it in every decision about doing
+        // nothing, so the log records when it starts and ends.
+        let notes: Vec<String> = s
+            .members
+            .iter()
+            .filter_map(|m| m.note.as_ref().map(|n| format!("{} {n}", m.name)))
+            .collect();
+        let with_notes = |reason: String| {
+            if notes.is_empty() {
+                reason
+            } else {
+                format!("{reason}; {}", notes.join("; "))
+            }
+        };
         plan.decisions.push(PlannedDecision {
             action: DecisionAction::NoAction,
             node: None,
-            reason: why(false),
-            live_reason: why(true),
+            reason: with_notes(why(false)),
+            live_reason: with_notes(why(true)),
             candidates: if unneeded.is_empty() && unplaced.is_empty() {
                 String::new()
             } else if unplaced.is_empty() {
@@ -1019,6 +1071,8 @@ mod tests {
                 require_explicit_selection: false,
                 prefer_s3_capable: false,
                 preferred_nodes: vec![],
+                boot_timeout_seconds: None,
+                boot_failure_backoff_seconds: 1800,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -1031,6 +1085,9 @@ mod tests {
                 ignore_daemon_set_utilization: false,
                 ignore_non_selecting_pod_utilization: false,
             },
+            manual_power_on_policy: None,
+            manual_power_on_grace_seconds: 600,
+            manual_power_off_cooldown_seconds: None,
         }
     }
 
@@ -1070,6 +1127,9 @@ mod tests {
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,
+            note: None,
+            adopted_at: None,
+            release_after: None,
         }
     }
 
@@ -1339,14 +1399,14 @@ mod tests {
         let now = Utc::now();
         let mut spec = spec();
         spec.scale_up.prefer_s3_capable = true;
-        prefer(&mut spec, &[("devbox", 100), ("vulpes-zerda", 10)]);
-        let mut devbox = member("devbox", MemberState::Offline, 0);
-        devbox.s3_capable = true;
+        prefer(&mut spec, &[("gpu-node-1", 100), ("gpu-node-2", 10)]);
+        let mut first = member("gpu-node-1", MemberState::Offline, 0);
+        first.s3_capable = true;
         let mut fixed = member("fixed", MemberState::Offline, 0);
         fixed.auto = false;
         let members = vec![
-            member("vulpes-zerda", MemberState::Offline, 0),
-            devbox,
+            member("gpu-node-2", MemberState::Offline, 0),
+            first,
             fixed,
             member("a", MemberState::Online, 3900),
         ];
@@ -1354,19 +1414,19 @@ mod tests {
         assert_eq!(p.decisions.len(), 1);
         let d = &p.decisions[0];
         assert_eq!(d.action, DecisionAction::PowerOn);
-        assert_eq!(d.node.as_deref(), Some("devbox"));
+        assert_eq!(d.node.as_deref(), Some("gpu-node-1"));
         assert_eq!(
             d.reason,
-            "unschedulable pod default/p1; #1 of 2 to power on, over vulpes-zerda by weight (100 vs 10)"
+            "unschedulable pod default/p1; #1 of 2 to power on, over gpu-node-2 by weight (100 vs 10)"
         );
-        assert_eq!(d.candidates, "devbox(w100 s3 4c/16Gi) > vulpes-zerda(w10 4c/16Gi)");
+        assert_eq!(d.candidates, "gpu-node-1(w100 s3 4c/16Gi) > gpu-node-2(w10 4c/16Gi)");
         assert!(
             p.details
-                .contains(&"devbox: #1 to power on (weight 100, S3 yes, 4c/16Gi); chosen".to_string())
+                .contains(&"gpu-node-1: #1 to power on (weight 100, S3 yes, 4c/16Gi); chosen".to_string())
         );
         assert!(
             p.details
-                .contains(&"vulpes-zerda: #2 to power on (weight 10, S3 no, 4c/16Gi)".to_string())
+                .contains(&"gpu-node-2: #2 to power on (weight 10, S3 no, 4c/16Gi)".to_string())
         );
         assert!(
             p.details
@@ -1395,33 +1455,34 @@ mod tests {
         let now = Utc::now();
         let mut spec = spec();
         spec.min_online = 0;
-        prefer(&mut spec, &[("devbox", 100), ("vulpes-zerda", 10)]);
+        prefer(&mut spec, &[("gpu-node-1", 100), ("gpu-node-2", 10)]);
         let mut s = snapshot(
             &spec,
             vec![
-                member("devbox", MemberState::Online, 100),
-                member("vulpes-zerda", MemberState::Online, 100),
+                member("gpu-node-1", MemberState::Online, 100),
+                member("gpu-node-2", MemberState::Online, 100),
             ],
             vec![],
             now,
         );
         s.unneeded_since = BTreeMap::from([
-            ("devbox".to_string(), now - Duration::seconds(700)),
-            ("vulpes-zerda".to_string(), now - Duration::seconds(700)),
+            ("gpu-node-1".to_string(), now - Duration::seconds(700)),
+            ("gpu-node-2".to_string(), now - Duration::seconds(700)),
         ]);
         let p = plan(&s);
         let d = &p.decisions[0];
         assert_eq!(d.action, DecisionAction::PowerOff);
-        assert_eq!(d.node.as_deref(), Some("vulpes-zerda"));
+        assert_eq!(d.node.as_deref(), Some("gpu-node-2"));
         assert_eq!(
             d.reason,
-            "utilization 2% below 50% for 600s; #1 of 2 to power off, before devbox by weight (10 vs 100)"
+            "utilization 2% below 50% for 600s; #1 of 2 to power off, before gpu-node-1 by weight (10 vs 100)"
         );
-        assert_eq!(d.candidates, "vulpes-zerda(w10 4c/16Gi) > devbox(w100 4c/16Gi)");
+        assert_eq!(d.candidates, "gpu-node-2(w10 4c/16Gi) > gpu-node-1(w100 4c/16Gi)");
         assert!(
             p.details
                 .iter()
-                .any(|l| l.starts_with("devbox: #2 to power off") && l.ends_with("kept: maxNodesPerStep (1) reached")),
+                .any(|l| l.starts_with("gpu-node-1: #2 to power off")
+                    && l.ends_with("kept: maxNodesPerStep (1) reached")),
             "{:?}",
             p.details
         );
@@ -1513,32 +1574,29 @@ mod tests {
         spec.min_online = 0;
         let i915 = "gpu.intel.com/i915".to_string();
         // Woken for the runner; Ready, but its device plugin reports 0 cards so far.
-        let mut gpu = member("vulpes-zerda", MemberState::Online, 0);
+        let mut gpu = member("gpu-node-2", MemberState::Online, 0);
         gpu.registering = BTreeMap::from([(i915.clone(), 1)]);
         let mut runner = pod("runner", 1000, 120, now);
         runner.extended_requests = BTreeMap::from([(i915.clone(), 1)]);
         let snap = |gpu: Member, pending: Vec<PodView>| {
             let mut s = snapshot(
                 &spec,
-                vec![member("devbox", MemberState::Online, 3000), gpu],
+                vec![member("gpu-node-1", MemberState::Online, 3000), gpu],
                 pending,
                 now,
             );
-            s.unneeded_since = BTreeMap::from([("vulpes-zerda".to_string(), now - Duration::seconds(700))]);
+            s.unneeded_since = BTreeMap::from([("gpu-node-2".to_string(), now - Duration::seconds(700))]);
             s
         };
 
         let p = plan(&snap(gpu.clone(), vec![runner.clone()]));
         assert!(p.power_off.is_empty(), "the node the runner waits for stays on");
-        assert!(
-            !p.unneeded_since.contains_key("vulpes-zerda"),
-            "and is not even unneeded"
-        );
+        assert!(!p.unneeded_since.contains_key("gpu-node-2"), "and is not even unneeded");
         assert_eq!(
             p.decisions[0].reason,
-            "vulpes-zerda needed: 1 pending pod(s) waiting for its gpu.intel.com/i915 to register"
+            "gpu-node-2 needed: 1 pending pod(s) waiting for its gpu.intel.com/i915 to register"
         );
-        assert!(p.details.iter().any(|l| l.starts_with("vulpes-zerda: #1 to power off")
+        assert!(p.details.iter().any(|l| l.starts_with("gpu-node-2: #1 to power off")
             && l.ends_with("needed: 1 pending pod(s) waiting for its gpu.intel.com/i915 to register")));
 
         // A pod that needs more cards than the node ever had does not hold it.
@@ -1892,6 +1950,8 @@ mod dedicated_pool_tests {
                 require_explicit_selection: true,
                 prefer_s3_capable: false,
                 preferred_nodes: vec![],
+                boot_timeout_seconds: None,
+                boot_failure_backoff_seconds: 1800,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -1904,6 +1964,9 @@ mod dedicated_pool_tests {
                 ignore_daemon_set_utilization: true,
                 ignore_non_selecting_pod_utilization: true,
             },
+            manual_power_on_policy: None,
+            manual_power_on_grace_seconds: 600,
+            manual_power_off_cooldown_seconds: None,
         }
     }
 
@@ -1935,6 +1998,9 @@ mod dedicated_pool_tests {
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,
+            note: None,
+            adopted_at: None,
+            release_after: None,
         }
     }
 
@@ -2055,9 +2121,9 @@ mod dedicated_pool_tests {
 
 #[cfg(test)]
 mod overlapping_pool_tests {
-    //! Two dedicated pools over the same machines, like this cluster's `gpu`
-    //! (gpu=true: devbox, vulpes-zerda) and `ci` (ci=true: vulpes-zerda,
-    //! vulpes-velox, devbox), each with its own pending pods, utilization rules
+    //! Two dedicated pools over the same machines: `gpu`
+    //! (gpu=true: gpu-node-1, gpu-node-2) and `ci` (ci=true: gpu-node-2,
+    //! ci-node-1, gpu-node-1), each with its own pending pods, utilization rules
     //! and preferences.
     use super::*;
     use crate::crd::{NodeSelector, PreferredNode};
@@ -2091,11 +2157,11 @@ mod overlapping_pool_tests {
     }
 
     fn gpu() -> NodeScalingPoolSpec {
-        pool("gpu", &[("devbox", 100), ("vulpes-zerda", 10)], 2)
+        pool("gpu", &[("gpu-node-1", 100), ("gpu-node-2", 10)], 2)
     }
 
     fn ci() -> NodeScalingPoolSpec {
-        pool("ci", &[("vulpes-zerda", 100), ("vulpes-velox", 50), ("devbox", 10)], 3)
+        pool("ci", &[("gpu-node-2", 100), ("ci-node-1", 50), ("gpu-node-1", 10)], 3)
     }
 
     fn machine(name: &str, labels: &[&str], state: MemberState) -> Member {
@@ -2118,15 +2184,18 @@ mod overlapping_pool_tests {
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,
+            note: None,
+            adopted_at: None,
+            release_after: None,
         }
     }
 
     /// The members each pool sees (only those its selector matches).
     fn fleet(state: MemberState, pool_label: &str) -> Vec<Member> {
         [
-            machine("devbox", &["gpu", "ci"], state),
-            machine("vulpes-zerda", &["gpu", "ci"], state),
-            machine("vulpes-velox", &["ci"], state),
+            machine("gpu-node-1", &["gpu", "ci"], state),
+            machine("gpu-node-2", &["gpu", "ci"], state),
+            machine("ci-node-1", &["ci"], state),
         ]
         .into_iter()
         .filter(|m| m.labels.contains_key(pool_label))
@@ -2180,27 +2249,27 @@ mod overlapping_pool_tests {
     }
 
     #[test]
-    fn a_gpu_job_wakes_devbox_through_gpu_and_ci_ignores_it() {
+    fn a_gpu_job_wakes_the_gpu_node_through_gpu_and_ci_ignores_it() {
         let now = Utc::now();
         let (gpu, ci) = (gpu(), ci());
         let pending = vec![job("transcode", "gpu", now)];
         let p = plan(&snap(&gpu, fleet(MemberState::Offline, "gpu"), pending.clone(), now));
         assert_eq!(p.power_on.len(), 1);
-        assert_eq!(p.power_on[0].0, "devbox");
+        assert_eq!(p.power_on[0].0, "gpu-node-1");
         let p = plan(&snap(&ci, fleet(MemberState::Offline, "ci"), pending, now));
         assert!(p.power_on.is_empty(), "a GPU job does not target ci");
     }
 
     #[test]
-    fn a_ci_job_wakes_zerda_through_ci_and_gpu_ignores_it() {
+    fn a_ci_job_wakes_the_shared_node_through_ci_and_gpu_ignores_it() {
         let now = Utc::now();
         let (gpu, ci) = (gpu(), ci());
         let pending = vec![job("runner", "ci", now)];
         let p = plan(&snap(&ci, fleet(MemberState::Offline, "ci"), pending.clone(), now));
         assert_eq!(p.power_on.len(), 1);
-        assert_eq!(p.power_on[0].0, "vulpes-zerda");
+        assert_eq!(p.power_on[0].0, "gpu-node-2");
         assert!(
-            p.power_on[0].1.contains("over vulpes-velox by weight (100 vs 50)"),
+            p.power_on[0].1.contains("over ci-node-1 by weight (100 vs 50)"),
             "{}",
             p.power_on[0].1
         );
@@ -2213,7 +2282,7 @@ mod overlapping_pool_tests {
         let now = Utc::now();
         let mut ci = ci();
         ci.max_online = Some(1);
-        // devbox is on because gpu woke it; ci may not wake a second machine.
+        // gpu-node-1 is on because gpu woke it; ci may not wake a second machine.
         let mut members = fleet(MemberState::Offline, "ci");
         members[0].state = MemberState::Online;
         members[0].woken_by = Some("gpu".into());
@@ -2224,16 +2293,16 @@ mod overlapping_pool_tests {
     }
 
     #[test]
-    fn a_ci_job_keeps_zerda_on_through_ci_although_gpu_ignores_it_and_power_off_needs_both() {
+    fn a_ci_job_keeps_the_shared_node_on_through_ci_although_gpu_ignores_it_and_power_off_needs_both() {
         let now = Utc::now();
         let (gpu, ci) = (gpu(), ci());
         let long_ago = now - Duration::seconds(1000);
-        // vulpes-zerda runs a CI job: requested load. ci counts it (the runner
+        // gpu-node-2 runs a CI job: requested load. ci counts it (the runner
         // selects ci=true); gpu does not (it does not select gpu=true).
         let busy = |label: &str| {
             let mut ms = fleet(MemberState::Online, label);
             for m in ms.iter_mut() {
-                if m.name == "vulpes-zerda" {
+                if m.name == "gpu-node-2" {
                     m.requested.cpu_millis = 4000;
                     if label == "ci" {
                         m.counted.cpu_millis = 4000;
@@ -2249,14 +2318,14 @@ mod overlapping_pool_tests {
         let mut ci_snap = snap(&ci, busy("ci"), vec![], now);
         ci_snap.unneeded_since = all_unneeded(&ci_snap.members);
         let ci_plan = plan(&ci_snap);
-        assert!(!ci_plan.releasable.contains(&"vulpes-zerda".to_string()));
-        assert_eq!(ci_plan.needed["vulpes-zerda"], "busy: utilization 50% >= 10%");
+        assert!(!ci_plan.releasable.contains(&"gpu-node-2".to_string()));
+        assert_eq!(ci_plan.needed["gpu-node-2"], "busy: utilization 50% >= 10%");
 
-        // gpu alone would power zerda off (lowest weight, idle by its rules)...
+        // gpu alone would power gpu-node-2 off (lowest weight, idle by its rules)...
         let mut gpu_snap = snap(&gpu, busy("gpu"), vec![], now);
         gpu_snap.unneeded_since = all_unneeded(&gpu_snap.members);
         gpu_snap.external = vec![ExternalNode {
-            name: "pve-thin-5".into(),
+            name: "always-on-1".into(),
             labels: BTreeMap::new(),
             taints: vec![],
             free: ResourceAmounts {
@@ -2265,14 +2334,14 @@ mod overlapping_pool_tests {
                 pods: 100,
             },
         }];
-        assert_eq!(plan(&gpu_snap).power_off[0].0, "vulpes-zerda");
-        // ...but ci keeps it on, and gpu says so. devbox, which ci releases, goes instead.
-        gpu_snap.kept_by_others = holds_from("ci", &ci_plan, "vulpes-zerda");
+        assert_eq!(plan(&gpu_snap).power_off[0].0, "gpu-node-2");
+        // ...but ci keeps it on, and gpu says so. gpu-node-1, which ci releases, goes instead.
+        gpu_snap.kept_by_others = holds_from("ci", &ci_plan, "gpu-node-2");
         let gpu_plan = plan(&gpu_snap);
         assert_eq!(gpu_plan.power_off.len(), 1);
-        assert_eq!(gpu_plan.power_off[0].0, "devbox");
+        assert_eq!(gpu_plan.power_off[0].0, "gpu-node-1");
         assert!(
-            gpu_plan.details.iter().any(|l| l.starts_with("vulpes-zerda:")
+            gpu_plan.details.iter().any(|l| l.starts_with("gpu-node-2:")
                 && l.ends_with("kept: needed by pool ci: busy: utilization 50% >= 10%")),
             "{:?}",
             gpu_plan.details
@@ -2282,9 +2351,9 @@ mod overlapping_pool_tests {
         let mut ci_snap = snap(&ci, fleet(MemberState::Online, "ci"), vec![], now);
         ci_snap.unneeded_since = all_unneeded(&ci_snap.members);
         let ci_plan = plan(&ci_snap);
-        assert!(ci_plan.releasable.contains(&"vulpes-zerda".to_string()));
-        gpu_snap.kept_by_others = holds_from("ci", &ci_plan, "vulpes-zerda");
-        assert_eq!(plan(&gpu_snap).power_off[0].0, "vulpes-zerda");
+        assert!(ci_plan.releasable.contains(&"gpu-node-2".to_string()));
+        gpu_snap.kept_by_others = holds_from("ci", &ci_plan, "gpu-node-2");
+        assert_eq!(plan(&gpu_snap).power_off[0].0, "gpu-node-2");
     }
 
     #[test]
@@ -2297,16 +2366,215 @@ mod overlapping_pool_tests {
         s.last_scale_up = Some(now - Duration::seconds(60));
         let p = plan(&s);
         assert!(p.releasable.is_empty());
-        assert!(p.needed["vulpes-zerda"].starts_with("holding after power-on until "));
+        assert!(p.needed["gpu-node-2"].starts_with("holding after power-on until "));
 
         // Recently unneeded: not releasable yet, and the reason says when it will be.
         let mut s = snap(&ci, fleet(MemberState::Online, "ci"), vec![], now);
-        s.unneeded_since = BTreeMap::from([("devbox".to_string(), now - Duration::seconds(10))]);
+        s.unneeded_since = BTreeMap::from([("gpu-node-1".to_string(), now - Duration::seconds(10))]);
         let p = plan(&s);
         assert!(
-            p.needed["devbox"].starts_with("unneeded since "),
+            p.needed["gpu-node-1"].starts_with("unneeded since "),
             "{}",
-            p.needed["devbox"]
+            p.needed["gpu-node-1"]
         );
+    }
+}
+
+#[cfg(test)]
+mod boot_and_manual_tests {
+    //! Boot failures and machines powered on by hand, as the planner sees them.
+    use super::*;
+
+    const GI: i64 = 1 << 30;
+
+    fn spec() -> NodeScalingPoolSpec {
+        serde_json::from_value(serde_json::json!({
+            "nodeSelector": {"matchLabels": {"example.com/gpu": "true"}},
+            "minOnline": 0,
+            "maxOnline": 2,
+            "scaleDown": {"unneededSeconds": 300, "utilizationThresholdPercent": 10, "holdAfterPowerOnSeconds": 600}
+        }))
+        .unwrap()
+    }
+
+    fn machine(name: &str, state: MemberState) -> Member {
+        Member {
+            name: name.into(),
+            state,
+            auto: true,
+            labels: BTreeMap::from([("example.com/gpu".to_string(), "true".to_string())]),
+            taints: vec![],
+            allocatable: ResourceAmounts {
+                cpu_millis: 8000,
+                memory_bytes: 32 * GI,
+                pods: 110,
+            },
+            requested: ResourceAmounts::default(),
+            counted: ResourceAmounts::default(),
+            movable_pods: vec![],
+            blocking_pods: vec![],
+            drain_failed_at: None,
+            s3_capable: false,
+            registering: BTreeMap::new(),
+            woken_by: None,
+            note: None,
+            adopted_at: None,
+            release_after: None,
+        }
+    }
+
+    fn snap(spec: &NodeScalingPoolSpec, members: Vec<Member>, now: DateTime<Utc>) -> PoolSnapshot<'_> {
+        PoolSnapshot {
+            spec,
+            unneeded_since: members
+                .iter()
+                .map(|m| (m.name.clone(), now - Duration::seconds(1000)))
+                .collect(),
+            members,
+            pending: vec![],
+            now,
+            last_scale_up: None,
+            external: vec![],
+            kept_by_others: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_machine_that_failed_to_boot_does_not_hold_the_pool() {
+        let now = Utc::now();
+        let spec = spec();
+        // Still booting: the idle machine is kept while capacity is on its way.
+        let booting = plan(&snap(
+            &spec,
+            vec![
+                machine("gpu-node-1", MemberState::Online),
+                machine("gpu-node-2", MemberState::Booting),
+            ],
+            now,
+        ));
+        assert!(booting.power_off.is_empty());
+        assert!(booting.decisions[0].reason.contains("scale-down held (nodes booting)"));
+
+        // Past its boot timeout it is boot-failed: the hold is released.
+        let mut failed = machine("gpu-node-2", MemberState::Unavailable);
+        failed.note = Some("boot failed at 12:00:00Z: on 20m+ without Ready; released hold; powering off".into());
+        let p = plan(&snap(
+            &spec,
+            vec![machine("gpu-node-1", MemberState::Online), failed],
+            now,
+        ));
+        assert_eq!(p.power_off.len(), 1);
+        assert_eq!(p.power_off[0].0, "gpu-node-1");
+        assert!(
+            p.details.contains(
+                &"gpu-node-2: boot failed at 12:00:00Z: on 20m+ without Ready; released hold; powering off".to_string()
+            ),
+            "{:?}",
+            p.details
+        );
+    }
+
+    #[test]
+    fn the_boot_failure_is_in_the_decision_log() {
+        let now = Utc::now();
+        let spec = spec();
+        let mut busy = machine("gpu-node-1", MemberState::Online);
+        busy.counted.cpu_millis = 6000;
+        let mut failed = machine("gpu-node-2", MemberState::Unavailable);
+        failed.note = Some("boot failed at 12:00:00Z: on 20m+ without Ready; released hold; powering off".into());
+        let p = plan(&snap(&spec, vec![busy, failed], now));
+        assert_eq!(p.decisions[0].action, DecisionAction::NoAction);
+        assert!(
+            p.decisions[0]
+                .reason
+                .ends_with("; gpu-node-2 boot failed at 12:00:00Z: on 20m+ without Ready; released hold; powering off"),
+            "{}",
+            p.decisions[0].reason
+        );
+    }
+
+    #[test]
+    fn a_machine_left_on_by_hand_is_never_powered_off_and_blocks_nothing() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.max_online = Some(1);
+        let mut manual = machine("gpu-node-1", MemberState::Manual);
+        manual.note = Some("manually powered on at 12:00:00Z; policy LeaveOn; not managing".into());
+        let pending = vec![PodView {
+            namespace: "default".into(),
+            name: "job".into(),
+            requests: ResourceAmounts {
+                cpu_millis: 1000,
+                memory_bytes: GI,
+                pods: 1,
+            },
+            created: Some(now - Duration::seconds(120)),
+            ..Default::default()
+        }];
+        let mut s = snap(
+            &spec,
+            vec![manual.clone(), machine("gpu-node-2", MemberState::Offline)],
+            now,
+        );
+        s.pending = pending;
+        let p = plan(&s);
+        // Idle, yet not powered off; not counted towards maxOnline, so the pool
+        // still wakes another machine for its pod.
+        assert!(p.power_off.is_empty());
+        assert_eq!(p.power_on.len(), 1);
+        assert_eq!(p.power_on[0].0, "gpu-node-2");
+
+        // It is room for pods evicted from a machine being powered off.
+        let mut leaving = machine("gpu-node-3", MemberState::Online);
+        leaving.movable_pods = vec![PodView {
+            namespace: "default".into(),
+            name: "web".into(),
+            requests: ResourceAmounts {
+                cpu_millis: 500,
+                memory_bytes: GI,
+                pods: 1,
+            },
+            ..Default::default()
+        }];
+        let p = plan(&snap(&spec, vec![manual, leaving], now));
+        assert_eq!(p.power_off.len(), 1);
+        assert_eq!(p.power_off[0].0, "gpu-node-3");
+    }
+
+    #[test]
+    fn an_adopted_machine_holds_the_pool_from_its_manual_power_on() {
+        let now = Utc::now();
+        let spec = spec();
+        let mut adopted = machine("gpu-node-1", MemberState::Online);
+        adopted.adopted_at = Some(now - Duration::seconds(120));
+        let p = plan(&snap(&spec, vec![adopted.clone()], now));
+        assert!(p.power_off.is_empty());
+        assert!(p.decisions[0].reason.contains("holding after power-on until"));
+        adopted.adopted_at = Some(now - Duration::seconds(700));
+        assert_eq!(plan(&snap(&spec, vec![adopted], now)).power_off.len(), 1);
+    }
+
+    #[test]
+    fn power_off_policy_powers_it_off_after_the_grace_busy_or_not() {
+        let now = Utc::now();
+        let spec = spec();
+        let mut m = machine("gpu-node-1", MemberState::Online);
+        m.counted.cpu_millis = 6000; // busy by the utilization rule
+        m.release_after = Some(now + Duration::seconds(60));
+        let mut s = snap(&spec, vec![m.clone()], now);
+        s.unneeded_since.clear();
+        assert!(plan(&s).power_off.is_empty(), "within the grace");
+        m.release_after = Some(now - Duration::seconds(1));
+        let mut s = snap(&spec, vec![m.clone()], now);
+        s.unneeded_since.clear();
+        let p = plan(&s);
+        assert_eq!(p.power_off.len(), 1);
+        assert!(p.power_off[0].1.starts_with("manually powered on; policy PowerOff"));
+        assert!(p.releasable.contains(&"gpu-node-1".to_string()));
+        // Pods that must not be evicted still keep it on.
+        m.blocking_pods = vec!["default/job (annotated safe-to-evict=false)".into()];
+        let mut s = snap(&spec, vec![m], now);
+        s.unneeded_since.clear();
+        assert!(plan(&s).power_off.is_empty());
     }
 }

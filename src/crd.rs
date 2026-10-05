@@ -74,6 +74,86 @@ pub struct NodePowerManagementConfigSpec {
     /// Timeouts and drain behaviour for power transitions.
     #[serde(default)]
     pub lifecycle: LifecycleSpec,
+
+    /// What to do when the machine is powered on outside the autoscaler (by
+    /// hand, from its BMC, or by a power button). Overrides the pools'
+    /// `manualPowerOnPolicy`; see `ManualPowerOnPolicy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_power_on_policy: Option<ManualPowerOnPolicy>,
+
+    /// After the machine is powered off outside the autoscaler, do not wake it
+    /// again for this many seconds. Overrides the pools'
+    /// `manualPowerOffCooldownSeconds`; 0 (the default) disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_power_off_cooldown_seconds: Option<u64>,
+}
+
+/// What the autoscaler does with a machine powered on outside it.
+///
+/// Whatever the policy, a stale scaling decision never acts on a manually
+/// powered-on machine: it is cleared when the manual power-on is seen.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum ManualPowerOnPolicy {
+    /// Leave it alone while it stays on: never power it off, and do not let
+    /// it hold or block anything (it is not "booting", not counted towards
+    /// `maxOnline`). It does count as room for pods evicted elsewhere once its
+    /// Node is Ready. It returns to normal management once it is observed off
+    /// again (e.g. powered off by hand), or when `status.manualPowerOn` is
+    /// cleared. Keeping a machine off for maintenance is `powerPolicy:
+    /// AlwaysOff`, not this.
+    #[default]
+    LeaveOn,
+    /// Manage it as if its pool had powered it on: normal scale-down, with
+    /// `holdAfterPowerOnSeconds` counted from the manual power-on.
+    Adopt,
+    /// Power it back off after the pool's `manualPowerOnGraceSeconds`, busy or
+    /// not (pods are still drained, and safe-to-evict=false pods still block):
+    /// for machines that must only ever be on when the autoscaler says so.
+    PowerOff,
+}
+
+impl ManualPowerOnPolicy {
+    /// How cautious the policy is; overlapping pools apply the most cautious.
+    fn caution(self) -> u8 {
+        match self {
+            ManualPowerOnPolicy::LeaveOn => 2,
+            ManualPowerOnPolicy::Adopt => 1,
+            ManualPowerOnPolicy::PowerOff => 0,
+        }
+    }
+}
+
+/// The policy for a machine: its own `manualPowerOnPolicy`, else the most
+/// cautious of its pools' (`LeaveOn` over `Adopt` over `PowerOff`), else
+/// `LeaveOn`.
+pub fn effective_manual_power_on_policy(
+    machine: Option<ManualPowerOnPolicy>,
+    pools: impl IntoIterator<Item = Option<ManualPowerOnPolicy>>,
+) -> ManualPowerOnPolicy {
+    machine.unwrap_or_else(|| {
+        pools
+            .into_iter()
+            .flatten()
+            .max_by_key(|p| p.caution())
+            .unwrap_or_default()
+    })
+}
+
+/// `lifecycle.bootTimeoutSeconds` when neither the machine nor any of its pools sets it.
+pub const DEFAULT_BOOT_TIMEOUT_SECONDS: u64 = 1200;
+
+/// The boot timeout for a machine: its own `lifecycle.bootTimeoutSeconds`,
+/// else the longest of its pools' `scaleUp.bootTimeoutSeconds`, else 1200.
+pub fn effective_boot_timeout(machine: Option<u64>, pools: impl IntoIterator<Item = Option<u64>>) -> u64 {
+    machine
+        .or_else(|| pools.into_iter().flatten().max())
+        .unwrap_or(DEFAULT_BOOT_TIMEOUT_SECONDS)
+}
+
+/// The manual power-off cooldown for a machine: its own, else the longest of
+/// its pools', else 0 (none).
+pub fn effective_manual_power_off_cooldown(machine: Option<u64>, pools: impl IntoIterator<Item = Option<u64>>) -> u64 {
+    machine.or_else(|| pools.into_iter().flatten().max()).unwrap_or(0)
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
@@ -175,9 +255,15 @@ fn default_password_key() -> String {
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleSpec {
-    /// Seconds to wait for the node to become `Ready` after powering on.
-    #[serde(default = "default_boot_timeout")]
-    pub boot_timeout_seconds: u64,
+    /// Seconds a powered-on machine may take for its Node to become `Ready`,
+    /// however it was powered on. Past it the machine counts as boot-failed
+    /// (phase `BootFailed`): it no longer holds its pools' scale-down, is not
+    /// counted as capacity, and is powered off (unless it was powered on by
+    /// hand under `manualPowerOnPolicy: LeaveOn`) and not woken again for its
+    /// pools' `scaleUp.bootFailureBackoffSeconds`. When unset, the longest of
+    /// its pools' `scaleUp.bootTimeoutSeconds`, else 1200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_timeout_seconds: Option<u64>,
     /// Seconds to wait for pods to be evicted before giving up.
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_seconds: u64,
@@ -215,9 +301,6 @@ pub enum PowerOffMode {
     Auto,
 }
 
-fn default_boot_timeout() -> u64 {
-    900
-}
 fn default_drain_timeout() -> u64 {
     300
 }
@@ -228,7 +311,7 @@ fn default_shutdown_timeout() -> u64 {
 impl Default for LifecycleSpec {
     fn default() -> Self {
         Self {
-            boot_timeout_seconds: default_boot_timeout(),
+            boot_timeout_seconds: None,
             drain_timeout_seconds: default_drain_timeout(),
             shutdown_timeout_seconds: default_shutdown_timeout(),
             force_after_drain_timeout: false,
@@ -250,6 +333,8 @@ pub enum Phase {
     /// Suspended to RAM by the operator (`lifecycle.powerOffMode: Standby`).
     Standby,
     Error,
+    /// Powered on, but its Node did not become Ready within the boot timeout.
+    BootFailed,
 }
 
 /// Observed power state as reported by the management interface.
@@ -383,6 +468,23 @@ pub struct NodePowerManagementConfigStatus {
     /// its current boot (`powerOffMode: Auto`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleep_support: Option<SleepSupport>,
+    /// Set when the machine was seen powered on outside the autoscaler
+    /// (powered off or in standby before, on now, and no PowerOn of ours).
+    /// Cleared when it is next seen off. Clear it by hand to put a `LeaveOn`
+    /// machine back under management while it is on:
+    /// `kubectl patch npmc <name> --subresource=status --type=merge -p '{"status":{"manualPowerOn":null}}'`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_power_on: Option<ManualPowerChange>,
+    /// The last time the machine was seen powered off outside the autoscaler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_power_off: Option<ManualPowerChange>,
+    /// Since when the machine has been powered on without its Node being Ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powered_on_not_ready_since: Option<DateTime<Utc>>,
+    /// The last boot failure (powered on, Node not Ready within the boot
+    /// timeout). Cleared once the Node is Ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_failure: Option<BootFailure>,
     /// When a forced (hard) power off was issued during the current `PoweringOff` phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_off_at: Option<DateTime<Utc>>,
@@ -405,6 +507,27 @@ pub struct NodePowerManagementConfigStatus {
     /// Human-readable details about the current state or the last error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// A power change made outside the autoscaler.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualPowerChange {
+    pub time: DateTime<Utc>,
+    /// The `manualPowerOnPolicy` in effect when it was seen (power-on only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ManualPowerOnPolicy>,
+}
+
+/// A machine that was powered on but did not become Ready in time.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BootFailure {
+    pub time: DateTime<Utc>,
+    /// Left powered on (powered on by hand under `LeaveOn`) rather than
+    /// powered off.
+    #[serde(default)]
+    pub left_on: bool,
 }
 
 /// Result of a sleep capability probe.
@@ -482,7 +605,28 @@ pub struct NodeScalingPoolSpec {
     pub scale_up: ScaleUpSpec,
     #[serde(default)]
     pub scale_down: ScaleDownSpec,
+    /// Default `manualPowerOnPolicy` for this pool's machines (a machine's own
+    /// setting wins; with overlapping pools the most cautious applies).
+    /// `LeaveOn` when unset everywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_power_on_policy: Option<ManualPowerOnPolicy>,
+    /// Under `manualPowerOnPolicy: PowerOff`, how long a manually powered-on
+    /// machine may stay on before it is powered off again.
+    #[serde(default = "default_manual_grace")]
+    pub manual_power_on_grace_seconds: u64,
+    /// Default `manualPowerOffCooldownSeconds` for this pool's machines: after
+    /// a machine is powered off by hand, do not wake it for this long. 0 (the
+    /// default) disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_power_off_cooldown_seconds: Option<u64>,
 }
+
+fn default_manual_grace() -> u64 {
+    600
+}
+
+/// `scaleUp.bootFailureBackoffSeconds` default.
+pub const DEFAULT_BOOT_FAILURE_BACKOFF_SECONDS: u64 = 1800;
 
 /// Label selector over Kubernetes Nodes (same semantics as a Kubernetes
 /// `LabelSelector`: all `matchLabels` and all `matchExpressions` must hold).
@@ -580,6 +724,18 @@ pub struct ScaleUpSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(schema_with = "preferred_nodes_schema")]
     pub preferred_nodes: Vec<PreferredNode>,
+    /// Default `lifecycle.bootTimeoutSeconds` for this pool's machines (a
+    /// machine's own setting wins; with overlapping pools the longest
+    /// applies). 1200 when unset everywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_timeout_seconds: Option<u64>,
+    /// After a machine fails to boot, do not power it on again for this long.
+    #[serde(default = "default_boot_failure_backoff")]
+    pub boot_failure_backoff_seconds: u64,
+}
+
+fn default_boot_failure_backoff() -> u64 {
+    DEFAULT_BOOT_FAILURE_BACKOFF_SECONDS
 }
 
 /// One entry of `scaleUp.preferredNodes`.
@@ -641,6 +797,8 @@ impl Default for ScaleUpSpec {
             require_explicit_selection: false,
             prefer_s3_capable: false,
             preferred_nodes: Vec::new(),
+            boot_timeout_seconds: None,
+            boot_failure_backoff_seconds: DEFAULT_BOOT_FAILURE_BACKOFF_SECONDS,
         }
     }
 }
@@ -879,6 +1037,12 @@ mod tests {
             serde_json::to_value([PowerPolicy::Auto, PowerPolicy::AlwaysOn, PowerPolicy::AlwaysOff]).unwrap(),
             serde_json::to_value([PowerOffMode::Shutdown, PowerOffMode::Standby, PowerOffMode::Auto]).unwrap(),
             serde_json::to_value([
+                ManualPowerOnPolicy::LeaveOn,
+                ManualPowerOnPolicy::Adopt,
+                ManualPowerOnPolicy::PowerOff,
+            ])
+            .unwrap(),
+            serde_json::to_value([
                 DecisionAction::PowerOn,
                 DecisionAction::PowerOff,
                 DecisionAction::NoAction,
@@ -902,6 +1066,34 @@ mod tests {
         for v in values {
             assert!(!YAML11_BOOLS.contains(&v.as_str()), "{v} is a YAML 1.1 boolean");
         }
+    }
+
+    #[test]
+    fn machine_settings_override_pool_defaults() {
+        use ManualPowerOnPolicy::*;
+        assert_eq!(effective_manual_power_on_policy(None, []), LeaveOn);
+        assert_eq!(effective_manual_power_on_policy(None, [Some(Adopt), None]), Adopt);
+        // Overlapping pools: the most cautious wins.
+        assert_eq!(
+            effective_manual_power_on_policy(None, [Some(PowerOff), Some(Adopt)]),
+            Adopt
+        );
+        assert_eq!(
+            effective_manual_power_on_policy(None, [Some(Adopt), Some(LeaveOn)]),
+            LeaveOn
+        );
+        // The machine's own setting wins over every pool.
+        assert_eq!(
+            effective_manual_power_on_policy(Some(PowerOff), [Some(LeaveOn)]),
+            PowerOff
+        );
+
+        assert_eq!(effective_boot_timeout(None, []), 1200);
+        assert_eq!(effective_boot_timeout(None, [Some(600), Some(900)]), 900);
+        assert_eq!(effective_boot_timeout(Some(300), [Some(900)]), 300);
+        assert_eq!(effective_manual_power_off_cooldown(None, [None]), 0);
+        assert_eq!(effective_manual_power_off_cooldown(None, [Some(60)]), 60);
+        assert_eq!(effective_manual_power_off_cooldown(Some(0), [Some(60)]), 0);
     }
 
     fn scale_down(v: serde_json::Value) -> ScaleDownSpec {
@@ -978,15 +1170,15 @@ mod tests {
         assert_eq!(weight["maximum"].as_f64(), Some(100.0));
 
         let up: ScaleUpSpec = serde_json::from_value(serde_json::json!({
-            "preferredNodes": [{"name": "devbox", "weight": 100}, {"name": "vulpes-zerda", "weight": 10}]
+            "preferredNodes": [{"name": "gpu-node-1", "weight": 100}, {"name": "gpu-node-2", "weight": 10}]
         }))
         .unwrap();
-        assert_eq!(up.node_weight("devbox"), 100);
-        assert_eq!(up.node_weight("vulpes-zerda"), 10);
+        assert_eq!(up.node_weight("gpu-node-1"), 100);
+        assert_eq!(up.node_weight("gpu-node-2"), 10);
         assert_eq!(up.node_weight("unlisted"), 0);
         assert!(
             serde_json::from_value::<ScaleUpSpec>(
-                serde_json::json!({"preferredNodes": [{"name": "devbox", "weight": -1}]})
+                serde_json::json!({"preferredNodes": [{"name": "gpu-node-1", "weight": -1}]})
             )
             .is_err()
         );

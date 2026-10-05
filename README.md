@@ -69,6 +69,10 @@ spec:
   Machines are powered on in a fixed order: weight (highest first), S3 capability (with
   `preferS3Capable`), size (largest first), then Node name. They're powered off in exactly
   the reverse order.
+- **Boot failures and manual power changes:** a machine that doesn't boot within its
+  timeout releases its pools and, unless a human started it, is powered off and backed
+  off. A machine powered on by hand is left alone (`LeaveOn`), adopted, or powered back
+  off, as configured. Stale decisions never fight a manual power change.
 - **Explained decisions:** every power-on, power-off, and reason for doing nothing is recorded
   with its rank and deciding rule. It appears in Events, in the logs, and in the pool's
   `status.recentDecisions`.

@@ -174,8 +174,10 @@ spec:
         name: bmc-worker-1
       config:
         address: 192.168.10.11
+  manualPowerOnPolicy: null  # LeaveOn | Adopt | PowerOff; unset: the pools' default (see "Manual power changes")
+  manualPowerOffCooldownSeconds: null   # unset: the pools' default (0 = none)
   lifecycle:                 # optional, defaults shown
-    bootTimeoutSeconds: 900
+    bootTimeoutSeconds: null # unset: the longest of its pools' scaleUp.bootTimeoutSeconds, else 1200
     drainTimeoutSeconds: 300
     shutdownTimeoutSeconds: 300
     forceAfterDrainTimeout: false
@@ -608,6 +610,8 @@ scaleUp:
   requireExplicitSelection: false   # see "Dedicated pools"
   preferS3Capable: false            # power on S3-capable machines first (see "Standby")
   preferredNodes: []                # [{name: <Node>, weight: 0-100}]; see "Preferred machines"
+  bootTimeoutSeconds: null          # default for members without lifecycle.bootTimeoutSeconds (1200)
+  bootFailureBackoffSeconds: 1800   # see "Boot failures"
 scaleDown:
   enabled: true
   utilizationThresholdPercent: 50
@@ -617,7 +621,75 @@ scaleDown:
   maxNodesPerStep: 1          # concurrent drains/power-offs
   ignoreDaemonSetUtilization: false
   ignoreNonSelectingPodUtilization: false
+manualPowerOnPolicy: null     # default for members (LeaveOn); see "Manual power changes"
+manualPowerOnGraceSeconds: 600   # under PowerOff: how long a manually started machine may stay on
+manualPowerOffCooldownSeconds: null   # default for members (0 = none)
 ```
+
+### Boot failures
+
+A machine that is powered on but whose Node doesn't become Ready within its boot timeout
+is **boot-failed**. This applies however it was powered on: by the operator, by hand, or
+because its power simply reads On. Examples are a boot device that fails, an OS that
+doesn't come up, or a kubelet that can't join.
+
+- **Boot timeout:** the machine's `lifecycle.bootTimeoutSeconds`. When that's unset, the
+  longest `scaleUp.bootTimeoutSeconds` among its pools applies, else 1200 s. Slow server
+  POSTs are why the default is generous.
+- **When it fails:** the phase becomes `BootFailed`, a `BootFailed` Warning Event is
+  emitted, and every pool's decision log says so, for example `gpu-node-2 boot failed at
+  12:20:00Z: on 20m+ without Ready; released hold; powering off`.
+- **Effect on its pools:** it no longer holds their scale-down. A booting machine normally
+  does (`nodes booting`), and before this a machine that never booted held its pools
+  forever. It's not counted as capacity either.
+- **Machines the operator powered on, or under `Adopt` / `PowerOff`:** these are powered
+  off. A graceful request comes first; if the machine is still on after
+  `min(shutdownTimeoutSeconds, 240)` s, a forced power-off follows, because a machine with
+  nothing to boot ignores ACPI. Its stored scaling decision is cleared, and no pool wakes it
+  again for `scaleUp.bootFailureBackoffSeconds` (1800 s).
+- **Machines powered on by hand under `LeaveOn`:** these are left on, since someone may be
+  working on them, but they still hold nothing.
+- **Recovery:** if the Node becomes Ready after all, `status.bootFailure` is cleared, a
+  `BootRecovered` Event is emitted, and the machine is managed normally again.
+
+### Manual power changes
+
+The operator notices power changes it didn't make:
+
+- **Manual power-on:** the machine was off (or in standby for over 5 minutes) and is on
+  now, with no PowerOn of the operator's to explain it. The operator records
+  `status.manualPowerOn`, emits a `ManualPowerOn` Event, and **clears the stored scaling
+  decision**, so a stale "off" from the last scale-down never powers it straight back off.
+- **Manual power-off:** the machine was on and reads off now, with no power-off of the
+  operator's. The operator clears `status.manualPowerOn`, records
+  `status.manualPowerOff`, emits a `ManualPowerOff` Event (`... back under management`)
+  and clears the stored decision, so a stale "on" doesn't wake it straight back up. Only
+  fresh demand wakes it.
+
+What happens to a manually powered-on machine depends on `manualPowerOnPolicy`. Set it on
+the machine, or as a default on its pools. The machine's own setting wins; with
+overlapping pools, the most cautious default applies (`LeaveOn`, then `Adopt`, then
+`PowerOff`).
+
+| Policy | While it stays on |
+|---|---|
+| `LeaveOn` (default) | Not managed. It's never powered off, isn't counted as booting or towards `maxOnline`, and doesn't hold or block anything. Once its Node is Ready it does count as room for pods evicted from other machines. |
+| `Adopt` | Managed as if its pool had powered it on: normal scale-down, with `holdAfterPowerOnSeconds` counted from the manual power-on. |
+| `PowerOff` | Powered off again after the pool's `manualPowerOnGraceSeconds` (600 s), busy or not. Pods are drained, and `safe-to-evict=false` pods still block. This is for machines that must only ever be on when the autoscaler says so. |
+
+`LeaveOn` lasts **only while the machine stays on**. Once it's seen off again (powered off
+by hand, or by its BMC), it's back under normal management and can be woken on demand. To
+hand a running `LeaveOn` machine back without powering it off, either clear the mark or
+change the policy:
+
+```sh
+kubectl patch npmc <name> --subresource=status --type=merge -p '{"status":{"manualPowerOn":null}}'
+# or set spec.manualPowerOnPolicy: Adopt on the machine
+```
+
+To keep a machine **off** for maintenance, use `powerPolicy: AlwaysOff`; `LeaveOn` won't
+do that. `manualPowerOffCooldownSeconds` (machine or pool, default 0 = off) keeps a machine
+powered off by hand from being woken for that long.
 
 ### Overlapping pools
 
@@ -658,9 +730,9 @@ weight from 0 to 100. Machines not listed weigh 0.
 scaleUp:
   preferS3Capable: true
   preferredNodes:
-    - name: devbox          # cheap to run, wakes from S3
+    - name: gpu-node-1      # cheap to run, wakes from S3
       weight: 100
-    - name: vulpes-zerda    # power-hungry server
+    - name: gpu-node-2      # power-hungry server
       weight: 10
 ```
 
@@ -711,7 +783,7 @@ The operator remembers each machine's last non-zero extended resources in
 Node becoming Ready, a machine that still reports 0 of such a resource counts as
 **needed** while a pending pod of its pool would fit it once that resource registers. It is
 not counted as unneeded, so neither `unneededSeconds` nor `holdAfterPowerOnSeconds` is what
-keeps it on. The decision log says so: `vulpes-zerda needed: 1 pending pod(s) waiting for its
+keeps it on. The decision log says so: `gpu-node-2 needed: 1 pending pod(s) waiting for its
 gpu.intel.com/i915 to register`. A pending pod "of its pool" means one that targets the pool
 when `requireExplicitSelection` is set. A pod asking for more devices than the machine ever
 had doesn't count.
@@ -754,9 +826,9 @@ explanation is published in several places:
 
   ```yaml
   - action: PowerOn
-    node: devbox
-    reason: "unschedulable pod ci/runner-x; #1 of 2 to power on, over vulpes-zerda by weight (100 vs 10)"
-    candidates: "devbox(w100 s3 16c/62Gi) > vulpes-zerda(w10 40c/125Gi)"
+    node: gpu-node-1
+    reason: "unschedulable pod ci/runner-x; #1 of 2 to power on, over gpu-node-2 by weight (100 vs 10)"
+    candidates: "gpu-node-1(w100 s3 16c/62Gi) > gpu-node-2(w10 40c/125Gi)"
     time: "2026-10-04T12:09:10Z"
   ```
 
@@ -897,7 +969,8 @@ pick it up automatically. The CRD does not change.
 | message `secret kube-hardware-autoscaler/x not found` | Secrets must be in the operator namespace. |
 | `POWER Unknown`, `ipmi: timeout` | UDP 623 blocked, wrong address, or IPMI-over-LAN disabled in the BMC. Try `hostNetwork: true`. |
 | `ipmi: authentication failed` | Wrong user/password/Kg, or the BMC does not allow cipher suite 3. |
-| `BootTimeout` event | The machine powered on but the node never became Ready: check BIOS boot order and kubelet. The operator retries. |
+| `BootFailed` event, phase `BootFailed` | The machine was powered on but its Node never became Ready within the boot timeout. Check the BIOS boot order, the boot device and the kubelet. Unless it was started by hand under `LeaveOn`, it's powered off and not woken again for `bootFailureBackoffSeconds`. See "Boot failures". |
+| A machine started by hand stays on although idle | `manualPowerOnPolicy: LeaveOn` (the default). See "Manual power changes" for `Adopt`/`PowerOff`, or clear `status.manualPowerOn`. |
 | `DrainFailed` event | A PDB or blocking pod prevented eviction; see `status.message` for the pods. |
 | Machines never scale down | `kubectl get nodescalingpool -o yaml`: `status.recentDecisions` and `status.message` explain holds (pods pending, holding after power-on, ...). Nodes with bare or `safe-to-evict=false` pods are never candidates. |
 | The wrong machine was powered on or off | `status.recentDecisions` shows the ranked candidates and the rule that decided (weight, S3 capability, size, name). See "Preferred machines". |
