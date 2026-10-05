@@ -181,6 +181,17 @@ pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, 
     BootEvent::None
 }
 
+/// Whether the recorded boot failure belongs to the boot in progress: the
+/// machine has been on without Ready since before the failure was recorded.
+/// A later boot (it was off in between, or a person powered it on) is a new
+/// boot, which the old failure must never act on.
+pub fn failure_is_current(st: &NodePowerManagementConfigStatus) -> bool {
+    match (&st.boot_failure, st.powered_on_not_ready_since) {
+        (Some(f), Some(since)) => since <= f.time,
+        _ => false,
+    }
+}
+
 /// Whether a boot failure leaves the machine on: only when it was powered on
 /// by hand (not by us) and the policy is `LeaveOn`; a human may be at it.
 pub fn boot_failure_leaves_on(st: &NodePowerManagementConfigStatus, policy: ManualPowerOnPolicy) -> bool {
@@ -693,9 +704,9 @@ impl Reconciler<'_> {
                 });
                 self.st.scaling_decision = None;
                 self.st.standby_since = None;
-                if self.st.boot_failure.as_ref().is_some_and(|f| f.left_on) {
-                    self.st.boot_failure = None;
-                }
+                // A person started a new boot: an earlier boot failure (and its
+                // backoff) no longer applies, and must not be acted on.
+                self.st.boot_failure = None;
                 let what = match policy {
                     ManualPowerOnPolicy::LeaveOn => "not managing it while it stays on",
                     ManualPowerOnPolicy::Adopt => "managing it as if its pool had powered it on",
@@ -777,7 +788,7 @@ impl Reconciler<'_> {
             BootEvent::None => {}
         }
         let failure = self.st.boot_failure.clone()?;
-        if self.st.node_ready || self.st.power_state != PowerState::On {
+        if self.st.node_ready || self.st.power_state != PowerState::On || !failure_is_current(&self.st) {
             return None;
         }
         // Still powered and not Ready after a boot failure.
@@ -1382,5 +1393,36 @@ mod tests {
             managed_target(PowerPolicy::Auto, &st, ManualPowerOnPolicy::LeaveOn),
             Some(PowerTarget::Off)
         );
+    }
+
+    #[test]
+    fn an_old_boot_failure_never_acts_on_a_new_boot() {
+        let t0 = Utc::now();
+        let at = |m: i64| t0 + chrono::Duration::minutes(m);
+        // The operator's boot failed at 20 min; the machine was powered off.
+        let mut st = status(Phase::PoweringOn, PowerState::On, false);
+        st.powered_on_not_ready_since = Some(at(0));
+        assert_eq!(track_boot(&mut st, at(21), 1200), BootEvent::Failed);
+        assert!(failure_is_current(&st));
+        st.power_state = PowerState::Off;
+        st.phase = Phase::Off;
+        track_boot(&mut st, at(22), 1200);
+        assert!(!failure_is_current(&st));
+
+        // A person powers it on at 23 min: a new boot, not the failed one.
+        let old = st.clone();
+        st.power_state = PowerState::On;
+        st.last_power_action = action("PowerOff", 2 * 60, at(23));
+        assert_eq!(
+            detect_manual_change(&old, &st, at(23), 1200, 300),
+            ManualChange::PoweredOn
+        );
+        assert_eq!(track_boot(&mut st, at(23), 1200), BootEvent::None);
+        assert!(!failure_is_current(&st), "the old failure is not this boot's");
+        // Even before manual_change clears it, nothing acts on it; a fresh
+        // failure of the new boot is recorded only after its own timeout.
+        assert_eq!(track_boot(&mut st, at(30), 1200), BootEvent::None);
+        assert_eq!(track_boot(&mut st, at(44), 1200), BootEvent::Failed);
+        assert!(failure_is_current(&st));
     }
 }
