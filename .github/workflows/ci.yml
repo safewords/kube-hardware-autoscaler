@@ -16,19 +16,24 @@ jobs:
   rust:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: safewords-runners
-    container: rust:1-bookworm
+    permissions:
+      contents: read
+      # Lets a push to main ask the cluster's compile cache for write access
+      # (ci-cache-setup); pull requests only read it.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
-      - run: rustup component add clippy rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      # Everything in the pinned Rust Alpine image (natively musl, as the
+      # published binary is built), through sccache on the cluster's cache.
+      - name: fmt, clippy, tests, CRDs (rust Alpine)
+        run: >-
+          hack/ci-alpine.sh 'rustup component add clippy rustfmt 2>/dev/null
+          && cargo fmt --check
+          && cargo clippy --all-targets --locked -- -D warnings
+          && cargo test --locked
+          && sh hack/gen-crds.sh'
       - name: CRDs in the chart are up to date
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          sh hack/gen-crds.sh
-          git diff --exit-code charts/kube-hardware-autoscaler/crds/
+        run: git diff --exit-code charts/kube-hardware-autoscaler/crds/
 
   chart:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -42,8 +47,15 @@ jobs:
   image:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: safewords-runners
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t kube-hardware-autoscaler:ci .
+      # The static musl binary, built in Alpine; the image only copies it in.
+      - name: Release binary (rust Alpine, musl)
+        run: >-
+          hack/ci-alpine.sh 'cargo build --release --locked
+          && mkdir -p dist/amd64 && cp target/release/kube-hardware-autoscaler dist/amd64/'
+      - run: docker build --build-arg TARGETARCH=amd64 -t kube-hardware-autoscaler:ci .
       - run: docker run --rm kube-hardware-autoscaler:ci drivers
-
