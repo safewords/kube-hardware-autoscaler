@@ -192,9 +192,18 @@ pub fn failure_is_current(st: &NodePowerManagementConfigStatus) -> bool {
     }
 }
 
-/// Whether a boot failure leaves the machine on: only when it was powered on
-/// by hand (not by us) and the policy is `LeaveOn`; a human may be at it.
-pub fn boot_failure_leaves_on(st: &NodePowerManagementConfigStatus, policy: ManualPowerOnPolicy) -> bool {
+/// Whether a boot failure leaves the machine on: always under a manual
+/// override (`powerPolicy: AlwaysOn`/`AlwaysOff`, which the autoscaler never
+/// overrules), and with `Auto` only when it was powered on by hand (not by us)
+/// under `LeaveOn`; a human may be at it.
+pub fn boot_failure_leaves_on(
+    st: &NodePowerManagementConfigStatus,
+    power_policy: PowerPolicy,
+    policy: ManualPowerOnPolicy,
+) -> bool {
+    if power_policy != PowerPolicy::Auto {
+        return true;
+    }
     let since = st.powered_on_not_ready_since;
     let ours = st
         .last_power_action
@@ -758,13 +767,15 @@ impl Reconciler<'_> {
                 return None;
             }
             BootEvent::Failed => {
-                let leave = boot_failure_leaves_on(&self.st, self.manual_policy);
+                let leave = boot_failure_leaves_on(&self.st, self.mn.spec.power_policy, self.manual_policy);
                 if let Some(f) = self.st.boot_failure.as_mut() {
                     f.left_on = leave;
                 }
                 self.st.scaling_decision = None;
                 let minutes = self.boot_timeout / 60;
-                let what = if leave {
+                let what = if self.mn.spec.power_policy != PowerPolicy::Auto {
+                    format!("left as it is: powerPolicy is {:?}", self.mn.spec.power_policy)
+                } else if leave {
                     "left on: it was powered on by hand and the policy is LeaveOn".to_string()
                 } else {
                     "powering it off; it is not woken again for the pools' bootFailureBackoffSeconds".to_string()
@@ -1354,12 +1365,25 @@ mod tests {
         let mut st = status(Phase::PoweringOn, PowerState::On, false);
         st.powered_on_not_ready_since = Some(now - chrono::Duration::minutes(21));
         // Nothing of ours started this boot.
-        assert!(boot_failure_leaves_on(&st, ManualPowerOnPolicy::LeaveOn));
-        assert!(!boot_failure_leaves_on(&st, ManualPowerOnPolicy::Adopt));
-        assert!(!boot_failure_leaves_on(&st, ManualPowerOnPolicy::PowerOff));
-        // We powered it on: powered off again whatever the policy.
+        let auto = PowerPolicy::Auto;
+        assert!(boot_failure_leaves_on(&st, auto, ManualPowerOnPolicy::LeaveOn));
+        assert!(!boot_failure_leaves_on(&st, auto, ManualPowerOnPolicy::Adopt));
+        assert!(!boot_failure_leaves_on(&st, auto, ManualPowerOnPolicy::PowerOff));
+        // We powered it on: powered off again whatever the manual policy...
         st.last_power_action = action("PowerOn", 21 * 60 + 5, now);
-        assert!(!boot_failure_leaves_on(&st, ManualPowerOnPolicy::LeaveOn));
+        assert!(!boot_failure_leaves_on(&st, auto, ManualPowerOnPolicy::LeaveOn));
+        // ...unless a manual override holds it: AlwaysOn would power it straight
+        // back on (a loop), and AlwaysOff already decides.
+        assert!(boot_failure_leaves_on(
+            &st,
+            PowerPolicy::AlwaysOn,
+            ManualPowerOnPolicy::PowerOff
+        ));
+        assert!(boot_failure_leaves_on(
+            &st,
+            PowerPolicy::AlwaysOff,
+            ManualPowerOnPolicy::PowerOff
+        ));
     }
 
     #[test]

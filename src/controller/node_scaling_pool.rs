@@ -990,6 +990,30 @@ mod tests {
                 now,
             );
             assert_eq!(c.release_after, Some(now + chrono::Duration::seconds(600)));
+
+            // Powered on by hand within the backoff of an earlier boot failure
+            // (the operator clears that failure when it sees the power-on; even
+            // if it were still recorded): a manual LeaveOn boot, not a failure.
+            let mut during_backoff = st(Phase::PoweringOn, false);
+            during_backoff.manual_power_on = Some(ManualPowerChange {
+                time: now,
+                policy: None,
+            });
+            during_backoff.boot_failure = Some(BootFailure {
+                time: now - chrono::Duration::minutes(2),
+                left_on: false,
+            });
+            let c = classify(
+                &during_backoff,
+                MemberState::Booting,
+                ManualPowerOnPolicy::LeaveOn,
+                &spec,
+                1200,
+                0,
+                now,
+            );
+            assert_eq!(c.state, Some(MemberState::Unavailable));
+            assert!(c.note.unwrap().contains("manually powered on"), "not a boot failure");
         }
 
         #[test]

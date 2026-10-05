@@ -649,6 +649,10 @@ doesn't come up, or a kubelet that can't join.
   again for `scaleUp.bootFailureBackoffSeconds` (1800 s).
 - **Machines powered on by hand under `LeaveOn`:** these are left on, since someone may be
   working on them, but they still hold nothing.
+- **Machines under a manual override (`powerPolicy: AlwaysOn` or `AlwaysOff`):** these are
+  never powered off for a boot failure. They're marked `BootFailed` and hold nothing, but
+  the override decides their power. Otherwise `AlwaysOn` would power the machine straight
+  back on, every boot timeout.
 - **Recovery:** if the Node becomes Ready after all, `status.bootFailure` is cleared, a
   `BootRecovered` Event is emitted, and the machine is managed normally again.
 
