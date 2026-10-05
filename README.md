@@ -94,6 +94,17 @@ helm install kube-hardware-autoscaler oci://ghcr.io/safewords/charts/kube-hardwa
 The image is `ghcr.io/safewords/kube-hardware-autoscaler`. Start in dry-run mode, where power
 actions are only logged, and switch it off once the decisions look right.
 
+The image is `ghcr.io/safewords/kube-hardware-autoscaler`, tagged `sha-<commit>` (immutable)
+and `main`:
+
+- **Base:** a static musl binary on `alpine:3.24`, with only `ca-certificates` and
+  `util-linux-misc` (`nsenter`) added.
+- **Platform:** linux/amd64 only.
+- **Size:** about 16 MB compressed. The earlier distroless/Debian image was about 20 MB.
+- **Uses:** the same image runs the operator, the Wake-on-LAN relay pods, and, by default,
+  the in-band shutdown, suspend and sleep-probe pods.
+- **Building locally:** `sh hack/build-image.sh`.
+
 The **[setup guide](docs/setup-guide.md)** covers:
 - prerequisites and credentials;
 - describing machines and verifying their interfaces;
