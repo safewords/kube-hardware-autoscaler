@@ -45,7 +45,9 @@ jobs:
       - run: helm template t charts/kube-hardware-autoscaler --set hostNetwork=true > /dev/null
 
   image:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # On a push to main, publish.yml builds, smoke-tests and pushes the same
+    # image; this job is for pull requests (and manual runs) only.
+    if: github.event_name != 'push' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: safewords-runners
     permissions:
       contents: read
