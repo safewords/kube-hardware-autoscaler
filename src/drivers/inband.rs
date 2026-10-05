@@ -234,7 +234,9 @@ pub async fn run(client: &Client, namespace: &str, node_name: &str, image: &str,
                     {"name": "ACTION", "value": action},
                     {"name": "HOST_COMMAND", "value": cmd.shell()},
                 ],
-                "securityContext": {"privileged": true},
+                // Root explicitly: the default image (the operator's own) runs as
+                // a non-root user, and nsenter into PID 1 needs root.
+                "securityContext": {"privileged": true, "runAsUser": 0, "runAsGroup": 0, "runAsNonRoot": false},
                 "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}},
             }],
         },

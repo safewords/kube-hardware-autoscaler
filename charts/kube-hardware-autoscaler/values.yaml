@@ -19,8 +19,9 @@ operator:
   dryRun: false
   # -- Timeout for one management-interface operation, in seconds.
   opTimeoutSeconds: 60
-  # -- Default image for in-band shutdown and standby pods (needs `sh` and `nsenter`).
-  shutdownImage: debian:stable-slim
+  # -- Image for in-band shutdown, standby and sleep-probe pods (needs `sh`,
+  # `cat`, `date` and `nsenter`). Empty: the operator's own image, which has them.
+  shutdownImage: ""
   # -- Emit JSON logs.
   logJson: false
   # -- RUST_LOG-style filter.

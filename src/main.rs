@@ -46,9 +46,11 @@ struct DriverArgs {
     /// Timeout for a single management interface operation, in seconds.
     #[arg(long, env = "KHA_OP_TIMEOUT_SECONDS", default_value_t = 60)]
     op_timeout_seconds: u64,
-    /// Default image for in-band shutdown and standby pods (must provide sh and nsenter).
-    #[arg(long, env = "KHA_SHUTDOWN_IMAGE", default_value = "debian:stable-slim")]
-    shutdown_image: String,
+    /// Image for in-band shutdown, standby and sleep-probe pods (must provide
+    /// sh, cat, date and nsenter). Defaults to the relay image, i.e. the
+    /// operator's own Alpine image, which has them.
+    #[arg(long, env = "KHA_SHUTDOWN_IMAGE")]
+    shutdown_image: Option<String>,
     /// Image for Wake-on-LAN relay pods on neighbouring nodes (this operator's image).
     #[arg(
         long,
@@ -166,7 +168,11 @@ fn driver_context(client: Client, args: &DriverArgs) -> DriverContext {
         client,
         namespace: args.namespace.clone(),
         op_timeout: Duration::from_secs(args.op_timeout_seconds),
-        shutdown_image: args.shutdown_image.clone(),
+        shutdown_image: args
+            .shutdown_image
+            .clone()
+            .filter(|i| !i.is_empty())
+            .unwrap_or_else(|| args.relay_image.clone()),
         relay_image: args.relay_image.clone(),
     }
 }

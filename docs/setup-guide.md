@@ -120,7 +120,7 @@ Useful values (see `charts/kube-hardware-autoscaler/values.yaml` for all):
 |---|---|---|
 | `operator.dryRun` | `false` | Log power actions without executing them. |
 | `operator.opTimeoutSeconds` | `60` | Upper bound for one management-interface call. |
-| `operator.shutdownImage` | `debian:stable-slim` | Image of in-band shutdown and standby pods (needs `sh` + `nsenter`). |
+| `operator.shutdownImage` | the operator's image | Image of in-band shutdown, standby and sleep-probe pods (needs `sh`, `cat`, `date` and `nsenter`; the operator's Alpine image has them). |
 | `hostNetwork` | `false` | Required for Wake-on-LAN; helps when BMCs are only reachable from the node network. |
 | `credentials` | `[]` | Convenience: creates credential Secrets. |
 | `nodePools` / `nodePowerManagementConfigs` | `[]` | Convenience: creates the custom resources from values. |
