@@ -40,7 +40,7 @@ jobs:
     runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: helm lint charts/kube-hardware-autoscaler
       - run: helm template t charts/kube-hardware-autoscaler --set hostNetwork=true > /dev/null
 
