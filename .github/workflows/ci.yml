@@ -22,7 +22,7 @@ jobs:
       # (ci-cache-setup); pull requests only read it.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Everything in the pinned Rust Alpine image (natively musl, as the
       # published binary is built), through sccache on the cluster's cache.
       - name: fmt, clippy, tests, CRDs (rust Alpine)
@@ -39,7 +39,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: safewords-runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
       - run: helm lint charts/kube-hardware-autoscaler
       - run: helm template t charts/kube-hardware-autoscaler --set hostNetwork=true > /dev/null
@@ -53,7 +53,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The static musl binary, built in Alpine; the image only copies it in.
       - name: Release binary (rust Alpine, musl)
         run: >-

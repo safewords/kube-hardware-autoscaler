@@ -33,7 +33,7 @@ jobs:
       # Write access to the cluster's compile cache for pushes to main.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Release binary (rust Alpine, musl)
         run: >-
           hack/ci-alpine.sh 'cargo build --release --locked
@@ -78,7 +78,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
       - name: Package chart
         run: |
