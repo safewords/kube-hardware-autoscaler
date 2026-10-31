@@ -150,6 +150,59 @@ pub fn effective_boot_timeout(machine: Option<u64>, pools: impl IntoIterator<Ite
         .unwrap_or(DEFAULT_BOOT_TIMEOUT_SECONDS)
 }
 
+/// What a pool does when a machine it asked to power on is still not on after
+/// `powerOnTimeoutSeconds`. A machine that did turn on and is waiting for its
+/// Node is the boot timeout's concern, not this.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum PowerOnFailurePolicy {
+    /// Drop the power-on. The machine is recorded as a boot failure: it stops
+    /// counting as capacity and is not powered on again until
+    /// `bootFailureBackoffSeconds` has passed, so the next machine in the
+    /// pool's order can be chosen. A forced power-off is issued only when an
+    /// interface reads the machine as on. Repeating Wake-on-LAN does not keep
+    /// the attempt open.
+    #[default]
+    Release,
+    /// Keep issuing PowerOn, and keep counting the machine as capacity already
+    /// on its way, until its Node is Ready or the decision is cleared.
+    Retry,
+}
+
+/// The power-on failure rule for one attempt. The pool that made the decision
+/// decides; its unset timeout uses `boot_timeout` (the machine's effective
+/// boot timeout). With no owning pool, `Release` wins over `Retry` and the
+/// shortest timeout wins.
+pub fn effective_power_on_failure(
+    decision_pool: Option<&str>,
+    pools: &[(&str, &ScaleUpSpec)],
+    boot_timeout: u64,
+) -> (PowerOnFailurePolicy, u64) {
+    let timeout_of = |spec: &ScaleUpSpec| spec.power_on_timeout_seconds.unwrap_or(boot_timeout);
+    if let Some(name) = decision_pool
+        && let Some((_, spec)) = pools.iter().find(|(pool, _)| *pool == name)
+    {
+        return (spec.power_on_failure_policy, timeout_of(spec));
+    }
+    if pools.is_empty() {
+        return (PowerOnFailurePolicy::Release, boot_timeout);
+    }
+    let policy = if pools
+        .iter()
+        .any(|(_, spec)| spec.power_on_failure_policy == PowerOnFailurePolicy::Release)
+    {
+        PowerOnFailurePolicy::Release
+    } else {
+        PowerOnFailurePolicy::Retry
+    };
+    let timeout = pools
+        .iter()
+        .filter(|(_, spec)| spec.power_on_failure_policy == policy)
+        .map(|(_, spec)| timeout_of(spec))
+        .min()
+        .unwrap_or(boot_timeout);
+    (policy, timeout)
+}
+
 /// The manual power-off cooldown for a machine: its own, else the longest of
 /// its pools', else 0 (none).
 pub fn effective_manual_power_off_cooldown(machine: Option<u64>, pools: impl IntoIterator<Item = Option<u64>>) -> u64 {
@@ -280,9 +333,10 @@ pub struct LifecycleSpec {
     /// on the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN
     /// is the most reliable way to wake a suspended machine). If the machine
     /// does not go to sleep, wakes up by itself, or does not wake up when
-    /// asked, standby is considered broken on it: it is shut down (or, when it
-    /// will not wake, forced off and cold booted) and standby is not used again
-    /// for a day (`status.standbyFailedAt`).
+    /// asked, standby is considered broken on it: it is shut down instead of
+    /// suspended, and standby is not used again for a day
+    /// (`status.standbyFailedAt`). A power-on that never turns the machine on
+    /// is the pool's `powerOnFailurePolicy`, not another cold boot.
     #[serde(default)]
     pub power_off_mode: PowerOffMode,
 }
@@ -732,6 +786,20 @@ pub struct ScaleUpSpec {
     /// After a machine fails to boot, do not power it on again for this long.
     #[serde(default = "default_boot_failure_backoff")]
     pub boot_failure_backoff_seconds: u64,
+    /// How long a power-on may stay short of the machine actually being on
+    /// before `powerOnFailurePolicy` applies. The clock is the scaling
+    /// decision's time; repeating the PowerOn command does not restart it.
+    /// Covers a machine that never turns on and a suspended machine that does
+    /// not wake. A machine that is on and posting is timed by
+    /// `bootTimeoutSeconds` instead. Unset: that machine's effective boot
+    /// timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_on_timeout_seconds: Option<u64>,
+    /// What to do when `powerOnTimeoutSeconds` elapses. `Release` (the
+    /// default) gives the attempt up so another machine can be powered on.
+    /// `Retry` keeps the attempt, and the capacity hold, open.
+    #[serde(default)]
+    pub power_on_failure_policy: PowerOnFailurePolicy,
 }
 
 fn default_boot_failure_backoff() -> u64 {
@@ -799,6 +867,8 @@ impl Default for ScaleUpSpec {
             preferred_nodes: Vec::new(),
             boot_timeout_seconds: None,
             boot_failure_backoff_seconds: DEFAULT_BOOT_FAILURE_BACKOFF_SECONDS,
+            power_on_timeout_seconds: None,
+            power_on_failure_policy: PowerOnFailurePolicy::default(),
         }
     }
 }
@@ -1035,6 +1105,7 @@ mod tests {
         const YAML11_BOOLS: &[&str] = &["y", "yes", "n", "no", "true", "false", "on", "off"];
         let values: Vec<String> = [
             serde_json::to_value([PowerPolicy::Auto, PowerPolicy::AlwaysOn, PowerPolicy::AlwaysOff]).unwrap(),
+            serde_json::to_value([PowerOnFailurePolicy::Release, PowerOnFailurePolicy::Retry]).unwrap(),
             serde_json::to_value([PowerOffMode::Shutdown, PowerOffMode::Standby, PowerOffMode::Auto]).unwrap(),
             serde_json::to_value([
                 ManualPowerOnPolicy::LeaveOn,
@@ -1091,9 +1162,43 @@ mod tests {
         assert_eq!(effective_boot_timeout(None, []), 1200);
         assert_eq!(effective_boot_timeout(None, [Some(600), Some(900)]), 900);
         assert_eq!(effective_boot_timeout(Some(300), [Some(900)]), 300);
+
         assert_eq!(effective_manual_power_off_cooldown(None, [None]), 0);
         assert_eq!(effective_manual_power_off_cooldown(None, [Some(60)]), 60);
         assert_eq!(effective_manual_power_off_cooldown(Some(0), [Some(60)]), 0);
+    }
+
+    #[test]
+    fn the_pool_that_asked_for_power_on_decides_the_failure() {
+        let release = ScaleUpSpec {
+            power_on_failure_policy: PowerOnFailurePolicy::Release,
+            power_on_timeout_seconds: Some(600),
+            ..ScaleUpSpec::default()
+        };
+        let retry = ScaleUpSpec {
+            power_on_failure_policy: PowerOnFailurePolicy::Retry,
+            power_on_timeout_seconds: None,
+            ..ScaleUpSpec::default()
+        };
+        let pools = [("ci", &release), ("gpu", &retry)];
+        assert_eq!(
+            effective_power_on_failure(Some("ci"), &pools, 1200),
+            (PowerOnFailurePolicy::Release, 600)
+        );
+        // Unset timeout: the machine's boot timeout.
+        assert_eq!(
+            effective_power_on_failure(Some("gpu"), &pools, 1200),
+            (PowerOnFailurePolicy::Retry, 1200)
+        );
+        // No owning pool: Release, and the shortest of those timeouts.
+        assert_eq!(
+            effective_power_on_failure(None, &pools, 1200),
+            (PowerOnFailurePolicy::Release, 600)
+        );
+        assert_eq!(
+            effective_power_on_failure(None, &[], 900),
+            (PowerOnFailurePolicy::Release, 900)
+        );
     }
 
     fn scale_down(v: serde_json::Value) -> ScaleDownSpec {

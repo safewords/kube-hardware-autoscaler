@@ -88,7 +88,7 @@
                       },
                       "powerOffMode": {
                         "default": "Shutdown",
-                        "description": "What \"off\" means for this machine: a full `Shutdown` (default) or\n`Standby` (suspend to RAM, which wakes in seconds). Standby is always\nentered in-band, through a privileged pod running `systemctl suspend`\non the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN\nis the most reliable way to wake a suspended machine). If the machine\ndoes not go to sleep, wakes up by itself, or does not wake up when\nasked, standby is considered broken on it: it is shut down (or, when it\nwill not wake, forced off and cold booted) and standby is not used again\nfor a day (`status.standbyFailedAt`).",
+                        "description": "What \"off\" means for this machine: a full `Shutdown` (default) or\n`Standby` (suspend to RAM, which wakes in seconds). Standby is always\nentered in-band, through a privileged pod running `systemctl suspend`\non the node; waking uses the `powerOn` interfaces as usual (Wake-on-LAN\nis the most reliable way to wake a suspended machine). If the machine\ndoes not go to sleep, wakes up by itself, or does not wake up when\nasked, standby is considered broken on it: it is shut down instead of\nsuspended, and standby is not used again for a day\n(`status.standbyFailedAt`). A power-on that never turns the machine on\nis the pool's `powerOnFailurePolicy`, not another cold boot.",
                         "enum": [
                           "Shutdown",
                           "Standby",
@@ -779,6 +779,7 @@
                       "enabled": true,
                       "maxNodesPerStep": 3,
                       "pendingPodGraceSeconds": 30,
+                      "powerOnFailurePolicy": "Release",
                       "preferS3Capable": false,
                       "requireExplicitSelection": false
                     },
@@ -813,6 +814,22 @@
                         "description": "Unschedulable pods younger than this are ignored (lets the scheduler settle).",
                         "format": "uint64",
                         "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "powerOnFailurePolicy": {
+                        "default": "Release",
+                        "description": "What to do when `powerOnTimeoutSeconds` elapses. `Release` (the\ndefault) gives the attempt up so another machine can be powered on.\n`Retry` keeps the attempt, and the capacity hold, open.",
+                        "enum": [
+                          "Release",
+                          "Retry"
+                        ],
+                        "type": "string"
+                      },
+                      "powerOnTimeoutSeconds": {
+                        "description": "How long a power-on may stay short of the machine actually being on\nbefore `powerOnFailurePolicy` applies. The clock is the scaling\ndecision's time; repeating the PowerOn command does not restart it.\nCovers a machine that never turns on and a suspended machine that does\nnot wake. A machine that is on and posting is timed by\n`bootTimeoutSeconds` instead. Unset: that machine's effective boot\ntimeout.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
                         "type": "integer"
                       },
                       "preferS3Capable": {

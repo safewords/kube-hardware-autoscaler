@@ -40,8 +40,9 @@ use super::{
 use crate::crd::{
     BootFailure, COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
     ManualPowerChange, ManualPowerOnPolicy, NodePowerManagementConfig, NodePowerManagementConfigStatus,
-    NodeScalingPool, Phase, PowerActionRecord, PowerOffMode, PowerPolicy, PowerState, PowerTarget, ScalingDecision,
-    SleepSupport, effective_boot_timeout, effective_manual_power_on_policy,
+    NodeScalingPool, Phase, PowerActionRecord, PowerOffMode, PowerOnFailurePolicy, PowerPolicy, PowerState,
+    PowerTarget, ScalingDecision, SleepSupport, effective_boot_timeout, effective_manual_power_on_policy,
+    effective_power_on_failure,
 };
 use crate::drivers::inband::{self, HostCommand, Probe};
 use crate::drivers::{Outcome, PowerChain};
@@ -181,6 +182,45 @@ pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, 
     BootEvent::None
 }
 
+/// Where a power-on attempt stands. `Expired` is only reported for `Release`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerOnAttempt {
+    Ongoing,
+    /// The machine is still off, or still suspended, and the timeout has elapsed.
+    Expired,
+}
+
+/// A power-on that has not reached a machine that is actually on. The clock is
+/// the scaling decision's time, so a retried PowerOn command does not restart
+/// it. A machine that reads as on and is not in standby is left to
+/// `track_boot`. `Retry` never expires.
+pub fn power_on_attempt(
+    st: &NodePowerManagementConfigStatus,
+    now: DateTime<Utc>,
+    policy: PowerOnFailurePolicy,
+    timeout_seconds: u64,
+) -> PowerOnAttempt {
+    if policy == PowerOnFailurePolicy::Retry || st.node_ready {
+        return PowerOnAttempt::Ongoing;
+    }
+    let Some(started) = st
+        .scaling_decision
+        .as_ref()
+        .filter(|d| d.target == PowerTarget::On)
+        .map(|d| d.time)
+    else {
+        return PowerOnAttempt::Ongoing;
+    };
+    if st.power_state == PowerState::On && st.standby_since.is_none() {
+        return PowerOnAttempt::Ongoing;
+    }
+    if (now - started).num_seconds() > timeout_seconds as i64 {
+        PowerOnAttempt::Expired
+    } else {
+        PowerOnAttempt::Ongoing
+    }
+}
+
 /// Whether the recorded boot failure belongs to the boot in progress: the
 /// machine has been on without Ready since before the failure was recorded.
 /// A later boot (it was off in between, or a person powered it on) is a new
@@ -237,6 +277,10 @@ struct Reconciler<'a> {
     boot_timeout: u64,
     /// Effective `manualPowerOnPolicy`.
     manual_policy: ManualPowerOnPolicy,
+    /// The deciding pool's `powerOnFailurePolicy`.
+    power_on_failure_policy: PowerOnFailurePolicy,
+    /// The deciding pool's power-on timeout, or this machine's boot timeout.
+    power_on_timeout: u64,
 }
 
 impl Reconciler<'_> {
@@ -360,11 +404,18 @@ impl Reconciler<'_> {
             }
             return Ok(SLOW);
         }
+        if power_on_attempt(&self.st, self.now, self.power_on_failure_policy, self.power_on_timeout)
+            == PowerOnAttempt::Expired
+        {
+            self.release_failed_power_on().await;
+            return Ok(FAST);
+        }
         let boot_timeout = self.boot_timeout as i64;
         match self.st.phase {
             Phase::PoweringOn => {
                 if self.in_phase_for() > boot_timeout && self.st.standby_since.is_some() {
-                    // Asleep but not answering the wake-up: cut the power so the
+                    // Retry only: Release already returned above once
+                    // `powerOnTimeoutSeconds` elapsed. Cut the power so the
                     // next power on is a cold boot. Keep standby_since so the
                     // wake-ups continue should the force off not be possible.
                     self.standby_failed(format!("machine did not wake from standby within {boot_timeout}s"))
@@ -481,6 +532,46 @@ impl Reconciler<'_> {
         self.ctx.event(self.mn, EventType::Normal, "SleepProbe", note).await;
         self.st.sleep_support = Some(SleepSupport { boot_id, s3, detail });
         Some(s3)
+    }
+
+    /// The power-on did not turn the machine on in time. Drop the decision so
+    /// the pool can choose another machine, and record a boot failure so the
+    /// backoff applies once the phase is `Off`.
+    async fn release_failed_power_on(&mut self) {
+        let timeout = self.power_on_timeout;
+        let node = self.mn.spec.node_name.clone();
+        if self.st.standby_since.is_some() {
+            self.st.standby_failed_at = Some(self.now);
+        }
+        self.st.boot_failure = Some(BootFailure {
+            time: self.now,
+            left_on: false,
+        });
+        self.st.scaling_decision = None;
+        self.st.standby_since = None;
+        let note = format!(
+            "{node} did not power on within {timeout}s; released, not woken again for the pools' bootFailureBackoffSeconds"
+        );
+        warn!(nodepowermanagementconfig = %self.mn.name_any(), timeout, "power on failed");
+        self.st.message = Some(note.clone());
+        self.ctx.event(self.mn, EventType::Warning, "PowerOnFailed", note).await;
+        if self.st.power_state == PowerState::On {
+            if !self.ctx.dry_run
+                && let Err(e) = mark_powered_off(&self.ctx.client, &node, self.now).await
+            {
+                warn!(node = %node, error = %e, "cannot annotate node as powered off");
+            }
+            // Same instant as the failure, so the boot-failure handler treats
+            // this as the boot in progress and finishes the power-off.
+            self.st.powered_on_not_ready_since = Some(self.now);
+            self.act("ForceOff").await;
+            self.st.forced_off_at = Some(self.now);
+            self.set_phase(Phase::BootFailed);
+        } else {
+            // Already off, or the interface cannot say. A Wake-on-LAN ForceOff
+            // cannot cut power, and issuing it used to restart the attempt.
+            self.set_phase(Phase::Off);
+        }
     }
 
     /// Records that standby does not work on this machine right now; it is
@@ -1130,6 +1221,20 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
         mn.spec.lifecycle.boot_timeout_seconds,
         member_pools.iter().map(|p| p.spec.scale_up.boot_timeout_seconds),
     );
+    let pool_scale_up: Vec<(String, &crate::crd::ScaleUpSpec)> =
+        member_pools.iter().map(|p| (p.name_any(), &p.spec.scale_up)).collect();
+    let pool_scale_up_ref: Vec<(&str, &crate::crd::ScaleUpSpec)> = pool_scale_up
+        .iter()
+        .map(|(name, spec)| (name.as_str(), *spec))
+        .collect();
+    let (power_on_failure_policy, power_on_timeout) = effective_power_on_failure(
+        st.scaling_decision
+            .as_ref()
+            .filter(|d| d.target == PowerTarget::On)
+            .map(|d| d.pool.as_str()),
+        &pool_scale_up_ref,
+        boot_timeout,
+    );
     let change = detect_manual_change(&old, &st, now, boot_timeout, mn.spec.lifecycle.shutdown_timeout_seconds);
     // A machine seen off is under normal management again, whoever turned it off.
     if st.power_state == PowerState::Off && !st.node_ready && change != ManualChange::PoweredOn {
@@ -1147,6 +1252,8 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
         now,
         boot_timeout,
         manual_policy,
+        power_on_failure_policy,
+        power_on_timeout,
     };
     r.manual_change(change).await;
     let boot_requeue = r.boot(boot_event).await;
@@ -1384,6 +1491,57 @@ mod tests {
             PowerPolicy::AlwaysOff,
             ManualPowerOnPolicy::PowerOff
         ));
+    }
+
+    #[test]
+    fn a_power_on_that_never_turns_the_machine_on_expires_and_a_retry_does_not() {
+        let now = Utc::now();
+        let mut st = status(Phase::PoweringOn, PowerState::Off, false);
+        st.standby_since = Some(now - chrono::Duration::seconds(700));
+        st.scaling_decision = Some(ScalingDecision {
+            pool: "ci".into(),
+            target: PowerTarget::On,
+            reason: "pending".into(),
+            time: now - chrono::Duration::seconds(700),
+        });
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Release, 600),
+            PowerOnAttempt::Expired
+        );
+        st.scaling_decision.as_mut().unwrap().time = now - chrono::Duration::seconds(100);
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Release, 600),
+            PowerOnAttempt::Ongoing
+        );
+        st.scaling_decision.as_mut().unwrap().time = now - chrono::Duration::seconds(700);
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Retry, 600),
+            PowerOnAttempt::Ongoing
+        );
+        // On, and not a standby reading: the boot timeout owns it.
+        st.power_state = PowerState::On;
+        st.standby_since = None;
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Release, 600),
+            PowerOnAttempt::Ongoing
+        );
+        // A BMC that still reads a suspended machine as On is a failed wake.
+        st.standby_since = Some(now - chrono::Duration::seconds(700));
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Release, 600),
+            PowerOnAttempt::Expired
+        );
+        st.node_ready = true;
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Release, 60),
+            PowerOnAttempt::Ongoing
+        );
+        st.node_ready = false;
+        st.scaling_decision = None;
+        assert_eq!(
+            power_on_attempt(&st, now, PowerOnFailurePolicy::Release, 60),
+            PowerOnAttempt::Ongoing
+        );
     }
 
     #[test]

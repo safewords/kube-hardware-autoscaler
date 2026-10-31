@@ -1073,6 +1073,8 @@ mod tests {
                 preferred_nodes: vec![],
                 boot_timeout_seconds: None,
                 boot_failure_backoff_seconds: 1800,
+                power_on_timeout_seconds: None,
+                power_on_failure_policy: Default::default(),
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -1952,6 +1954,8 @@ mod dedicated_pool_tests {
                 preferred_nodes: vec![],
                 boot_timeout_seconds: None,
                 boot_failure_backoff_seconds: 1800,
+                power_on_timeout_seconds: None,
+                power_on_failure_policy: Default::default(),
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
