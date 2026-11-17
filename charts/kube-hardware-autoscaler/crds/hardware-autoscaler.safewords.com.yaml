@@ -1142,7 +1142,8 @@
                                 "Standby",
                                 "Largest",
                                 "Smallest",
-                                "Random"
+                                "Random",
+                                "ActiveHoursRemaining"
                               ],
                               "type": "string"
                             },

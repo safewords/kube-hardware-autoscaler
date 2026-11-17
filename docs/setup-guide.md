@@ -894,6 +894,18 @@ scaleUp:
 | `Largest` | its CPU (then memory) relative to the largest machine in the pool |
 | `Smallest` | the reverse of `Largest`: least capacity, and power, left idle |
 | `Random` | a fresh draw per machine every time the pool decides; spreads wakes, and wear, over interchangeable machines |
+| `ActiveHoursRemaining` | how much of its [active hours](#active-hours) window is left once it has booted: `(left - expected boot) / 1h`, so 1 with an hour or more to work and 0 when it would close before it is Ready. The expected boot is its average, else five minutes; a machine without active hours rates 1. A machine whose window closes before it would be Ready is woken only when no other machine fits. |
+
+`Reachable` and `ActiveHoursRemaining` also apply a rule, not only a rating: the machine they
+rule out goes after every other candidate whatever its score, so they hold even against a
+dominant `Priority`. It is still woken when nothing else fits; a job that starts just before
+a machine's hours end runs to completion, since work is never interrupted.
+
+For a strict preference order, with the other strategies only breaking ties, make
+`Priority` outweigh them: its weight times the smallest gap between two `preferredNodes`
+weights (as a fraction of 100) must exceed the other weights combined. With node weights
+100, 50 and 10, `Priority: 100` separates any two machines by at least 40 points, against at
+most 7 from strategies weighing 7 in total.
 
 Each strategy may be listed once, with a weight from 1 to 100. Ties go to the larger
 machine, then to the Node name. Strategies only choose among candidates: active hours,

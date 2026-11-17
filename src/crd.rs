@@ -1091,6 +1091,14 @@ pub enum Strategy {
     /// A fresh random number per candidate every time the pool decides:
     /// spreads wakes, and wear, over interchangeable machines.
     Random,
+    /// How much of its `activeHours` window is left once it has booted:
+    /// `(left - expected boot) / 1h`, so 1 with an hour or more to work, 0
+    /// when it would close before it is Ready. The expected boot is its
+    /// average (`status.bootHistory`), else 5 minutes. 1 for a machine
+    /// without active hours. With this strategy listed, a machine whose
+    /// window closes before it would be Ready is woken only when no other
+    /// machine fits.
+    ActiveHoursRemaining,
 }
 
 fn strategies_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -1104,7 +1112,7 @@ fn strategies_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
             "properties": {
                 "name": {
                     "type": "string",
-                    "enum": ["Priority", "Reachable", "FastestBoot", "Reliable", "Standby", "Largest", "Smallest", "Random"]
+                    "enum": ["Priority", "Reachable", "FastestBoot", "Reliable", "Standby", "Largest", "Smallest", "Random", "ActiveHoursRemaining"]
                 },
                 "weight": {
                     "description": "1 to 100: how much this strategy counts against the others.",

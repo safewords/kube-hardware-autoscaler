@@ -119,6 +119,9 @@ pub struct MachineHistory {
     pub booting_since: Option<DateTime<Utc>>,
     /// This decision's draw for the `Random` strategy, 0.0 to 1.0.
     pub lottery: f64,
+    /// Seconds until its active hours end, when it has them and is inside
+    /// them; `None` when it has no end within a week.
+    pub active_seconds_left: Option<i64>,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -455,6 +458,17 @@ pub struct Score {
 
 /// Seconds at which a boot rates 0.5 for `FastestBoot`.
 const BOOT_TIME_HALF_SECS: f64 = 120.0;
+/// The boot `ActiveHoursRemaining` expects of a machine with no history.
+const UNKNOWN_BOOT_SECS: f64 = 300.0;
+/// Time left after booting at which `ActiveHoursRemaining` rates 1.
+const WORTHWHILE_SECS: f64 = 3600.0;
+
+/// Seconds a machine would have in its active hours once Ready; `None`
+/// without an end.
+fn usable_seconds(m: &Member) -> Option<f64> {
+    let left = m.history.active_seconds_left? as f64;
+    Some(left - m.history.boot_average_seconds.unwrap_or(UNKNOWN_BOOT_SECS))
+}
 
 impl<'a> Ranking<'a> {
     pub fn new<'m>(spec: &'a NodeScalingPoolSpec, members: impl IntoIterator<Item = &'m Member>) -> Self {
@@ -498,8 +512,21 @@ impl<'a> Ranking<'a> {
         key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name))
     }
 
+    /// A machine woken only when no other fits: its management interface
+    /// does not answer (`Reachable`), or its active hours end before it
+    /// would be Ready (`ActiveHoursRemaining`).
     fn unreachable(&self, m: &Member) -> bool {
-        self.uses(Strategy::Reachable) && m.history.reachable == Some(false)
+        self.last_resort(m).is_some()
+    }
+
+    fn last_resort(&self, m: &Member) -> Option<&'static str> {
+        if self.uses(Strategy::Reachable) && m.history.reachable == Some(false) {
+            Some("Reachable")
+        } else if self.uses(Strategy::ActiveHoursRemaining) && usable_seconds(m).is_some_and(|s| s <= 0.0) {
+            Some("ActiveHoursRemaining")
+        } else {
+            None
+        }
     }
 
     fn size_rating(&self, m: &Member) -> f64 {
@@ -539,6 +566,10 @@ impl<'a> Ranking<'a> {
             Strategy::Largest => self.size_rating(m),
             Strategy::Smallest => 1.0 - self.size_rating(m),
             Strategy::Random => h.lottery.clamp(0.0, 1.0),
+            Strategy::ActiveHoursRemaining => match usable_seconds(m) {
+                Some(s) => (s / WORTHWHILE_SECS).clamp(0.0, 1.0),
+                None => 1.0,
+            },
         }
     }
 
@@ -598,12 +629,16 @@ impl<'a> Ranking<'a> {
         if !self.strategic() {
             return ordered_rule(self.spec, chosen, other, down);
         }
-        let (uc, uo) = (self.unreachable(chosen), self.unreachable(other));
-        if uc != uo {
-            return if down {
-                "Reachable (its management interface does not answer)".into()
-            } else {
-                format!("Reachable ({}'s management interface does not answer)", other.name)
+        let (uc, uo) = (self.last_resort(chosen), self.last_resort(other));
+        if uc.is_some() != uo.is_some() {
+            let (who, why) = if down { (chosen, uc) } else { (other, uo) };
+            return match why {
+                Some("Reachable") => format!("Reachable ({}'s management interface does not answer)", who.name),
+                _ => format!(
+                    "ActiveHoursRemaining ({}'s active hours end in {}s, before it would be Ready)",
+                    who.name,
+                    who.history.active_seconds_left.unwrap_or(0)
+                ),
             };
         }
         let (sc, so) = (self.score(chosen), self.score(other));
@@ -660,8 +695,14 @@ impl<'a> Ranking<'a> {
             ),
             Strategy::Largest | Strategy::Smallest => format!("{} vs {}", size(a), size(b)),
             Strategy::Random => format!("drew {:.2} vs {:.2}", ha.lottery, hb.lottery),
+            Strategy::ActiveHoursRemaining => format!("hours left {} vs {}", left(ha), left(hb)),
         }
     }
+}
+
+fn left(h: &MachineHistory) -> String {
+    h.active_seconds_left
+        .map_or("unlimited".into(), |s| format!("{}m", s / 60))
 }
 
 fn secs(s: Option<f64>) -> String {
@@ -3359,6 +3400,75 @@ mod strategy_tests {
             kept_by_others: BTreeMap::new(),
         });
         assert!(p.power_on.is_empty());
+    }
+
+    #[test]
+    fn active_hours_remaining_skips_a_machine_that_would_close_before_it_is_ready() {
+        // Your order: lagopus, then velox, then zerda, by a dominant Priority.
+        let spec = spec(serde_json::json!({
+            "preferredNodes": [{"name": "velox", "weight": 50}, {"name": "zerda", "weight": 10}],
+            "strategies": [{"name": "Priority", "weight": 100}, {"name": "ActiveHoursRemaining", "weight": 1}]
+        }));
+        let with_left = |name: &str, left: Option<i64>, boot: Option<f64>| {
+            let mut m = machine(name, 8);
+            m.history.active_seconds_left = left;
+            m.history.boot_average_seconds = boot;
+            m
+        };
+        // Mid-day: Priority decides.
+        let p = woken(
+            &spec,
+            vec![
+                with_left("zerda", Some(8 * 3600), Some(200.0)),
+                with_left("velox", Some(8 * 3600), Some(260.0)),
+            ],
+        );
+        assert_eq!(p.power_on[0].0, "velox");
+
+        // 19:55: velox has 5 minutes and boots in 262s, so 38s to work; still
+        // ahead, as zerda (same hours) is no better off.
+        let p = woken(
+            &spec,
+            vec![
+                with_left("zerda", Some(300), Some(200.0)),
+                with_left("velox", Some(300), Some(262.0)),
+            ],
+        );
+        assert_eq!(p.power_on[0].0, "velox");
+
+        // 19:58: velox would close before it is Ready. A machine without hours
+        // is woken instead, whatever its priority.
+        let p = woken(
+            &spec,
+            vec![
+                with_left("velox", Some(120), Some(262.0)),
+                with_left("anytime", None, None),
+            ],
+        );
+        assert_eq!(p.power_on[0].0, "anytime");
+        assert!(
+            p.power_on[0].1.contains(
+                "over velox by ActiveHoursRemaining (velox's active hours end in 120s, before it would be Ready)"
+            ),
+            "{}",
+            p.power_on[0].1
+        );
+        // And when it is the only machine that fits, it is still woken: the
+        // job may run past the end of its hours (work is never interrupted).
+        let p = woken(&spec, vec![with_left("velox", Some(120), Some(262.0))]);
+        assert_eq!(p.power_on[0].0, "velox");
+
+        // The rating: an hour or more after booting is 1, none is 0, no hours is 1.
+        let ranking = Ranking::new(&spec, []);
+        let rate = |left, boot| ranking.rate(Strategy::ActiveHoursRemaining, &with_left("m", left, boot));
+        assert_eq!(rate(Some(4 * 3600), Some(60.0)), 1.0);
+        assert_eq!(
+            rate(Some(1800 + 300), None),
+            0.5,
+            "five minutes expected with no history"
+        );
+        assert_eq!(rate(Some(100), Some(200.0)), 0.0);
+        assert_eq!(rate(None, None), 1.0);
     }
 
     #[test]

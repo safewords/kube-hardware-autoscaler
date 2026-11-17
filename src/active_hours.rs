@@ -155,6 +155,31 @@ pub fn standing(hours: Option<&ActiveHours>, now: DateTime<Utc>) -> Standing {
     })
 }
 
+/// When a machine with `hours` stops being active, if it is active at `now`:
+/// the first minute no window covers, following windows that run into each
+/// other (and across midnight). `None` when it is not active at `now`, when
+/// it has no `activeHours`, or when it stays active for the coming week.
+pub fn active_until(hours: Option<&ActiveHours>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let h = hours?;
+    let tz: Tz = h.time_zone.as_deref().unwrap_or("UTC").parse().ok()?;
+    let windows: Vec<Window> = h.windows.iter().map(Window::parse).collect::<Result<_, _>>().ok()?;
+    let covered = |at: DateTime<Utc>| {
+        let here = at.with_timezone(&tz);
+        let t = here.hour() * 60 + here.minute();
+        windows.iter().any(|w| w.covers(here.weekday(), t))
+    };
+    if !covered(now) {
+        return None;
+    }
+    // Minute by minute, from the next minute boundary: windows are whole
+    // minutes, and a week is ten thousand steps.
+    let first = now - Duration::seconds(now.second() as i64) - Duration::nanoseconds(now.nanosecond() as i64)
+        + Duration::minutes(1);
+    (0..7 * 24 * 60)
+        .map(|m| first + Duration::minutes(m))
+        .find(|t| !covered(*t))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +271,43 @@ mod tests {
             standing(Some(&h), at("2026-11-18T14:00:00Z")),
             Standing::Outside(_)
         ));
+    }
+
+    #[test]
+    fn active_until_finds_the_end_of_the_window() {
+        let day = hours("America/Los_Angeles", &[(&[], "08:00", "20:00")]);
+        // 19:55 PST is 03:55 UTC the next day.
+        assert_eq!(
+            active_until(Some(&day), at("2026-11-18T03:55:30Z")),
+            Some(at("2026-11-18T04:00:00Z"))
+        );
+        assert_eq!(
+            active_until(Some(&day), at("2026-11-17T17:00:00Z")),
+            Some(at("2026-11-18T04:00:00Z"))
+        );
+        assert_eq!(
+            active_until(Some(&day), at("2026-11-18T05:00:00Z")),
+            None,
+            "outside: not active"
+        );
+        assert_eq!(
+            active_until(None, at("2026-11-18T05:00:00Z")),
+            None,
+            "no hours: never closes"
+        );
+        // Windows that meet run on; one that covers the whole week never closes.
+        let chained = hours("UTC", &[(&[], "08:00", "12:00"), (&[], "12:00", "14:00")]);
+        assert_eq!(
+            active_until(Some(&chained), at("2026-11-17T09:00:00Z")),
+            Some(at("2026-11-17T14:00:00Z"))
+        );
+        let always = hours("UTC", &[(&[], "00:00", "24:00")]);
+        assert_eq!(active_until(Some(&always), at("2026-11-17T09:00:00Z")), None);
+        let overnight = hours("UTC", &[(&[], "22:00", "06:00")]);
+        assert_eq!(
+            active_until(Some(&overnight), at("2026-11-17T23:00:00Z")),
+            Some(at("2026-11-18T06:00:00Z"))
+        );
     }
 
     #[test]

@@ -328,6 +328,7 @@ fn build_member(
     } else {
         crate::active_hours::standing(mn.spec.active_hours.as_ref(), Utc::now())
     };
+    let active_now = standing == crate::active_hours::Standing::Active;
     let (state, note, outside_active_hours) = apply_active_hours(
         special.state.unwrap_or(base),
         special.note,
@@ -362,7 +363,15 @@ fn build_member(
         logged_in: st.login_sessions.as_ref().map(|l| (l.checked_at, l.sessions.clone())),
         s3_capable: s3_capable(&st, Utc::now()),
         registering,
-        history: history(&st, state),
+        history: MachineHistory {
+            // Inside its hours (and not lifted by a PowerRequest): how long it has left.
+            active_seconds_left: active_now
+                .then(|| crate::active_hours::active_until(mn.spec.active_hours.as_ref(), Utc::now()))
+                .flatten()
+                .filter(|_| !holds.iter().any(|h| h.override_active_hours))
+                .map(|t| (t - Utc::now()).num_seconds()),
+            ..history(&st, state)
+        },
     })
 }
 
@@ -401,6 +410,7 @@ pub fn history(st: &NodePowerManagementConfigStatus, state: MemberState) -> Mach
         rtt_ms: st.reachability.as_ref().and_then(|r| r.rtt_ms),
         booting_since,
         lottery: lottery(),
+        active_seconds_left: None,
     }
 }
 

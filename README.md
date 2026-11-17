@@ -80,7 +80,8 @@ spec:
   the reverse order.
 - **Wake strategies:** instead of that order, a pool can combine strategies by weight to pick the machine to wake:
   `Reachable` (its BMC answers, and how fast), `FastestBoot` and `Reliable` (learned from
-  each machine's recent boots), `Standby`, `Largest`, `Smallest`, `Random` and `Priority`.
+  each machine's recent boots), `Standby`, `Largest`, `Smallest`, `Random`, `Priority` and `ActiveHoursRemaining` (not
+  a machine whose active hours end before it would be Ready).
   With `hedge`, a boot that is taking too long no longer holds the pending pods: the next
   machine is woken.
 - **Boot failures and manual power changes:** a machine that doesn't boot within its
