@@ -17,9 +17,9 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use kube_hardware_autoscaler::controller::{
-    Context, DecisionVerbosity, IdentityCache, node_power_management_config, node_scaling_pool,
+    Context, DecisionVerbosity, IdentityCache, node_power_management_config, node_scaling_pool, power_request,
 };
-use kube_hardware_autoscaler::crd::{NodePowerManagementConfig, NodeScalingPool};
+use kube_hardware_autoscaler::crd::{NodePowerManagementConfig, NodeScalingPool, PowerRequest};
 use kube_hardware_autoscaler::drivers::{self, CATALOG, DriverContext, PowerChain};
 use kube_hardware_autoscaler::metrics::{self, Metrics};
 use kube_hardware_autoscaler::webhook;
@@ -108,6 +108,10 @@ enum Command {
         /// is done) or `detailed` (also every machine's rank at info).
         #[arg(long, env = "KHA_DECISION_VERBOSITY", value_enum, default_value_t = DecisionVerbosity::Summary)]
         decision_verbosity: DecisionVerbosity,
+        /// The longest a PowerRequest may hold a machine on; longer requests
+        /// are refused.
+        #[arg(long, env = "KHA_MAX_POWER_REQUEST_SECONDS", default_value_t = kube_hardware_autoscaler::power_request::DEFAULT_MAX_SECS)]
+        max_power_request_seconds: u64,
         #[command(flatten)]
         webhook: WebhookArgs,
     },
@@ -204,6 +208,7 @@ async fn run(
     metrics_addr: SocketAddr,
     dry_run: bool,
     decision_verbosity: DecisionVerbosity,
+    max_power_request_secs: u64,
     webhook_args: WebhookArgs,
 ) -> anyhow::Result<()> {
     let client = Client::try_default().await.context("connecting to Kubernetes")?;
@@ -214,11 +219,13 @@ async fn run(
     let pods = spawn_reflector(Api::<Pod>::all(client.clone()));
     let node_power_management_configs = spawn_reflector(Api::<NodePowerManagementConfig>::all(client.clone()));
     let pools = spawn_reflector(Api::<NodeScalingPool>::all(client.clone()));
+    let power_requests = spawn_reflector(Api::<PowerRequest>::all(client.clone()));
     info!("waiting for caches to sync");
     nodes.wait_until_ready().await?;
     pods.wait_until_ready().await?;
     node_power_management_configs.wait_until_ready().await?;
     pools.wait_until_ready().await?;
+    power_requests.wait_until_ready().await?;
     metrics.ready.store(true, Ordering::Relaxed);
     info!(dry_run, namespace = %args.namespace, "caches synced; starting controllers");
 
@@ -259,6 +266,8 @@ async fn run(
         pods,
         node_power_management_configs,
         pools,
+        power_requests,
+        max_power_request_secs,
         identity_cache: IdentityCache::default(),
         recorder: Recorder::new(client.clone(), reporter),
         metrics,
@@ -295,7 +304,21 @@ async fn run(
         ctx.clone(),
     )
     .for_each(|r| async move { log_controller_result("nodepowermanagementconfig", r) });
+    // A new or changed PowerRequest is looked at by every pool at once, not
+    // at the next 15 s tick.
+    let all_pools = ctx.pools.clone();
     let pool_controller = Controller::new(Api::<NodeScalingPool>::all(client.clone()), watcher::Config::default())
+        .watches(
+            Api::<PowerRequest>::all(client.clone()),
+            watcher::Config::default(),
+            move |_req| {
+                all_pools
+                    .state()
+                    .iter()
+                    .map(|p| ObjectRef::from(p.as_ref()))
+                    .collect::<Vec<_>>()
+            },
+        )
         .shutdown_on_signal()
         .run(
             node_scaling_pool::reconcile,
@@ -303,7 +326,11 @@ async fn run(
             ctx.clone(),
         )
         .for_each(|r| async move { log_controller_result("nodescalingpool", r) });
-    tokio::join!(mn_controller, pool_controller);
+    let request_controller = Controller::new(Api::<PowerRequest>::all(client.clone()), watcher::Config::default())
+        .shutdown_on_signal()
+        .run(power_request::reconcile, power_request::error_policy, ctx.clone())
+        .for_each(|r| async move { log_controller_result("powerrequest", r) });
+    tokio::join!(mn_controller, pool_controller, request_controller);
     info!("controllers stopped");
     if let Some(task) = webhook_shutdown {
         let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
@@ -389,8 +416,19 @@ async fn main() -> anyhow::Result<()> {
             metrics_addr,
             dry_run,
             decision_verbosity,
+            max_power_request_seconds,
             webhook,
-        } => run(drivers, metrics_addr, dry_run, decision_verbosity, webhook).await,
+        } => {
+            run(
+                drivers,
+                metrics_addr,
+                dry_run,
+                decision_verbosity,
+                max_power_request_seconds,
+                webhook,
+            )
+            .await
+        }
         Command::Wake { mac, port, broadcast } => {
             let mac_bytes = kube_hardware_autoscaler::wake::parse_mac(&mac).context("invalid --mac")?;
             let targets = kube_hardware_autoscaler::wake::targets(broadcast.as_deref(), port)?;
@@ -403,9 +441,10 @@ async fn main() -> anyhow::Result<()> {
             // JSON documents (valid YAML): unquoted YAML would let YAML 1.1
             // parsers turn enum values such as `On`/`Off` into booleans.
             println!(
-                "{}\n---\n{}",
+                "{}\n---\n{}\n---\n{}",
                 serde_json::to_string_pretty(&NodePowerManagementConfig::crd())?,
-                serde_json::to_string_pretty(&NodeScalingPool::crd())?
+                serde_json::to_string_pretty(&NodeScalingPool::crd())?,
+                serde_json::to_string_pretty(&PowerRequest::crd())?
             );
             Ok(())
         }

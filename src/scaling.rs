@@ -94,6 +94,9 @@ pub struct Member {
     pub outside_active_hours: Option<String>,
     /// The machine's own `lifecycle.unneededSeconds`, over the pool's.
     pub unneeded_seconds: Option<u64>,
+    /// PowerRequests holding the machine on (their labels, `; `-joined): it is
+    /// woken if off, and never unneeded while they last.
+    pub power_requests: Option<String>,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -512,6 +515,14 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             unplaced.push((pod_name, "fits no machine that is off and Auto".into()));
         }
     }
+    // PowerRequests: their machines are woken whatever the pending pods,
+    // maxOnline or maxNodesPerStep say (and even with scale-up disabled).
+    while let Some(pos) = offline.iter().position(|m| m.power_requests.is_some()) {
+        let m = offline.remove(pos);
+        let reason = m.power_requests.clone().unwrap_or_default();
+        up_notes.push((m.name.clone(), reason.clone()));
+        opened.push((m.name.clone(), reason));
+    }
     // minOnline is enforced even when scale-up is disabled.
     while online_now + opened.len() < spec.min_online as usize && online_now + opened.len() < max_online {
         let Some(m) = offline.first().copied() else { break };
@@ -554,6 +565,8 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         let note = if let Some(note) = waiting {
             waiting_notes.push(format!("{} {note}", m.name));
             Note::same(note)
+        } else if let Some(r) = &m.power_requests {
+            Note::same(format!("busy: {r}"))
         } else if !m.blocking_pods.is_empty() {
             Note::same(format!("busy: blocked by {}", m.blocking_pods.join(", ")))
         } else if let Some((t, who)) = m.logged_in.as_ref().filter(|(t, _)| s.now - *t < login_recheck) {
@@ -640,13 +653,15 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     let mut off_notes: BTreeMap<String, String> = BTreeMap::new();
     // `manualPowerOnPolicy: PowerOff` past its grace: powered off busy or not
     // (pods are still drained; safe-to-evict=false pods still block).
-    let released = |m: &Member| m.release_after.is_some_and(|t| s.now >= t) && m.blocking_pods.is_empty();
+    let released = |m: &Member| {
+        m.release_after.is_some_and(|t| s.now >= t) && m.blocking_pods.is_empty() && m.power_requests.is_none()
+    };
     let eligible: Vec<&Member> = candidates
         .iter()
         .copied()
         .filter(|m| {
             let expired = plan.unneeded_since.get(&m.name).is_some_and(|t| expired_for(m, *t));
-            (over_max > 0 && m.blocking_pods.is_empty()) || expired || released(m)
+            (over_max > 0 && m.blocking_pods.is_empty() && m.power_requests.is_none()) || expired || released(m)
         })
         .collect();
     if blocked_reason.is_none() && leaving >= step && over_max == 0 {
@@ -1162,6 +1177,7 @@ mod tests {
             release_after: None,
             outside_active_hours: None,
             unneeded_seconds: None,
+            power_requests: None,
         }
     }
 
@@ -1893,6 +1909,41 @@ mod tests {
     }
 
     #[test]
+    fn a_power_request_wakes_its_machine_with_nothing_pending() {
+        let now = Utc::now();
+        let mut spec = spec();
+        spec.scale_up.enabled = false;
+        spec.max_online = Some(0);
+        let mut b = member("b", MemberState::Offline, 0);
+        b.power_requests = Some("power request app/r until 14:00:00Z".into());
+        let s = snapshot(&spec, vec![member("a", MemberState::Offline, 0), b], vec![], now);
+        let p = plan(&s);
+        assert_eq!(
+            p.power_on,
+            [("b".to_string(), "power request app/r until 14:00:00Z".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_power_request_keeps_an_idle_machine_and_tells_the_other_pools() {
+        let now = Utc::now();
+        let spec = spec();
+        let mut b = member("b", MemberState::Online, 0);
+        b.power_requests = Some("power request app/r until 14:00:00Z".into());
+        let s = PoolSnapshot {
+            unneeded_since: BTreeMap::from([("b".to_string(), now - Duration::seconds(7200))]),
+            ..snapshot(&spec, vec![member("a", MemberState::Online, 1000), b], vec![], now)
+        };
+        let p = plan(&s);
+        assert!(p.power_off.is_empty(), "{:?}", p.power_off);
+        assert!(!p.unneeded_since.contains_key("b"));
+        assert_eq!(
+            p.needed.get("b").map(String::as_str),
+            Some("busy: power request app/r until 14:00:00Z")
+        );
+    }
+
+    #[test]
     fn does_not_scale_down_when_pods_would_not_fit() {
         let now = Utc::now();
         let spec = spec();
@@ -2139,6 +2190,7 @@ mod dedicated_pool_tests {
             release_after: None,
             outside_active_hours: None,
             unneeded_seconds: None,
+            power_requests: None,
         }
     }
 
@@ -2328,6 +2380,7 @@ mod overlapping_pool_tests {
             release_after: None,
             outside_active_hours: None,
             unneeded_seconds: None,
+            power_requests: None,
         }
     }
 
@@ -2564,6 +2617,7 @@ mod boot_and_manual_tests {
             release_after: None,
             outside_active_hours: None,
             unneeded_seconds: None,
+            power_requests: None,
         }
     }
 

@@ -1142,3 +1142,156 @@
     ]
   }
 }
+---
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "powerrequests.hardware-autoscaler.safewords.com"
+  },
+  "spec": {
+    "group": "hardware-autoscaler.safewords.com",
+    "names": {
+      "kind": "PowerRequest",
+      "plural": "powerrequests",
+      "shortNames": [
+        "pwr"
+      ],
+      "singular": "powerrequest"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.nodeName",
+            "name": "Node",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.phase",
+            "name": "Phase",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.expiresAt",
+            "name": "Expires",
+            "type": "date"
+          },
+          {
+            "jsonPath": ".spec.reason",
+            "name": "Reason",
+            "priority": 1,
+            "type": "string"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for PowerRequestSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "A request from an application to have one machine powered on for a while:\nthe pools wake it and keep it on until the request expires or is deleted,\nafter which their usual idle rules apply.\n\nNamespaced, so RBAC decides which applications may ask. Setting\n`overrideActiveHours` needs `create` on the `powerrequests/overrideactivehours`\nsubresource as well (checked by the chart's ValidatingAdmissionPolicy).",
+                "properties": {
+                  "duration": {
+                    "description": "How long to keep it on, counted from when its Node is Ready: `90m`,\n`2h`, `1h30m`, `45s`. Exactly one of `duration` and `until`.",
+                    "minLength": 2,
+                    "nullable": true,
+                    "pattern": "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$",
+                    "type": "string"
+                  },
+                  "nodeName": {
+                    "description": "The machine: its Node name (and NodePowerManagementConfig name).",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "overrideActiveHours": {
+                    "default": false,
+                    "description": "Wake and keep the machine even outside its `activeHours`. Without it,\na request for a machine outside its hours is refused, and an active\none ends when its hours do.",
+                    "type": "boolean"
+                  },
+                  "reason": {
+                    "description": "Why, for the pools' decisions and Events.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "until": {
+                    "description": "Keep it on until this time (RFC 3339). Exactly one of `duration` and\n`until`.",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "nodeName"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "nullable": true,
+                "properties": {
+                  "expiresAt": {
+                    "description": "When the request stops holding the machine on.",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "finishedAt": {
+                    "description": "When it reached Expired, Refused or Failed; deleted an hour later.",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "message": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "phase": {
+                    "default": "Pending",
+                    "enum": [
+                      "Pending",
+                      "PoweringOn",
+                      "Active",
+                      "Expired",
+                      "Refused",
+                      "Failed"
+                    ],
+                    "type": "string"
+                  },
+                  "readyAt": {
+                    "description": "When the machine's Node was first seen Ready for this request.",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "PowerRequest",
+            "type": "object",
+            "x-kubernetes-validations": [
+              {
+                "message": "set exactly one of spec.duration and spec.until",
+                "rule": "has(self.spec.duration) != has(self.spec.until)"
+              }
+            ]
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

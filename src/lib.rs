@@ -11,6 +11,7 @@ pub mod drivers;
 pub mod identity;
 pub mod membership;
 pub mod metrics;
+pub mod power_request;
 pub mod resources;
 pub mod scaling;
 pub mod wake;

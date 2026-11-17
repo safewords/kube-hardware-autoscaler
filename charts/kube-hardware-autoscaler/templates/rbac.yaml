@@ -26,6 +26,14 @@ rules:
   - apiGroups: ["hardware-autoscaler.safewords.com"]
     resources: ["nodepowermanagementconfigs/status", "nodescalingpools/status"]
     verbs: ["get", "patch", "update"]
+  # PowerRequests: read by the pools, their status written, and deleted an
+  # hour after they finish.
+  - apiGroups: ["hardware-autoscaler.safewords.com"]
+    resources: ["powerrequests"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["hardware-autoscaler.safewords.com"]
+    resources: ["powerrequests/status"]
+    verbs: ["get", "patch", "update"]
   # Cordon/uncordon.
   - apiGroups: [""]
     resources: ["nodes"]

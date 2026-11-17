@@ -350,6 +350,56 @@ Only `powerPolicy: Auto` is affected. A time zone the operator does not know, or
 malformed time, counts as outside: the machine is never woken by a mistake, and a
 running machine is not forced off by one either. The error is in the pools' decisions.
 
+### Power requests: an application asks for a machine
+
+A `PowerRequest` asks for one machine to be on for a while, whatever the pods say: for a
+batch job that schedules its own work, a person who wants a box warm before they start,
+or anything that is not a pending pod. It is namespaced, so RBAC decides which
+applications may ask.
+
+```yaml
+apiVersion: hardware-autoscaler.safewords.com/v1alpha1
+kind: PowerRequest
+metadata:
+  name: nightly-batch
+  namespace: my-app
+spec:
+  nodeName: vulpes-lagopus    # the machine's Node / NodePowerManagementConfig name
+  duration: 2h                # counted from when its Node is Ready; or `until: <RFC 3339>`
+  reason: nightly batch       # shown in the pools' decisions and Events
+  overrideActiveHours: false  # true: may run it outside its activeHours (needs RBAC, below)
+```
+
+`kubectl get pwr -A` shows them. What happens:
+
+| `status.phase` | Meaning |
+|---|---|
+| `PoweringOn` | Accepted. Every pool that selects the machine wakes it (whatever its pending pods, `maxOnline`, `maxNodesPerStep` or `scaleUp.enabled`) and keeps it. |
+| `Active` | Its Node is Ready. `status.readyAt` and `status.expiresAt` are set; with `duration`, `expiresAt` is `readyAt` + duration. |
+| `Expired` | `expiresAt` passed, or the machine's active hours ended (without `overrideActiveHours`). The pools' usual idle rules take over: it is powered off after its `unneededSeconds`. |
+| `Refused` | Not accepted: no such machine, `powerPolicy: AlwaysOff`, outside its active hours without `overrideActiveHours`, longer than `--max-power-request-seconds` (24 h by default), or a bad `duration`. Nothing was powered for it. |
+| `Failed` | Accepted, but the machine was not Ready within 30 minutes. |
+
+Deleting a request releases the machine at once. Finished requests are deleted an hour
+after they finish. While a request holds a machine, the pools show it as
+`busy: power request my-app/nightly-batch (nightly batch) until 14:02:00Z` and list it in
+`status.needed`, so overlapping pools agree. A machine that cannot be woken (a boot
+failure backoff, a manual power-off cooldown) is not woken for a request either.
+
+**RBAC.** The chart installs two ClusterRoles. Bind them with a RoleBinding in the
+application's namespace:
+
+- `<release>-power-requester`: create, read and delete PowerRequests.
+- `<release>-power-request-override`: also set `overrideActiveHours: true`. A
+  ValidatingAdmissionPolicy (Kubernetes 1.30+) refuses that field unless the requester
+  may `create` the `powerrequests/overrideactivehours` subresource, which only this
+  role grants.
+
+```sh
+kubectl -n my-app create rolebinding my-app-power \
+  --clusterrole=kube-hardware-autoscaler-power-requester --serviceaccount=my-app:default
+```
+
 ### Multiple interfaces and fallback
 
 `powerInterfaces` is an ordered list. Each operation (read state, power on,

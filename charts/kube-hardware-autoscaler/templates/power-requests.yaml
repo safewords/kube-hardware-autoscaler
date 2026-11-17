@@ -1,0 +1,63 @@
+{{- if .Values.rbac.create }}
+# PowerRequests: applications ask for a machine to be powered on for a while.
+#
+# Bind an application to {{ include "kube-hardware-autoscaler.fullname" . }}-power-requester (a RoleBinding in its own
+# namespace) to let it create them there. Setting `overrideActiveHours` also
+# needs {{ include "kube-hardware-autoscaler.fullname" . }}-power-request-override: the ValidatingAdmissionPolicy below asks
+# the authorizer for `create` on the `powerrequests/overrideactivehours`
+# subresource, so RBAC alone decides who may run a machine outside its hours.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}-power-requester
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["hardware-autoscaler.safewords.com"]
+    resources: ["powerrequests"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}-power-request-override
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+rules:
+  # Not a real subresource: the admission policy checks this permission.
+  - apiGroups: ["hardware-autoscaler.safewords.com"]
+    resources: ["powerrequests/overrideactivehours"]
+    verbs: ["create"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}-power-request-override
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["hardware-autoscaler.safewords.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["powerrequests"]
+  validations:
+    - expression: >-
+        !has(object.spec.overrideActiveHours) || !object.spec.overrideActiveHours ||
+        (request.operation == 'UPDATE' && has(oldObject.spec.overrideActiveHours) && oldObject.spec.overrideActiveHours) ||
+        authorizer.group('hardware-autoscaler.safewords.com').resource('powerrequests').subresource('overrideactivehours').namespace(object.metadata.namespace).check('create').allowed()
+      message: "spec.overrideActiveHours needs create on powerrequests/overrideactivehours (ClusterRole {{ include "kube-hardware-autoscaler.fullname" . }}-power-request-override)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "kube-hardware-autoscaler.fullname" . }}-power-request-override
+  labels:
+    {{- include "kube-hardware-autoscaler.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "kube-hardware-autoscaler.fullname" . }}-power-request-override
+  validationActions: ["Deny"]
+{{- end }}

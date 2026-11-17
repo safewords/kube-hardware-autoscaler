@@ -67,6 +67,10 @@ spec:
 - **Active hours:** `activeHours` limits when the pools may run a machine (say, a loud
   server only in the daytime, in its own time zone). Outside them it is never woken, and
   once idle it is powered off at once; running work is not interrupted.
+- **Power requests:** another application can ask for a machine to be on for a while by
+  creating a `PowerRequest` (`nodeName`, `duration: 2h` or `until`). The pools wake it and
+  keep it on until the request expires or is deleted. RBAC decides who may ask, and who may
+  override a machine's active hours.
 - **Demand-driven scaling:** unschedulable pods are bin-packed onto powered-off machines,
   checking resources, node selectors, node affinity and taints. Idle machines are drained
   through the eviction API, which respects PDBs. `safe-to-evict` annotations are honoured.

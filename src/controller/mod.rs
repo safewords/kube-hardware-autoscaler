@@ -2,6 +2,7 @@
 
 pub mod node_power_management_config;
 pub mod node_scaling_pool;
+pub mod power_request;
 
 use std::sync::Arc;
 
@@ -13,7 +14,9 @@ use kube::{Api, Client, Resource, ResourceExt};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::crd::{CORDONED_BY_ANNOTATION, NodePowerManagementConfig, NodeScalingPool, POWERED_OFF_ANNOTATION};
+use crate::crd::{
+    CORDONED_BY_ANNOTATION, NodePowerManagementConfig, NodeScalingPool, POWERED_OFF_ANNOTATION, PowerRequest,
+};
 use crate::drivers::DriverContext;
 use crate::identity::IdentityCheck;
 use crate::metrics::Metrics;
@@ -35,6 +38,9 @@ pub struct Context {
     pub pods: Store<Pod>,
     pub node_power_management_configs: Store<NodePowerManagementConfig>,
     pub pools: Store<NodeScalingPool>,
+    pub power_requests: Store<PowerRequest>,
+    /// The longest a PowerRequest may hold a machine.
+    pub max_power_request_secs: u64,
     pub recorder: Recorder,
     pub metrics: Arc<Metrics>,
     /// Log power actions instead of executing them.
@@ -114,6 +120,47 @@ impl Context {
                 false
             }
         }
+    }
+
+    /// What every PowerRequest for `node` does to it now, as the pools see it.
+    pub fn power_request_holds(
+        &self,
+        node: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<crate::power_request::Hold> {
+        let mn = self
+            .node_power_management_configs
+            .get(&kube::runtime::reflector::ObjectRef::new(node));
+        let mut holds: Vec<(String, crate::power_request::Hold)> = self
+            .power_requests
+            .state()
+            .iter()
+            .filter(|r| r.spec.node_name == node)
+            .filter_map(|r| {
+                let created = r
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0))
+                    .unwrap_or(now);
+                let ns = r.namespace().unwrap_or_default();
+                let name = r.name_any();
+                crate::power_request::evaluate(
+                    &ns,
+                    &name,
+                    &r.spec,
+                    &r.status.clone().unwrap_or_default(),
+                    created,
+                    mn.as_deref(),
+                    now,
+                    self.max_power_request_secs,
+                )
+                .hold
+                .map(|h| (format!("{ns}/{name}"), h))
+            })
+            .collect();
+        holds.sort_by(|a, b| a.0.cmp(&b.0));
+        holds.into_iter().map(|(_, h)| h).collect()
     }
 
     pub fn pods_on(&self, node: &str) -> Vec<Arc<Pod>> {

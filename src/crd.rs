@@ -1375,3 +1375,98 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PowerRequest
+// ---------------------------------------------------------------------------
+
+/// A request from an application to have one machine powered on for a while:
+/// the pools wake it and keep it on until the request expires or is deleted,
+/// after which their usual idle rules apply.
+///
+/// Namespaced, so RBAC decides which applications may ask. Setting
+/// `overrideActiveHours` needs `create` on the `powerrequests/overrideactivehours`
+/// subresource as well (checked by the chart's ValidatingAdmissionPolicy).
+#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "hardware-autoscaler.safewords.com",
+    version = "v1alpha1",
+    kind = "PowerRequest",
+    plural = "powerrequests",
+    shortname = "pwr",
+    namespaced,
+    status = "PowerRequestStatus",
+    validation = kube::core::Rule::new("has(self.spec.duration) != has(self.spec.until)").message("set exactly one of spec.duration and spec.until"),
+    printcolumn = r#"{"name":"Node","type":"string","jsonPath":".spec.nodeName"}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
+    printcolumn = r#"{"name":"Reason","type":"string","jsonPath":".spec.reason","priority":1}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct PowerRequestSpec {
+    /// The machine: its Node name (and NodePowerManagementConfig name).
+    #[schemars(length(min = 1))]
+    pub node_name: String,
+    /// How long to keep it on, counted from when its Node is Ready: `90m`,
+    /// `2h`, `1h30m`, `45s`. Exactly one of `duration` and `until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^([0-9]+h)?([0-9]+m)?([0-9]+s)?$"), length(min = 2))]
+    pub duration: Option<String>,
+    /// Keep it on until this time (RFC 3339). Exactly one of `duration` and
+    /// `until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    /// Why, for the pools' decisions and Events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Wake and keep the machine even outside its `activeHours`. Without it,
+    /// a request for a machine outside its hours is refused, and an active
+    /// one ends when its hours do.
+    #[serde(default)]
+    pub override_active_hours: bool,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum PowerRequestPhase {
+    /// Not looked at yet.
+    #[default]
+    Pending,
+    /// Accepted; the machine is being woken (or its Node is not Ready yet).
+    PoweringOn,
+    /// The machine is on and Ready, and kept on until `expiresAt`.
+    Active,
+    /// Over: `expiresAt` passed, or the machine's active hours ended.
+    Expired,
+    /// Not accepted (see `message`); the machine was not touched for it.
+    Refused,
+    /// Accepted, but the machine did not become Ready in time.
+    Failed,
+}
+
+impl PowerRequestPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            PowerRequestPhase::Expired | PowerRequestPhase::Refused | PowerRequestPhase::Failed
+        )
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PowerRequestStatus {
+    #[serde(default)]
+    pub phase: PowerRequestPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// When the machine's Node was first seen Ready for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<DateTime<Utc>>,
+    /// When the request stops holding the machine on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// When it reached Expired, Refused or Failed; deleted an hour later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}

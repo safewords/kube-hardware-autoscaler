@@ -321,18 +321,28 @@ fn build_member(
 
     let base = member_state(mn, member_of);
     let special = classify(&st, base, manual_policy, &pool.spec, boot_timeout, cooldown, Utc::now());
+    let holds = ctx.power_request_holds(&mn.spec.node_name, Utc::now());
+    // A request that may override the active hours lifts them while it lasts.
+    let standing = if holds.iter().any(|h| h.override_active_hours) {
+        crate::active_hours::Standing::Active
+    } else {
+        crate::active_hours::standing(mn.spec.active_hours.as_ref(), Utc::now())
+    };
     let (state, note, outside_active_hours) = apply_active_hours(
         special.state.unwrap_or(base),
         special.note,
         mn.spec.power_policy,
-        crate::active_hours::standing(mn.spec.active_hours.as_ref(), Utc::now()),
+        standing,
     );
+    let power_requests =
+        (!holds.is_empty()).then(|| holds.iter().map(|h| h.label.as_str()).collect::<Vec<_>>().join("; "));
     Some(Member {
         name: mn.name_any(),
         state,
         note,
         outside_active_hours,
         unneeded_seconds: mn.spec.lifecycle.unneeded_seconds,
+        power_requests,
         adopted_at: special.adopted_at,
         release_after: special.release_after,
         woken_by: st
