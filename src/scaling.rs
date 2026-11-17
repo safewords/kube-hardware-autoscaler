@@ -70,6 +70,9 @@ pub struct Member {
     /// Pods that block powering the node off.
     pub blocking_pods: Vec<String>,
     pub drain_failed_at: Option<DateTime<Utc>>,
+    /// When a scale-down last found someone logged in, and who
+    /// (`lifecycle.keepOnWhileLoggedIn`).
+    pub logged_in: Option<(DateTime<Utc>, Vec<String>)>,
     /// Whether the machine can sleep in S3 (see `scaleUp.preferS3Capable`).
     pub s3_capable: bool,
     /// Extended resources (e.g. `gpu.intel.com/i915`) the machine had before
@@ -157,6 +160,10 @@ pub struct PlannedDecision {
 
 /// Taints that result from the node being powered off or cordoned by us, and
 /// therefore say nothing about whether a pod could run there once it is on.
+/// How long a machine someone was found logged in to is kept before a
+/// scale-down checks it again (`lifecycle.keepOnWhileLoggedIn`).
+pub const LOGIN_RECHECK_SECS: i64 = 300;
+
 const TRANSIENT_TAINTS: &[&str] = &[
     "node.kubernetes.io/unschedulable",
     "node.kubernetes.io/not-ready",
@@ -529,6 +536,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     candidates.sort_by(|a, b| power_on_order(spec, b, a));
     let threshold = spec.scale_down.utilization_threshold_percent as f64;
     let backoff = Duration::seconds(spec.scale_down.drain_failure_backoff_seconds as i64);
+    let login_recheck = Duration::seconds(LOGIN_RECHECK_SECS);
     let unneeded_for = Duration::seconds(spec.scale_down.unneeded_seconds as i64);
     let util = |m: &Member| m.allocatable.utilization_percent(&m.counted);
     // Per online candidate: why it is not (yet) eligible to power off, in both renderings.
@@ -541,6 +549,19 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             Note::same(note)
         } else if !m.blocking_pods.is_empty() {
             Note::same(format!("busy: blocked by {}", m.blocking_pods.join(", ")))
+        } else if let Some((t, who)) = m.logged_in.as_ref().filter(|(t, _)| s.now - *t < login_recheck) {
+            Note {
+                stable: format!(
+                    "busy: logged in: {}; recheck after {}",
+                    who.join(", "),
+                    hhmmss(*t + login_recheck)
+                ),
+                live: format!(
+                    "busy: logged in: {}; recheck in {}s",
+                    who.join(", "),
+                    (*t + login_recheck - s.now).num_seconds()
+                ),
+            }
         } else if let Some(t) = m.drain_failed_at.filter(|t| s.now - *t < backoff) {
             Note {
                 stable: format!("drain failed; retry after {}", hhmmss(t + backoff)),
@@ -1126,6 +1147,7 @@ mod tests {
             movable_pods: vec![],
             blocking_pods: vec![],
             drain_failed_at: None,
+            logged_in: None,
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,
@@ -1765,6 +1787,38 @@ mod tests {
     }
 
     #[test]
+    fn keeps_a_machine_someone_is_logged_in_to_until_the_recheck() {
+        let now = Utc::now();
+        let spec = spec();
+        let mut b = member("b", MemberState::Online, 0);
+        b.logged_in = Some((now - Duration::seconds(60), vec!["alice on pts/0 from 10.0.0.5".into()]));
+        let s = PoolSnapshot {
+            unneeded_since: BTreeMap::from([("b".to_string(), now - Duration::seconds(700))]),
+            ..snapshot(
+                &spec,
+                vec![member("a", MemberState::Online, 1000), b.clone()],
+                vec![],
+                now,
+            )
+        };
+        let p = plan(&s);
+        assert!(p.power_off.is_empty());
+        assert!(!p.unneeded_since.contains_key("b"), "the unneeded timer starts over");
+        assert!(
+            p.details.iter().any(|d| d.contains("logged in: alice on pts/0")),
+            "{:?}",
+            p.details
+        );
+
+        // Past the recheck it is unneeded again, and the timer starts afresh.
+        b.logged_in = Some((now - Duration::seconds(LOGIN_RECHECK_SECS + 1), b.logged_in.unwrap().1));
+        let s = snapshot(&spec, vec![member("a", MemberState::Online, 1000), b], vec![], now);
+        let p = plan(&s);
+        assert!(p.power_off.is_empty());
+        assert!(p.unneeded_since.contains_key("b"));
+    }
+
+    #[test]
     fn does_not_scale_down_when_pods_would_not_fit() {
         let now = Utc::now();
         let spec = spec();
@@ -1999,6 +2053,7 @@ mod dedicated_pool_tests {
             movable_pods: vec![],
             blocking_pods: vec![],
             drain_failed_at: None,
+            logged_in: None,
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,
@@ -2185,6 +2240,7 @@ mod overlapping_pool_tests {
             movable_pods: vec![],
             blocking_pods: vec![],
             drain_failed_at: None,
+            logged_in: None,
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,
@@ -2418,6 +2474,7 @@ mod boot_and_manual_tests {
             movable_pods: vec![],
             blocking_pods: vec![],
             drain_failed_at: None,
+            logged_in: None,
             s3_capable: false,
             registering: BTreeMap::new(),
             woken_by: None,

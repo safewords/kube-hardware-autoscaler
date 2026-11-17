@@ -308,6 +308,7 @@ fn build_member(
         movable_pods,
         blocking_pods,
         drain_failed_at: st.drain_failed_at,
+        logged_in: st.login_sessions.as_ref().map(|l| (l.checked_at, l.sessions.clone())),
         s3_capable: s3_capable(&st, Utc::now()),
         registering,
     })

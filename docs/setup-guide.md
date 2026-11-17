@@ -182,6 +182,7 @@ spec:
     shutdownTimeoutSeconds: 300
     forceAfterDrainTimeout: false
     powerOffMode: Shutdown   # Shutdown | Standby | Auto (S3 sleep where available, see below)
+    keepOnWhileLoggedIn: false  # true: never scale it down while someone is logged in (see below)
 ```
 
 More examples: [`examples/`](../examples) (IPMI, Redfish, PiKVM, JetKVM, Wake-on-LAN,
@@ -262,6 +263,41 @@ Check that `systemctl suspend` works on the machine, and that it wakes up from t
 interface, before enabling this. A machine that wakes up the moment it is suspended usually
 has a PCIe port or USB controller allowed to wake it. `/proc/acpi/wakeup` lists them, and
 writing an entry's name to that file toggles it. Leave the entry above the NIC enabled.
+
+### Keeping a machine on while someone is logged in
+
+With `lifecycle.keepOnWhileLoggedIn: true`, a scale-down never powers off or suspends a
+machine while someone is logged in to it, at its console or over SSH. That covers anyone
+debugging the machine, or a job running in an interactive shell that the pool can't see.
+
+```yaml
+spec:
+  lifecycle:
+    keepOnWhileLoggedIn: true
+```
+
+- **How it checks:** a small unprivileged pod on the node reads systemd-logind's session
+  files (`/run/systemd/sessions`) through a read-only mount. It counts user sessions that
+  are open: `CLASS=user*` with `STATE` `active`, `online` or `opening`. It does not count
+  the per-user `systemd --user` manager, greeters, `background` sessions such as cron, or
+  `closing` sessions. A closing session is one whose user logged out while processes
+  linger, such as a detached tmux.
+- **When it checks:** just before the Node is cordoned, so a logged-in machine's pods are
+  never evicted. It checks again just before the power-off, which also covers someone
+  logging in during the drain.
+- **If someone is logged in:**
+  - The scale-down is called off and the Node is uncordoned.
+  - A `LoggedIn` event names the sessions (`alice on pts/0 from 10.0.0.5`), and
+    `status.loginSessions` records them.
+  - The pools keep the machine, with the reason `busy: logged in: ...; recheck after ...`.
+  - After 5 minutes the machine is a scale-down candidate again. Its unneeded timer
+    starts over, so the next check comes `unneededSeconds` later.
+- **If the check can't run** (no systemd-logind on the host, or the pod fails), that also
+  keeps the machine on, with the error as the session. A host without systemd-logind
+  should not set this option.
+- **What it doesn't cover:** only scale-downs with `powerPolicy: Auto` are checked.
+  `powerPolicy: AlwaysOff` is a person's explicit choice, so it isn't checked, and neither
+  is powering off a machine whose Node never became Ready.
 
 ### Multiple interfaces and fallback
 

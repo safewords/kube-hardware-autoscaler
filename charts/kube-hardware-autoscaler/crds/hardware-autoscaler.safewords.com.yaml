@@ -62,6 +62,7 @@
                     "default": {
                       "drainTimeoutSeconds": 300,
                       "forceAfterDrainTimeout": false,
+                      "keepOnWhileLoggedIn": false,
                       "powerOffMode": "Shutdown",
                       "shutdownTimeoutSeconds": 300
                     },
@@ -84,6 +85,11 @@
                       "forceAfterDrainTimeout": {
                         "default": false,
                         "description": "Power off anyway when the drain times out. When false (default) the\nscale-down is aborted and the node is uncordoned.",
+                        "type": "boolean"
+                      },
+                      "keepOnWhileLoggedIn": {
+                        "default": false,
+                        "description": "Never let a scale-down power off or suspend the machine while someone\nis logged in to it (a console or SSH login, as systemd-logind records\nit in `/run/systemd/sessions`). Checked by a small unprivileged pod on\nthe node just before the Node is cordoned, and again just before the\npower-off. A login calls the scale-down off, records the sessions in\n`status.loginSessions`, and the pools keep the machine for 5 minutes\nbefore trying again. A check that cannot run also keeps it on.\n`powerPolicy: AlwaysOff` and boot-failure power-offs are not checked.",
                         "type": "boolean"
                       },
                       "powerOffMode": {
@@ -350,6 +356,28 @@
                       "action",
                       "succeeded",
                       "time"
+                    ],
+                    "type": "object"
+                  },
+                  "loginSessions": {
+                    "description": "Who was logged in when a scale-down last found the machine in use\n(`lifecycle.keepOnWhileLoggedIn`). Cleared when a check finds nobody.",
+                    "nullable": true,
+                    "properties": {
+                      "checkedAt": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "sessions": {
+                        "description": "One entry per session, e.g. `alice on pts/0 from 10.0.0.5`, or why the\ncheck could not tell.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "checkedAt",
+                      "sessions"
                     ],
                     "type": "object"
                   },

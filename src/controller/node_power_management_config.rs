@@ -39,12 +39,12 @@ use super::{
 };
 use crate::crd::{
     BootFailure, COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
-    ManualPowerChange, ManualPowerOnPolicy, NodePowerManagementConfig, NodePowerManagementConfigStatus,
+    LoginSessions, ManualPowerChange, ManualPowerOnPolicy, NodePowerManagementConfig, NodePowerManagementConfigStatus,
     NodeScalingPool, Phase, PowerActionRecord, PowerOffMode, PowerOnFailurePolicy, PowerPolicy, PowerState,
     PowerTarget, ScalingDecision, SleepSupport, effective_boot_timeout, effective_manual_power_on_policy,
     effective_power_on_failure,
 };
-use crate::drivers::inband::{self, HostCommand, Probe};
+use crate::drivers::inband::{self, HostCommand, Probe, SessionProbe};
 use crate::drivers::{Outcome, PowerChain};
 use crate::identity::IdentityCheck;
 use crate::membership::{self, Membership};
@@ -64,6 +64,17 @@ const STANDBY_BACKOFF_SECS: i64 = 24 * 3600;
 /// How long a drained machine waits for its sleep probe before shutting down
 /// (`powerOffMode: Auto`).
 const PROBE_WAIT_SECS: i64 = 60;
+
+/// Outcome of the login check before a scale-down powers a machine off.
+#[derive(Debug, PartialEq, Eq)]
+enum LoginCheck {
+    /// Still checking.
+    Pending,
+    /// Nobody is logged in, or the check does not apply.
+    Clear,
+    /// Someone is logged in, or the check could not tell: keep it on.
+    InUse(Vec<String>),
+}
 
 /// The state to drive towards. With `Auto`, only a decision from a pool the
 /// machine currently belongs to counts (stale decisions are cleared earlier).
@@ -646,9 +657,20 @@ impl Reconciler<'_> {
                 Ok(FAST)
             }
             Phase::Draining => self.drain().await,
-            _ => match &self.node {
+            _ => match self.node.clone() {
                 Some(node) => {
-                    cordon(&self.ctx.client, node).await?;
+                    match self.login_check().await {
+                        LoginCheck::Pending => {
+                            self.st.message = Some("checking whether anyone is logged in".into());
+                            return Ok(Duration::from_secs(2));
+                        }
+                        LoginCheck::InUse(sessions) => {
+                            self.keep_on_for_login(&sessions).await?;
+                            return Ok(NORMAL);
+                        }
+                        LoginCheck::Clear => {}
+                    }
+                    cordon(&self.ctx.client, &node).await?;
                     self.ctx
                         .event(
                             self.mn,
@@ -673,6 +695,64 @@ impl Reconciler<'_> {
                 }
             },
         }
+    }
+
+    /// With `lifecycle.keepOnWhileLoggedIn`, whether anyone is logged in to
+    /// the machine. Applies only to a scale-down (`powerPolicy: Auto`) of a
+    /// machine whose Node is Ready: a check pod cannot run anywhere else.
+    async fn login_check(&mut self) -> LoginCheck {
+        if !self.mn.spec.lifecycle.keep_on_while_logged_in
+            || self.mn.spec.power_policy != PowerPolicy::Auto
+            || !self.st.node_ready
+        {
+            return LoginCheck::Clear;
+        }
+        let d = &self.ctx.drivers;
+        let sessions =
+            match inband::probe_sessions(&d.client, &d.namespace, &self.mn.spec.node_name, &d.shutdown_image).await {
+                Ok(SessionProbe::Pending) => return LoginCheck::Pending,
+                Ok(SessionProbe::Done(sessions)) => sessions,
+                Ok(SessionProbe::Failed(e)) => vec![format!("cannot tell whether anyone is logged in: {e}")],
+                Err(e) => vec![format!("cannot tell whether anyone is logged in: {e}")],
+            };
+        if sessions.is_empty() {
+            self.st.login_sessions = None;
+            return LoginCheck::Clear;
+        }
+        self.st.login_sessions = Some(LoginSessions {
+            checked_at: self.now,
+            sessions: sessions.clone(),
+        });
+        LoginCheck::InUse(sessions)
+    }
+
+    /// Calls the scale-down off because someone is logged in. The pools see
+    /// `status.loginSessions` and keep the machine for a while.
+    async fn keep_on_for_login(&mut self, sessions: &[String]) -> Result<(), Error> {
+        let who = sessions.join(", ");
+        let note = format!("not powering off: logged in: {who}");
+        info!(nodepowermanagementconfig = %self.mn.name_any(), sessions = %who, "scale down called off: logged in");
+        self.ctx
+            .event(self.mn, EventType::Normal, "LoggedIn", note.clone())
+            .await;
+        self.st.message = Some(note);
+        self.st.scaling_decision = Some(ScalingDecision {
+            pool: self
+                .st
+                .scaling_decision
+                .as_ref()
+                .map(|d| d.pool.clone())
+                .or_else(|| self.st.pools.first().cloned())
+                .unwrap_or_default(),
+            target: PowerTarget::On,
+            reason: format!("scale down aborted: logged in: {who}"),
+            time: self.now,
+        });
+        if let Some(node) = &self.node {
+            uncordon_if_ours(&self.ctx.client, node).await?;
+        }
+        self.set_phase(Phase::On);
+        Ok(())
     }
 
     async fn power_off(&mut self) {
@@ -723,6 +803,17 @@ impl Reconciler<'_> {
                 self.st.message = Some("checking whether the machine can sleep in S3".into());
                 return Ok(Duration::from_secs(2));
             }
+            match self.login_check().await {
+                LoginCheck::Pending => {
+                    self.st.message = Some("checking whether anyone is logged in".into());
+                    return Ok(Duration::from_secs(2));
+                }
+                LoginCheck::InUse(sessions) => {
+                    self.keep_on_for_login(&sessions).await?;
+                    return Ok(NORMAL);
+                }
+                LoginCheck::Clear => {}
+            }
             self.st.message = None;
             self.power_off().await;
             return Ok(FAST);
@@ -744,6 +835,14 @@ impl Reconciler<'_> {
         }
 
         if self.mn.spec.lifecycle.force_after_drain_timeout {
+            match self.login_check().await {
+                LoginCheck::Pending => return Ok(Duration::from_secs(2)),
+                LoginCheck::InUse(sessions) => {
+                    self.keep_on_for_login(&sessions).await?;
+                    return Ok(NORMAL);
+                }
+                LoginCheck::Clear => {}
+            }
             self.st.message = Some(format!("drain timed out ({summary}); powering off anyway"));
             self.ctx
                 .event(

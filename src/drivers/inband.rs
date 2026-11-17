@@ -4,13 +4,17 @@
 //! Used by the `wakeOnLan` driver to power off, and by the controller to put
 //! machines into standby (`lifecycle.powerOffMode: Standby`/`Auto`), which no
 //! management interface can do out-of-band. A separate unprivileged probe pod
-//! reads `/sys/power/mem_sleep` to find out whether the host can sleep in S3.
+//! reads `/sys/power/mem_sleep` to find out whether the host can sleep in S3,
+//! and another reads `/run/systemd/sessions` to find out whether anyone is
+//! logged in (`lifecycle.keepOnWhileLoggedIn`).
 //!
 //! The pod carries the node's boot id and refuses to act if the host has
 //! rebooted since, so a stale pod can never shut down a freshly booted host.
 //! A suspend is additionally refused after a short deadline: suspending
 //! does not change the boot id, so a pod that only starts after the machine
 //! has been woken again must not put it straight back to sleep.
+
+use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::api::{DeleteParams, PostParams};
@@ -182,6 +186,149 @@ pub async fn probe_sleep(client: &Client, namespace: &str, node_name: &str, imag
     Ok(result)
 }
 
+/// Progress of a login session check.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionProbe {
+    /// The check pod was started or is still running.
+    Pending,
+    /// Who is logged in (empty: nobody), one entry per session.
+    Done(Vec<String>),
+    Failed(String),
+}
+
+fn sessions_pod_name(node_name: &str) -> String {
+    let mut name = format!("kha-sessions-{}", node_name.replace('.', "-"));
+    name.truncate(63);
+    name.trim_end_matches('-').to_string()
+}
+
+/// A check pod older than this is from an earlier check (e.g. before an
+/// operator restart): its answer is stale, so it is replaced.
+const SESSIONS_STALE_SECS: i64 = 120;
+
+/// One line per logind session file, its interesting keys space-separated.
+const SESSIONS_SCRIPT: &str = r#"for f in /host/sessions/*; do
+  [ -f "$f" ] || continue
+  grep -E '^(USER|CLASS|STATE|TYPE|TTY|REMOTE_HOST|SERVICE)=' "$f" | tr '\n' ' ' || true
+  echo
+done > /dev/termination-log"#;
+
+/// Parses the check's output into the sessions that count as someone being
+/// logged in: user sessions (not the per-user manager, greeters or
+/// `background` sessions such as cron) that are not closing. A closing
+/// session is one whose user logged out while processes (a detached tmux,
+/// say) linger.
+pub fn parse_sessions(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let kv: BTreeMap<&str, &str> = line.split_whitespace().filter_map(|t| t.split_once('=')).collect();
+            if kv.is_empty() {
+                return None;
+            }
+            let class = kv.get("CLASS").copied().unwrap_or("user");
+            let state = kv.get("STATE").copied().unwrap_or("active");
+            if !class.starts_with("user") || !matches!(state, "active" | "online" | "opening") {
+                return None;
+            }
+            let mut who = kv.get("USER").copied().unwrap_or("someone").to_string();
+            match (kv.get("TTY"), kv.get("SERVICE")) {
+                (Some(tty), _) => who.push_str(&format!(" on {tty}")),
+                (None, Some(service)) => who.push_str(&format!(" via {service}")),
+                _ => {}
+            }
+            if let Some(host) = kv.get("REMOTE_HOST") {
+                who.push_str(&format!(" from {host}"));
+            }
+            Some(who)
+        })
+        .collect()
+}
+
+/// Reports who is logged in to the node. Call repeatedly: the first call
+/// starts a small unprivileged pod that reads systemd-logind's session files
+/// through a read-only hostPath; a later call collects its result and removes
+/// it. A host without systemd-logind fails the check.
+pub async fn probe_sessions(client: &Client, namespace: &str, node_name: &str, image: &str) -> Result<SessionProbe> {
+    let name = sessions_pod_name(node_name);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let existing = pods.get_opt(&name).await?;
+    let stale = existing
+        .as_ref()
+        .and_then(|p| p.metadata.creation_timestamp.as_ref())
+        .is_some_and(|t| chrono::Utc::now().timestamp() - t.0.as_second() > SESSIONS_STALE_SECS);
+    let pod = match existing {
+        Some(_) if stale => {
+            delete_pod(client, namespace, &name).await?;
+            return Ok(SessionProbe::Pending);
+        }
+        Some(pod) => pod,
+        None => {
+            let pod: Pod = serde_json::from_value(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace,
+                    "labels": {
+                        "app.kubernetes.io/name": "kube-hardware-autoscaler",
+                        "app.kubernetes.io/component": "session-check",
+                        "hardware-autoscaler.safewords.com/node": node_name,
+                    },
+                },
+                "spec": {
+                    "nodeName": node_name,
+                    "restartPolicy": "Never",
+                    "activeDeadlineSeconds": 60,
+                    "terminationGracePeriodSeconds": 0,
+                    "automountServiceAccountToken": false,
+                    "priorityClassName": "system-node-critical",
+                    "tolerations": [{"operator": "Exists"}],
+                    "volumes": [{"name": "sessions", "hostPath": {"path": "/run/systemd/sessions", "type": "Directory"}}],
+                    "containers": [{
+                        "name": "check",
+                        "image": image,
+                        "command": ["sh", "-c", SESSIONS_SCRIPT],
+                        "volumeMounts": [{"name": "sessions", "mountPath": "/host/sessions", "readOnly": true}],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "readOnlyRootFilesystem": true,
+                            "runAsNonRoot": true,
+                            "runAsUser": 65532,
+                            "runAsGroup": 65532,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "32Mi"}},
+                    }],
+                },
+            }))
+            .map_err(|e| DriverError::Interface(format!("building session check pod: {e}")))?;
+            pods.create(&PostParams::default(), &pod).await?;
+            return Ok(SessionProbe::Pending);
+        }
+    };
+    let status = pod.status.unwrap_or_default();
+    let terminated = status
+        .container_statuses
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|c| c.state.and_then(|s| s.terminated));
+    let result = match (terminated, status.phase.as_deref()) {
+        (Some(t), _) if t.exit_code == 0 => {
+            SessionProbe::Done(parse_sessions(t.message.as_deref().unwrap_or_default()))
+        }
+        (Some(t), _) => SessionProbe::Failed(format!("session check exited with {}", t.exit_code)),
+        (None, Some("Failed")) => SessionProbe::Failed(
+            status
+                .message
+                .unwrap_or_else(|| "session check pod failed (no /run/systemd/sessions on the host?)".into()),
+        ),
+        (None, _) => return Ok(SessionProbe::Pending),
+    };
+    delete_pod(client, namespace, &name).await?;
+    Ok(result)
+}
+
 /// Replaces any earlier host command pod of the node with one running `cmd`.
 pub async fn run(client: &Client, namespace: &str, node_name: &str, image: &str, cmd: HostCommand) -> Result<()> {
     let nodes: Api<Node> = Api::all(client.clone());
@@ -257,6 +404,28 @@ mod tests {
         assert!(offers_s3("[s2idle] deep"));
         assert!(!offers_s3("[s2idle]"));
         assert!(!offers_s3(""));
+    }
+
+    #[test]
+    fn counts_only_open_user_sessions() {
+        let out = "\
+USER=alice CLASS=user STATE=active TYPE=tty TTY=pts/0 REMOTE_HOST=10.0.0.5 SERVICE=sshd \n\
+USER=root CLASS=user STATE=online TYPE=tty TTY=tty1 SERVICE=login \n\
+USER=bob CLASS=user STATE=active TYPE=unspecified SERVICE=sshd REMOTE_HOST=10.0.0.6 \n\
+USER=alice CLASS=manager STATE=active TYPE=unspecified SERVICE=systemd-user \n\
+USER=carol CLASS=user STATE=closing TYPE=tty TTY=pts/1 SERVICE=sshd \n\
+USER=root CLASS=background STATE=active TYPE=unspecified SERVICE=crond \n\
+USER=gdm CLASS=greeter STATE=online TYPE=wayland SERVICE=gdm-launch-environment \n\
+\n";
+        assert_eq!(
+            parse_sessions(out),
+            vec![
+                "alice on pts/0 from 10.0.0.5".to_string(),
+                "root on tty1".into(),
+                "bob via sshd from 10.0.0.6".into(),
+            ]
+        );
+        assert!(parse_sessions("").is_empty());
     }
 
     #[test]

@@ -62,6 +62,8 @@ spec:
   suspended to RAM and woken in seconds. `powerOffMode: Auto` uses S3 sleep on machines
   whose kernel offers it and shuts the others down. Either mode falls back to shutdown
   when sleeping fails.
+- **Logged-in users:** with `keepOnWhileLoggedIn`, a machine is never scaled down while
+  someone has a console or SSH session open on it, as systemd-logind reports.
 - **Demand-driven scaling:** unschedulable pods are bin-packed onto powered-off machines,
   checking resources, node selectors, node affinity and taints. Idle machines are drained
   through the eviction API, which respects PDBs. `safe-to-evict` annotations are honoured.
@@ -102,7 +104,7 @@ and `main`:
 - **Platform:** linux/amd64 only.
 - **Size:** about 16 MB compressed. The earlier distroless/Debian image was about 20 MB.
 - **Uses:** the same image runs the operator, the Wake-on-LAN relay pods, and, by default,
-  the in-band shutdown, suspend and sleep-probe pods.
+  the in-band shutdown, suspend, sleep-probe and login-check pods.
 - **Building locally:** `sh hack/build-image.sh`.
 
 The **[setup guide](docs/setup-guide.md)** covers:

@@ -339,6 +339,16 @@ pub struct LifecycleSpec {
     /// is the pool's `powerOnFailurePolicy`, not another cold boot.
     #[serde(default)]
     pub power_off_mode: PowerOffMode,
+    /// Never let a scale-down power off or suspend the machine while someone
+    /// is logged in to it (a console or SSH login, as systemd-logind records
+    /// it in `/run/systemd/sessions`). Checked by a small unprivileged pod on
+    /// the node just before the Node is cordoned, and again just before the
+    /// power-off. A login calls the scale-down off, records the sessions in
+    /// `status.loginSessions`, and the pools keep the machine for 5 minutes
+    /// before trying again. A check that cannot run also keeps it on.
+    /// `powerPolicy: AlwaysOff` and boot-failure power-offs are not checked.
+    #[serde(default)]
+    pub keep_on_while_logged_in: bool,
 }
 
 /// How a machine is taken offline.
@@ -370,6 +380,7 @@ impl Default for LifecycleSpec {
             shutdown_timeout_seconds: default_shutdown_timeout(),
             force_after_drain_timeout: false,
             power_off_mode: PowerOffMode::default(),
+            keep_on_while_logged_in: false,
         }
     }
 }
@@ -522,6 +533,10 @@ pub struct NodePowerManagementConfigStatus {
     /// its current boot (`powerOffMode: Auto`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleep_support: Option<SleepSupport>,
+    /// Who was logged in when a scale-down last found the machine in use
+    /// (`lifecycle.keepOnWhileLoggedIn`). Cleared when a check finds nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_sessions: Option<LoginSessions>,
     /// Set when the machine was seen powered on outside the autoscaler
     /// (powered off or in standby before, on now, and no PowerOn of ours).
     /// Cleared when it is next seen off. Clear it by hand to put a `LeaveOn`
@@ -582,6 +597,16 @@ pub struct BootFailure {
     /// powered off.
     #[serde(default)]
     pub left_on: bool,
+}
+
+/// Login sessions found on a machine that was about to be powered off.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginSessions {
+    pub checked_at: DateTime<Utc>,
+    /// One entry per session, e.g. `alice on pts/0 from 10.0.0.5`, or why the
+    /// check could not tell.
+    pub sessions: Vec<String>,
 }
 
 /// Result of a sleep capability probe.
