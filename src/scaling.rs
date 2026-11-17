@@ -89,6 +89,9 @@ pub struct Member {
     pub adopted_at: Option<DateTime<Utc>>,
     /// Powered on by hand under `PowerOff`: powered off once this has passed.
     pub release_after: Option<DateTime<Utc>>,
+    /// Outside its `activeHours`, and why: powered off as soon as it is idle,
+    /// without waiting out `unneededSeconds`.
+    pub outside_active_hours: Option<String>,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -572,7 +575,9 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         } else {
             let since = s.unneeded_since.get(&m.name).copied().unwrap_or(s.now);
             plan.unneeded_since.insert(m.name.clone(), since);
-            if s.now - since >= unneeded_for {
+            if let Some(why) = &m.outside_active_hours {
+                Note::same(format!("unneeded since {}; {why}", hhmmss(since)))
+            } else if s.now - since >= unneeded_for {
                 Note::same(format!("unneeded since {}", hhmmss(since)))
             } else {
                 Note {
@@ -635,7 +640,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             let expired = plan
                 .unneeded_since
                 .get(&m.name)
-                .is_some_and(|t| s.now - *t >= unneeded_for);
+                .is_some_and(|t| m.outside_active_hours.is_some() || s.now - *t >= unneeded_for);
             (over_max > 0 && m.blocking_pods.is_empty()) || expired || released(m)
         })
         .collect();
@@ -1154,6 +1159,7 @@ mod tests {
             note: None,
             adopted_at: None,
             release_after: None,
+            outside_active_hours: None,
         }
     }
 
@@ -1819,6 +1825,34 @@ mod tests {
     }
 
     #[test]
+    fn outside_active_hours_an_idle_machine_goes_at_once_and_a_busy_one_stays() {
+        let now = Utc::now();
+        let spec = spec();
+        let why = "outside active hours (08:00-22:00 UTC)".to_string();
+        let mut b = member("b", MemberState::Online, 0);
+        b.outside_active_hours = Some(why.clone());
+        // Idle: powered off without waiting out unneededSeconds.
+        let s = snapshot(
+            &spec,
+            vec![member("a", MemberState::Online, 1000), b.clone()],
+            vec![],
+            now,
+        );
+        let p = plan(&s);
+        assert_eq!(p.power_off.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert!(p.details.iter().any(|d| d.contains(&why)), "{:?}", p.details);
+        // Busy: its work finishes first.
+        let mut busy = b.clone();
+        busy.counted.cpu_millis = 2000;
+        let s = snapshot(&spec, vec![member("a", MemberState::Online, 1000), busy], vec![], now);
+        assert!(plan(&s).power_off.is_empty());
+        // Someone logged in: kept, as at any hour.
+        b.logged_in = Some((now - Duration::seconds(60), vec!["alice on pts/0".into()]));
+        let s = snapshot(&spec, vec![member("a", MemberState::Online, 1000), b], vec![], now);
+        assert!(plan(&s).power_off.is_empty());
+    }
+
+    #[test]
     fn does_not_scale_down_when_pods_would_not_fit() {
         let now = Utc::now();
         let spec = spec();
@@ -2063,6 +2097,7 @@ mod dedicated_pool_tests {
             note: None,
             adopted_at: None,
             release_after: None,
+            outside_active_hours: None,
         }
     }
 
@@ -2250,6 +2285,7 @@ mod overlapping_pool_tests {
             note: None,
             adopted_at: None,
             release_after: None,
+            outside_active_hours: None,
         }
     }
 
@@ -2484,6 +2520,7 @@ mod boot_and_manual_tests {
             note: None,
             adopted_at: None,
             release_after: None,
+            outside_active_hours: None,
         }
     }
 

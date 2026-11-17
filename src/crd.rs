@@ -86,6 +86,59 @@ pub struct NodePowerManagementConfigSpec {
     /// `manualPowerOffCooldownSeconds`; 0 (the default) disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_power_off_cooldown_seconds: Option<u64>,
+
+    /// When the pools may run this machine (e.g. a loud server only in the
+    /// daytime). Outside these hours no pool wakes it, and once it is on and
+    /// idle it is powered off without waiting out `unneededSeconds`. Work
+    /// already running is not interrupted: a machine stays on while it is busy
+    /// by the pools' usual rules (utilization, blocking pods, logins), and a
+    /// machine switched on by hand follows `manualPowerOnPolicy` as always.
+    /// Only `powerPolicy: Auto` is affected. Always active when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_hours: Option<ActiveHours>,
+}
+
+/// The hours a machine may be run by the pools: active whenever any window is.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveHours {
+    /// IANA time zone the windows are in, e.g. `America/Los_Angeles`, so
+    /// they follow daylight saving. UTC when omitted. A name the operator
+    /// does not know makes the machine count as outside its hours (it is not
+    /// woken; a running machine is not forced off), with the error in the
+    /// pools' decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[schemars(length(min = 1))]
+    pub windows: Vec<ActiveWindow>,
+}
+
+/// One daily window, `start` inclusive to `end` exclusive, in local time. An
+/// `end` at or before `start` runs past midnight into the next day (`22:00` to
+/// `06:00`); `00:00` to `24:00` is the whole day.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveWindow {
+    /// The days the window starts on. Every day when omitted or empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<Day>,
+    /// `HH:MM`, 24-hour.
+    #[schemars(regex(pattern = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"))]
+    pub start: String,
+    /// `HH:MM`, 24-hour, or `24:00`.
+    #[schemars(regex(pattern = r"^(([01][0-9]|2[0-3]):[0-5][0-9]|24:00)$"))]
+    pub end: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+pub enum Day {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
 }
 
 /// What the autoscaler does with a machine powered on outside it.

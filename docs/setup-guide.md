@@ -299,6 +299,47 @@ spec:
   `powerPolicy: AlwaysOff` is a person's explicit choice, so it isn't checked, and neither
   is powering off a machine whose Node never became Ready.
 
+### Active hours
+
+`activeHours` limits when the pools may run a machine, for one that is loud, or that
+someone sleeps next to:
+
+```yaml
+spec:
+  activeHours:
+    timeZone: America/Los_Angeles   # IANA name, follows daylight saving; UTC if omitted
+    windows:
+      - start: "08:00"              # every day when `days` is omitted
+        end: "22:00"
+      - days: [Sat, Sun]
+        start: "10:00"
+        end: "24:00"
+```
+
+A window runs from `start` (inclusive) to `end` (exclusive), local time. An `end` at or
+before `start` runs past midnight, and belongs to the day it starts on (`days: [Fri]`,
+`22:00`-`06:00` covers Friday night into Saturday morning). The machine is active
+whenever any window is.
+
+Outside its hours:
+
+- **No pool wakes it.** Its pools show it as `excluded`, with
+  `outside active hours (08:00-22:00 America/Los_Angeles; next opens Wed 08:00 PST)`.
+  Pending pods wake the next machine in the pool's order instead, or wait.
+- **Once on and idle, it is powered off at once**, without waiting out `unneededSeconds`.
+  The pool-wide holds still apply (pending pods, a machine booting,
+  `holdAfterPowerOnSeconds`).
+- **Running work is not interrupted.** A machine that is busy by the pool's usual rules
+  (utilization over the threshold, pods that block a drain, someone logged in with
+  `keepOnWhileLoggedIn`) stays on until it is not. New pods can still be scheduled on
+  it meanwhile; cordon it by hand to stop that.
+- **A machine switched on by hand** follows `manualPowerOnPolicy` as always: with
+  `LeaveOn`, someone can still use it at night.
+
+Only `powerPolicy: Auto` is affected. A time zone the operator does not know, or a
+malformed time, counts as outside: the machine is never woken by a mistake, and a
+running machine is not forced off by one either. The error is in the pools' decisions.
+
 ### Multiple interfaces and fallback
 
 `powerInterfaces` is an ordered list. Each operation (read state, power on,

@@ -77,6 +77,39 @@ pub fn member_state(mn: &NodePowerManagementConfig, pools: &[String]) -> MemberS
     }
 }
 
+/// Applies `activeHours` to a member's state and note: outside its hours a
+/// machine that is off is not woken (`Unavailable`, with the reason), and one
+/// that is on is marked to be powered off as soon as it is idle. Returns the
+/// state, the note and that mark. A machine switched on by hand, or not
+/// `Auto`, is left as it is.
+pub fn apply_active_hours(
+    state: MemberState,
+    note: Option<String>,
+    policy: PowerPolicy,
+    standing: crate::active_hours::Standing,
+) -> (MemberState, Option<String>, Option<String>) {
+    let Some(why) = standing.note() else {
+        return (state, note, None);
+    };
+    if policy != PowerPolicy::Auto {
+        return (state, note, None);
+    }
+    match state {
+        MemberState::Offline => {
+            let note = Some(match note {
+                Some(n) => format!("{n}; {why}"),
+                None => why,
+            });
+            (MemberState::Unavailable, note, None)
+        }
+        // An unreadable activeHours never powers a running machine off.
+        MemberState::Online if matches!(standing, crate::active_hours::Standing::Outside(_)) => {
+            (state, note, Some(why))
+        }
+        _ => (state, note, None),
+    }
+}
+
 /// How boot failures and manual power changes shape a member, for one pool.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Special {
@@ -288,10 +321,17 @@ fn build_member(
 
     let base = member_state(mn, member_of);
     let special = classify(&st, base, manual_policy, &pool.spec, boot_timeout, cooldown, Utc::now());
+    let (state, note, outside_active_hours) = apply_active_hours(
+        special.state.unwrap_or(base),
+        special.note,
+        mn.spec.power_policy,
+        crate::active_hours::standing(mn.spec.active_hours.as_ref(), Utc::now()),
+    );
     Some(Member {
         name: mn.name_any(),
-        state: special.state.unwrap_or(base),
-        note: special.note,
+        state,
+        note,
+        outside_active_hours,
         adopted_at: special.adopted_at,
         release_after: special.release_after,
         woken_by: st
@@ -687,6 +727,7 @@ mod tests {
                 lifecycle: Default::default(),
                 manual_power_on_policy: None,
                 manual_power_off_cooldown_seconds: None,
+                active_hours: None,
             },
         );
         m.status = Some(NodePowerManagementConfigStatus {
@@ -874,6 +915,46 @@ mod tests {
         assert!(other_pools_holding("gpu-node-2", &member_of, "gpu", &pools).is_empty());
         // A machine in one pool only is never held by another.
         assert!(other_pools_holding("gpu-node-2", &["gpu".to_string()], "gpu", &pools).is_empty());
+    }
+
+    #[test]
+    fn active_hours_shape_auto_members_only() {
+        use crate::active_hours::Standing;
+        let out = || Standing::Outside("08:00-22:00 UTC; next opens Wed 08:00 UTC".into());
+        let why = "outside active hours (08:00-22:00 UTC; next opens Wed 08:00 UTC)".to_string();
+        // Off: not woken, with the reason.
+        assert_eq!(
+            apply_active_hours(MemberState::Offline, None, PowerPolicy::Auto, out()),
+            (MemberState::Unavailable, Some(why.clone()), None)
+        );
+        // On: marked to go as soon as it is idle.
+        assert_eq!(
+            apply_active_hours(MemberState::Online, None, PowerPolicy::Auto, out()),
+            (MemberState::Online, None, Some(why.clone()))
+        );
+        // Inside its hours, switched on by hand, or not Auto: untouched.
+        assert_eq!(
+            apply_active_hours(MemberState::Offline, None, PowerPolicy::Auto, Standing::Active),
+            (MemberState::Offline, None, None)
+        );
+        assert_eq!(
+            apply_active_hours(MemberState::Manual, None, PowerPolicy::Auto, out()),
+            (MemberState::Manual, None, None)
+        );
+        assert_eq!(
+            apply_active_hours(MemberState::Online, None, PowerPolicy::AlwaysOn, out()),
+            (MemberState::Online, None, None)
+        );
+        // A mistake never wakes it, and never forces it off.
+        let bad = Standing::Invalid("unknown time zone".into());
+        assert_eq!(
+            apply_active_hours(MemberState::Offline, None, PowerPolicy::Auto, bad.clone()).0,
+            MemberState::Unavailable
+        );
+        assert_eq!(
+            apply_active_hours(MemberState::Online, None, PowerPolicy::Auto, bad),
+            (MemberState::Online, None, None)
+        );
     }
 
     mod special {

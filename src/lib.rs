@@ -4,6 +4,7 @@
 //! Wake-on-LAN) for cluster nodes and powers the machines on and off based on
 //! scheduling demand.
 
+pub mod active_hours;
 pub mod controller;
 pub mod crd;
 pub mod drivers;

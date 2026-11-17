@@ -58,6 +58,61 @@
               "spec": {
                 "description": "A physical (or virtual) machine backing a Kubernetes node whose power state\ncan be controlled out-of-band.",
                 "properties": {
+                  "activeHours": {
+                    "description": "When the pools may run this machine (e.g. a loud server only in the\ndaytime). Outside these hours no pool wakes it, and once it is on and\nidle it is powered off without waiting out `unneededSeconds`. Work\nalready running is not interrupted: a machine stays on while it is busy\nby the pools' usual rules (utilization, blocking pods, logins), and a\nmachine switched on by hand follows `manualPowerOnPolicy` as always.\nOnly `powerPolicy: Auto` is affected. Always active when omitted.",
+                    "nullable": true,
+                    "properties": {
+                      "timeZone": {
+                        "description": "IANA time zone the windows are in, e.g. `America/Los_Angeles`, so\nthey follow daylight saving. UTC when omitted. A name the operator\ndoes not know makes the machine count as outside its hours (it is not\nwoken; a running machine is not forced off), with the error in the\npools' decisions.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "windows": {
+                        "items": {
+                          "description": "One daily window, `start` inclusive to `end` exclusive, in local time. An\n`end` at or before `start` runs past midnight into the next day (`22:00` to\n`06:00`); `00:00` to `24:00` is the whole day.",
+                          "properties": {
+                            "days": {
+                              "description": "The days the window starts on. Every day when omitted or empty.",
+                              "items": {
+                                "enum": [
+                                  "Mon",
+                                  "Tue",
+                                  "Wed",
+                                  "Thu",
+                                  "Fri",
+                                  "Sat",
+                                  "Sun"
+                                ],
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "end": {
+                              "description": "`HH:MM`, 24-hour, or `24:00`.",
+                              "pattern": "^(([01][0-9]|2[0-3]):[0-5][0-9]|24:00)$",
+                              "type": "string"
+                            },
+                            "start": {
+                              "description": "`HH:MM`, 24-hour.",
+                              "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "end",
+                            "start"
+                          ],
+                          "type": "object"
+                        },
+                        "minItems": 1,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "windows"
+                    ],
+                    "type": "object"
+                  },
                   "lifecycle": {
                     "default": {
                       "drainTimeoutSeconds": 300,
