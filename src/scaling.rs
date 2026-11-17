@@ -348,7 +348,7 @@ pub fn is_operator_helper_pod(pod: &Pod) -> bool {
     label("app.kubernetes.io/name") == Some("kube-hardware-autoscaler")
         && matches!(
             label("app.kubernetes.io/component"),
-            Some("sleep-probe" | "shutdown" | "wake-relay")
+            Some("sleep-probe" | "session-check" | "shutdown" | "wake-relay")
         )
 }
 
@@ -1972,13 +1972,16 @@ mod tests {
             )),
             DrainClass::Ignore
         );
-        // The operator's own helper pods (probe, suspend/shutdown, wake relay) never hold up a drain.
-        assert_eq!(
-            drain_class(&mk(serde_json::json!({"metadata": {"name": "kha-probe-x", "labels": {
-                "app.kubernetes.io/name": "kube-hardware-autoscaler",
-                "app.kubernetes.io/component": "sleep-probe"}}}))),
-            DrainClass::Ignore
-        );
+        // The operator's own helper pods (probes, suspend/shutdown, wake relay) never hold up a drain.
+        for component in ["sleep-probe", "session-check", "shutdown", "wake-relay"] {
+            assert_eq!(
+                drain_class(&mk(serde_json::json!({"metadata": {"name": "kha-x", "labels": {
+                    "app.kubernetes.io/name": "kube-hardware-autoscaler",
+                    "app.kubernetes.io/component": component}}}))),
+                DrainClass::Ignore,
+                "{component}"
+            );
+        }
     }
 }
 
