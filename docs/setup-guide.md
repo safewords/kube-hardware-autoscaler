@@ -299,6 +299,13 @@ spec:
   `powerPolicy: AlwaysOff` is a person's explicit choice, so it isn't checked, and neither
   is powering off a machine whose Node never became Ready.
 
+### A machine's own idle timer
+
+`lifecycle.unneededSeconds` replaces its pools' `scaleDown.unneededSeconds` for one
+machine: every pool that selects it waits that long instead of its own. For a machine
+that is back in a minute (shorter), or one that is slow to boot (longer). The pools'
+holds (`holdAfterPowerOnSeconds`, pending pods, a machine booting) still apply.
+
 ### Active hours
 
 `activeHours` limits when the pools may run a machine, for one that is loud, or that
@@ -335,6 +342,9 @@ Outside its hours:
   it meanwhile; cordon it by hand to stop that.
 - **A machine switched on by hand** follows `manualPowerOnPolicy` as always: with
   `LeaveOn`, someone can still use it at night.
+
+With overlapping pools, every pool releases it at once outside its hours, so one pool
+does not hold it for its own `unneededSeconds`.
 
 Only `powerPolicy: Auto` is affected. A time zone the operator does not know, or a
 malformed time, counts as outside: the machine is never woken by a mistake, and a

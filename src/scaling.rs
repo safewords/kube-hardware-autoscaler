@@ -92,6 +92,8 @@ pub struct Member {
     /// Outside its `activeHours`, and why: powered off as soon as it is idle,
     /// without waiting out `unneededSeconds`.
     pub outside_active_hours: Option<String>,
+    /// The machine's own `lifecycle.unneededSeconds`, over the pool's.
+    pub unneeded_seconds: Option<u64>,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -540,7 +542,9 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     let threshold = spec.scale_down.utilization_threshold_percent as f64;
     let backoff = Duration::seconds(spec.scale_down.drain_failure_backoff_seconds as i64);
     let login_recheck = Duration::seconds(LOGIN_RECHECK_SECS);
-    let unneeded_for = Duration::seconds(spec.scale_down.unneeded_seconds as i64);
+    let pool_unneeded = spec.scale_down.unneeded_seconds;
+    // A member's own `lifecycle.unneededSeconds`, else the pool's.
+    let unneeded_for = |m: &Member| Duration::seconds(m.unneeded_seconds.unwrap_or(pool_unneeded) as i64);
     let util = |m: &Member| m.allocatable.utilization_percent(&m.counted);
     // Per online candidate: why it is not (yet) eligible to power off, in both renderings.
     let mut down_notes: BTreeMap<String, Note> = BTreeMap::new();
@@ -577,19 +581,19 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             plan.unneeded_since.insert(m.name.clone(), since);
             if let Some(why) = &m.outside_active_hours {
                 Note::same(format!("unneeded since {}; {why}", hhmmss(since)))
-            } else if s.now - since >= unneeded_for {
+            } else if s.now - since >= unneeded_for(m) {
                 Note::same(format!("unneeded since {}", hhmmss(since)))
             } else {
                 Note {
                     stable: format!(
                         "unneeded since {}, eligible at {}",
                         hhmmss(since),
-                        hhmmss(since + unneeded_for)
+                        hhmmss(since + unneeded_for(m))
                     ),
                     live: format!(
                         "unneeded for {} of {}s",
                         (s.now - since).num_seconds(),
-                        unneeded_for.num_seconds()
+                        unneeded_for(m).num_seconds()
                     ),
                 }
             }
@@ -597,6 +601,10 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         down_notes.insert(m.name.clone(), note);
     }
 
+    // Unneeded long enough to go: its own or the pool's unneededSeconds, or at
+    // once outside its active hours.
+    let expired_for =
+        |m: &Member, since: DateTime<Utc>| m.outside_active_hours.is_some() || s.now - since >= unneeded_for(m);
     let over_max = online_now.saturating_sub(max_online);
     let leaving = s.members.iter().filter(|m| m.state == MemberState::Leaving).count();
     // `holdAfterPowerOnSeconds`: pool-wide, after this pool last powered a
@@ -637,10 +645,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         .iter()
         .copied()
         .filter(|m| {
-            let expired = plan
-                .unneeded_since
-                .get(&m.name)
-                .is_some_and(|t| m.outside_active_hours.is_some() || s.now - *t >= unneeded_for);
+            let expired = plan.unneeded_since.get(&m.name).is_some_and(|t| expired_for(m, *t));
             (over_max > 0 && m.blocking_pods.is_empty()) || expired || released(m)
         })
         .collect();
@@ -726,20 +731,19 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             if all_fit {
                 free = trial;
                 removed.insert(m.name.clone());
-                let expired = plan
-                    .unneeded_since
-                    .get(&m.name)
-                    .is_some_and(|t| s.now - *t >= unneeded_for);
+                let expired = plan.unneeded_since.get(&m.name).is_some_and(|t| expired_for(m, *t));
                 let why = if over_max > 0 {
                     format!("pool above maxOnline ({max_online})")
                 } else if released(m) && !expired {
                     "manually powered on; policy PowerOff, grace over".to_string()
+                } else if let Some(hours) = &m.outside_active_hours {
+                    format!("utilization {:.0}% below {:.0}%; {hours}", util(m), threshold)
                 } else {
                     format!(
                         "utilization {:.0}% below {:.0}% for {}s",
                         util(m),
                         threshold,
-                        unneeded_for.num_seconds()
+                        unneeded_for(m).num_seconds()
                     )
                 };
                 // The machine that would have gone otherwise: the next eligible one.
@@ -771,10 +775,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     // What this pool says to other pools selecting the same machines: which
     // members it would let go now, and why it keeps the others.
     for m in &candidates {
-        let expired = plan
-            .unneeded_since
-            .get(&m.name)
-            .is_some_and(|t| s.now - *t >= unneeded_for);
+        let expired = plan.unneeded_since.get(&m.name).is_some_and(|t| expired_for(m, *t));
         let held = if !expired && !released(m) {
             Some(down_notes[&m.name].stable.clone())
         } else if let Some(r) = &blocked_reason {
@@ -1160,6 +1161,7 @@ mod tests {
             adopted_at: None,
             release_after: None,
             outside_active_hours: None,
+            unneeded_seconds: None,
         }
     }
 
@@ -1853,6 +1855,44 @@ mod tests {
     }
 
     #[test]
+    fn outside_active_hours_an_idle_machine_is_releasable_to_other_pools_at_once() {
+        let now = Utc::now();
+        let spec = spec();
+        let mut b = member("b", MemberState::Online, 0);
+        b.outside_active_hours = Some("outside active hours (08:00-20:00 UTC)".into());
+        let s = snapshot(&spec, vec![member("a", MemberState::Online, 1000), b], vec![], now);
+        let p = plan(&s);
+        assert_eq!(p.releasable, ["b"], "needed: {:?}", p.needed);
+    }
+
+    #[test]
+    fn a_machine_own_unneeded_seconds_overrides_the_pool() {
+        let now = Utc::now();
+        let spec = spec();
+        let pool = spec.scale_down.unneeded_seconds as i64;
+        assert!(pool > 300, "the test needs a pool timer over 300 s");
+        let mut b = member("b", MemberState::Online, 0);
+        b.unneeded_seconds = Some(300);
+        let mut c = member("c", MemberState::Online, 0);
+        c.unneeded_seconds = None;
+        let s = PoolSnapshot {
+            unneeded_since: BTreeMap::from([
+                ("b".to_string(), now - Duration::seconds(301)),
+                ("c".to_string(), now - Duration::seconds(301)),
+            ]),
+            ..snapshot(&spec, vec![member("a", MemberState::Online, 1000), b, c], vec![], now)
+        };
+        let p = plan(&s);
+        assert_eq!(p.releasable, ["b"], "needed: {:?}", p.needed);
+        assert!(
+            p.power_off.iter().any(|(n, r)| n == "b" && r.contains("for 300s")),
+            "{:?}",
+            p.power_off
+        );
+        assert!(!p.power_off.iter().any(|(n, _)| n == "c"));
+    }
+
+    #[test]
     fn does_not_scale_down_when_pods_would_not_fit() {
         let now = Utc::now();
         let spec = spec();
@@ -2098,6 +2138,7 @@ mod dedicated_pool_tests {
             adopted_at: None,
             release_after: None,
             outside_active_hours: None,
+            unneeded_seconds: None,
         }
     }
 
@@ -2286,6 +2327,7 @@ mod overlapping_pool_tests {
             adopted_at: None,
             release_after: None,
             outside_active_hours: None,
+            unneeded_seconds: None,
         }
     }
 
@@ -2521,6 +2563,7 @@ mod boot_and_manual_tests {
             adopted_at: None,
             release_after: None,
             outside_active_hours: None,
+            unneeded_seconds: None,
         }
     }
 

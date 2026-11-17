@@ -370,6 +370,13 @@ pub struct LifecycleSpec {
     /// its pools' `scaleUp.bootTimeoutSeconds`, else 1200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_timeout_seconds: Option<u64>,
+    /// How long this machine must stay continuously unneeded before it is
+    /// powered off, over its pools' `scaleDown.unneededSeconds` (each pool
+    /// that selects it applies this instead of its own). For a machine that
+    /// is cheap to wake again, or expensive to leave idle. The pools'
+    /// `holdAfterPowerOnSeconds` and other holds still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unneeded_seconds: Option<u64>,
     /// Seconds to wait for pods to be evicted before giving up.
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_seconds: u64,
@@ -429,6 +436,7 @@ impl Default for LifecycleSpec {
     fn default() -> Self {
         Self {
             boot_timeout_seconds: None,
+            unneeded_seconds: None,
             drain_timeout_seconds: default_drain_timeout(),
             shutdown_timeout_seconds: default_shutdown_timeout(),
             force_after_drain_timeout: false,

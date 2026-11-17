@@ -332,6 +332,7 @@ fn build_member(
         state,
         note,
         outside_active_hours,
+        unneeded_seconds: mn.spec.lifecycle.unneeded_seconds,
         adopted_at: special.adopted_at,
         release_after: special.release_after,
         woken_by: st

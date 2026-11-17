@@ -163,6 +163,13 @@
                         "format": "uint64",
                         "minimum": 0.0,
                         "type": "integer"
+                      },
+                      "unneededSeconds": {
+                        "description": "How long this machine must stay continuously unneeded before it is\npowered off, over its pools' `scaleDown.unneededSeconds` (each pool\nthat selects it applies this instead of its own). For a machine that\nis cheap to wake again, or expensive to leave idle. The pools'\n`holdAfterPowerOnSeconds` and other holds still apply.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
                       }
                     },
                     "type": "object"
