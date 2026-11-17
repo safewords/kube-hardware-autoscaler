@@ -158,15 +158,22 @@ pub fn classify(
         };
     }
     if base == MemberState::Offline {
+        let in_a_row = st.boot_history.as_ref().map_or(1, |h| h.consecutive_failures.max(1));
+        let backoff = crate::crd::boot_failure_backoff(&spec.scale_up, in_a_row);
         if let Some(f) = st.boot_failure.as_ref().filter(|f| !f.left_on)
-            && now < f.time + secs(spec.scale_up.boot_failure_backoff_seconds)
+            && now < f.time + secs(backoff)
         {
+            let streak = if in_a_row > 1 {
+                format!(" ({in_a_row} failures in a row)")
+            } else {
+                String::new()
+            };
             return Special {
                 state: Some(MemberState::Unavailable),
                 note: Some(format!(
-                    "boot failed at {}; not woken again until {}",
+                    "boot failed at {}{streak}; not woken again until {}",
                     at(f.time),
-                    at(f.time + secs(spec.scale_up.boot_failure_backoff_seconds))
+                    at(f.time + secs(backoff))
                 )),
                 ..Default::default()
             };

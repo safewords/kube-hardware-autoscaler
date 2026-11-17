@@ -1470,6 +1470,8 @@ mod tests {
                 power_on_failure_policy: Default::default(),
                 strategies: vec![],
                 hedge: None,
+                learned_power_on_timeout: None,
+                boot_failure_backoff_max_seconds: None,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -2494,6 +2496,8 @@ mod dedicated_pool_tests {
                 power_on_failure_policy: Default::default(),
                 strategies: vec![],
                 hedge: None,
+                learned_power_on_timeout: None,
+                boot_failure_backoff_max_seconds: None,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,

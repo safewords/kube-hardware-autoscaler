@@ -754,6 +754,8 @@ scaleUp:
   hedge: null                       # {} to wake another machine when a boot is overdue; see "Hedging"
   bootTimeoutSeconds: null          # default for members without lifecycle.bootTimeoutSeconds (1200)
   bootFailureBackoffSeconds: 1800   # see "Boot failures"
+  bootFailureBackoffMaxSeconds: null   # doubles per failure in a row up to this; see "Finding out fast..."
+  learnedPowerOnTimeout: null       # {} to give up a power-on with no sign of life early
 scaleDown:
   enabled: true
   utilizationThresholdPercent: 50
@@ -797,6 +799,36 @@ doesn't come up, or a kubelet that can't join.
   back on, every boot timeout.
 - **Recovery:** if the Node becomes Ready after all, `status.bootFailure` is cleared, a
   `BootRecovered` Event is emitted, and the machine is managed normally again.
+
+### Finding out fast that a machine cannot come up
+
+A machine with only Wake-on-LAN cannot tell "off" from "no power": a magic packet to an
+unplugged machine looks exactly like one to a sleeping one, until nothing happens. Two
+settings keep that from costing every waiting pod the full `powerOnTimeoutSeconds`:
+
+```yaml
+scaleUp:
+  powerOnFailurePolicy: Release
+  powerOnTimeoutSeconds: 300           # the ceiling
+  learnedPowerOnTimeout: {}            # percentOfAverage: 200, minSeconds: 60
+  bootFailureBackoffSeconds: 1800
+  bootFailureBackoffMaxSeconds: 14400  # 30m, 1h, 2h, 4h after failures in a row
+```
+
+- **`learnedPowerOnTimeout`:** every successful boot records, in `status.bootHistory`, how
+  long the machine took to show a **sign of life**: its status interface reading On (a
+  `ping` interface answering, a BMC reporting the power on), or its Node Ready when nothing
+  reads On sooner. A later power-on with no sign of life after `percentOfAverage` of that
+  average (never under `minSeconds`, never over `powerOnTimeoutSeconds`) is released, and
+  the pool wakes the next machine. A machine that answers a ping 40 s after its magic
+  packet is given up on at 80 s instead of 300 s. Until it has booted once, the ceiling
+  applies. Give a Wake-on-LAN machine a `ping` status interface, or the first sign of life
+  is its Node Ready and the timeout learns that instead.
+- **`bootFailureBackoffMaxSeconds`:** each failure in a row doubles the backoff, up to this,
+  so a machine that is unplugged stops being tried every half hour. The pools' decisions
+  say so: `boot failed at 22:31:10Z (3 failures in a row); not woken again until 00:31:10Z`.
+  `status.bootHistory.consecutiveFailures` counts them; any boot that reaches Ready, by the
+  operator or by hand, starts over.
 
 ### Manual power changes
 

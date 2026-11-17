@@ -670,6 +670,10 @@ pub struct NodePowerManagementConfigStatus {
     /// The last checks of the management path (`spec.probe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reachability: Option<Reachability>,
+    /// When the boot in progress first showed a sign of life (see
+    /// `bootHistory`). Cleared when it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_of_life_at: Option<DateTime<Utc>>,
     /// When a forced (hard) power off was issued during the current `PoweringOff` phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_off_at: Option<DateTime<Utc>>,
@@ -717,11 +721,22 @@ pub struct BootHistory {
     /// Mean seconds to Ready of the successful boots listed (for display).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_seconds: Option<u64>,
+    /// Mean seconds to the first sign of life of the successful boots listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_sign_of_life_seconds: Option<u64>,
     /// Successful and failed boots listed (for display).
     #[serde(default)]
     pub succeeded: u32,
     #[serde(default)]
     pub failed: u32,
+    /// Failed boots since the last successful one (for display; see
+    /// `scaleUp.bootFailureBackoffMaxSeconds`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub consecutive_failures: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// One boot in `status.bootHistory`.
@@ -735,6 +750,11 @@ pub struct BootRecord {
     /// Seconds from powering on to Ready (successful boots only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seconds: Option<u64>,
+    /// Seconds from powering on to the first sign of life: the status
+    /// interface reading On (a ping answering, a BMC reporting the power on),
+    /// or the Node Ready if nothing read On before. Successful boots only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_of_life_seconds: Option<u64>,
 }
 
 impl BootHistory {
@@ -751,6 +771,14 @@ impl BootHistory {
         self.succeeded = self.boots.iter().filter(|b| b.succeeded).count() as u32;
         self.failed = self.boots.len() as u32 - self.succeeded;
         self.average_seconds = (!ok.is_empty()).then(|| ok.iter().sum::<u64>() / ok.len() as u64);
+        let life: Vec<u64> = self
+            .boots
+            .iter()
+            .filter(|b| b.succeeded)
+            .filter_map(|b| b.sign_of_life_seconds)
+            .collect();
+        self.average_sign_of_life_seconds = (!life.is_empty()).then(|| life.iter().sum::<u64>() / life.len() as u64);
+        self.consecutive_failures = self.boots.iter().rev().take_while(|b| !b.succeeded).count() as u32;
     }
 }
 
@@ -1051,6 +1079,79 @@ pub struct ScaleUpSpec {
     /// longer than it should. Off when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hedge: Option<HedgeSpec>,
+    /// Give a power-on up as soon as it is clearly not working, judged by
+    /// the machine's own history: once it has booted before, a power-on
+    /// with no sign of life (its status interface still reading Off) after
+    /// `percentOfAverage` of its usual time to one is released by
+    /// `powerOnFailurePolicy: Release`, and the next machine is woken. A
+    /// machine without power, unplugged or tripped, is found out in about a
+    /// minute instead of `powerOnTimeoutSeconds`, which stays the ceiling.
+    /// Off when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_power_on_timeout: Option<LearnedTimeout>,
+    /// Back off longer from a machine that keeps failing to boot: each
+    /// consecutive failure doubles `bootFailureBackoffSeconds`, up to this.
+    /// A boot that reaches Ready starts over. Unset: no doubling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_failure_backoff_max_seconds: Option<u64>,
+}
+
+/// `scaleUp.learnedPowerOnTimeout`.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LearnedTimeout {
+    /// Released after this percentage of the machine's average time to a
+    /// sign of life. Default 200.
+    #[serde(default = "default_learned_percent")]
+    #[schemars(range(min = 100))]
+    pub percent_of_average: u32,
+    /// Never released before this many seconds. Default 60.
+    #[serde(default = "default_learned_min")]
+    pub min_seconds: u64,
+}
+
+fn default_learned_percent() -> u32 {
+    200
+}
+fn default_learned_min() -> u64 {
+    60
+}
+
+impl Default for LearnedTimeout {
+    fn default() -> Self {
+        Self {
+            percent_of_average: default_learned_percent(),
+            min_seconds: default_learned_min(),
+        }
+    }
+}
+
+impl LearnedTimeout {
+    /// The power-on timeout for a machine whose average time to a sign of
+    /// life is `average`, under `ceiling` (`powerOnTimeoutSeconds`).
+    pub fn timeout(&self, average: Option<u64>, ceiling: u64) -> u64 {
+        match average {
+            Some(avg) => (avg * self.percent_of_average as u64)
+                .div_ceil(100)
+                .max(self.min_seconds)
+                .min(ceiling),
+            None => ceiling,
+        }
+    }
+}
+
+/// How long a machine is not woken after failing to boot: the pool's
+/// `bootFailureBackoffSeconds`, doubled for each failure in a row after the
+/// first, up to `bootFailureBackoffMaxSeconds`.
+pub fn boot_failure_backoff(spec: &ScaleUpSpec, consecutive_failures: u32) -> u64 {
+    let base = spec.boot_failure_backoff_seconds;
+    match spec.boot_failure_backoff_max_seconds {
+        Some(max) if consecutive_failures > 1 => {
+            let doublings = (consecutive_failures - 1).min(20);
+            base.saturating_mul(1u64 << doublings).min(max.max(base))
+        }
+        _ => base,
+    }
 }
 
 /// One entry of `scaleUp.strategies`.
@@ -1242,6 +1343,8 @@ impl Default for ScaleUpSpec {
             power_on_failure_policy: PowerOnFailurePolicy::default(),
             strategies: Vec::new(),
             hedge: None,
+            learned_power_on_timeout: None,
+            boot_failure_backoff_max_seconds: None,
         }
     }
 }

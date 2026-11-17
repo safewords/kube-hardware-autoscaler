@@ -160,6 +160,15 @@ pub enum BootEvent {
 /// `boot_timeout_secs`. A new boot after a failure (it was off in between)
 /// can fail again.
 pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, boot_timeout_secs: u64) -> BootEvent {
+    // The first sign of life of a cold boot of ours: the status interface
+    // reading On (or the Node Ready, when nothing reads On before it).
+    if st.phase == Phase::PoweringOn && st.standby_since.is_none() {
+        if st.sign_of_life_at.is_none() && (st.power_state == PowerState::On || st.node_ready) {
+            st.sign_of_life_at = Some(now);
+        }
+    } else if !st.node_ready {
+        st.sign_of_life_at = None;
+    }
     if st.node_ready {
         // A cold boot of ours just finished: `PoweringOn` began with our
         // PowerOn, whatever the interface could read meanwhile (Wake-on-LAN
@@ -168,12 +177,15 @@ pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, 
             && st.standby_since.is_none()
             && let Some(since) = st.phase_since.filter(|t| *t <= now)
         {
+            let life = st.sign_of_life_at.unwrap_or(now).max(since);
             st.boot_history.get_or_insert_default().record(BootRecord {
                 time: now,
                 succeeded: true,
                 seconds: Some((now - since).num_seconds() as u64),
+                sign_of_life_seconds: Some((life - since).num_seconds() as u64),
             });
         }
+        st.sign_of_life_at = None;
         st.powered_on_not_ready_since = None;
         return match st.boot_failure.take() {
             Some(_) => BootEvent::Recovered,
@@ -213,7 +225,9 @@ pub fn record_failed_boot(st: &mut NodePowerManagementConfigStatus, now: DateTim
         time: now,
         succeeded: false,
         seconds: None,
+        sign_of_life_seconds: None,
     });
+    st.sign_of_life_at = None;
 }
 
 /// Where a power-on attempt stands. `Expired` is only reported for `Release`.
@@ -1381,6 +1395,21 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
         &pool_scale_up_ref,
         boot_timeout,
     );
+    // With `learnedPowerOnTimeout` on the pool that woke it, a power-on
+    // showing no sign of life well past the machine's usual time is given up
+    // early (never later than `powerOnTimeoutSeconds`).
+    let power_on_timeout = st
+        .scaling_decision
+        .as_ref()
+        .filter(|d| d.target == PowerTarget::On)
+        .and_then(|d| pool_scale_up_ref.iter().find(|(name, _)| *name == d.pool))
+        .and_then(|(_, spec)| spec.learned_power_on_timeout)
+        .map_or(power_on_timeout, |learned| {
+            learned.timeout(
+                st.boot_history.as_ref().and_then(|h| h.average_sign_of_life_seconds),
+                power_on_timeout,
+            )
+        });
     let change = detect_manual_change(&old, &st, now, boot_timeout, mn.spec.lifecycle.shutdown_timeout_seconds);
     // A machine seen off is under normal management again, whoever turned it off.
     if st.power_state == PowerState::Off && !st.node_ready && change != ManualChange::PoweredOn {
@@ -1643,11 +1672,92 @@ mod tests {
                 time: at(i),
                 succeeded: true,
                 seconds: Some(i as u64 * 10),
+                sign_of_life_seconds: None,
             });
         }
         assert_eq!(h.boots.len(), 10);
         assert_eq!(h.boots[0].seconds, Some(20));
         assert_eq!(h.average_seconds, Some(65));
+    }
+
+    #[test]
+    fn the_first_sign_of_life_is_timed_and_teaches_the_power_on_timeout() {
+        let t0 = Utc::now();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        // Wake-on-LAN sent at 0; the status ping answers at 40; Ready at 90.
+        let mut st = status(Phase::PoweringOn, PowerState::Off, false);
+        st.phase_since = Some(at(0));
+        track_boot(&mut st, at(30), 600);
+        assert!(st.sign_of_life_at.is_none(), "still dark");
+        st.power_state = PowerState::On;
+        track_boot(&mut st, at(40), 600);
+        track_boot(&mut st, at(60), 600);
+        assert_eq!(st.sign_of_life_at, Some(at(40)), "the first reading counts");
+        st.node_ready = true;
+        track_boot(&mut st, at(90), 600);
+        let h = st.boot_history.clone().unwrap();
+        assert_eq!(h.boots[0].sign_of_life_seconds, Some(40));
+        assert_eq!(
+            (h.average_seconds, h.average_sign_of_life_seconds),
+            (Some(90), Some(40))
+        );
+        assert!(st.sign_of_life_at.is_none());
+
+        // 200% of 40s is 80s, inside the 300s ceiling and above the 60s floor.
+        let learned = crate::crd::LearnedTimeout::default();
+        assert_eq!(learned.timeout(Some(40), 300), 80);
+        assert_eq!(learned.timeout(Some(10), 300), 60, "never under minSeconds");
+        assert_eq!(learned.timeout(Some(200), 300), 300, "never over powerOnTimeoutSeconds");
+        assert_eq!(learned.timeout(None, 300), 300, "no history: the ceiling");
+
+        // With no sign of life by then, the power-on expires (and is released).
+        let mut dark = status(Phase::PoweringOn, PowerState::Off, false);
+        dark.scaling_decision = Some(ScalingDecision {
+            pool: "ci".into(),
+            target: PowerTarget::On,
+            reason: String::new(),
+            time: at(0),
+        });
+        assert_eq!(
+            power_on_attempt(&dark, at(79), PowerOnFailurePolicy::Release, 80),
+            PowerOnAttempt::Ongoing
+        );
+        assert_eq!(
+            power_on_attempt(&dark, at(81), PowerOnFailurePolicy::Release, 80),
+            PowerOnAttempt::Expired
+        );
+    }
+
+    #[test]
+    fn failures_in_a_row_back_off_longer() {
+        let mut spec = crate::crd::ScaleUpSpec {
+            boot_failure_backoff_seconds: 1800,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::crd::boot_failure_backoff(&spec, 3),
+            1800,
+            "no doubling unless a maximum is set"
+        );
+        spec.boot_failure_backoff_max_seconds = Some(4 * 3600);
+        assert_eq!(crate::crd::boot_failure_backoff(&spec, 1), 1800);
+        assert_eq!(crate::crd::boot_failure_backoff(&spec, 2), 3600);
+        assert_eq!(crate::crd::boot_failure_backoff(&spec, 3), 7200);
+        assert_eq!(crate::crd::boot_failure_backoff(&spec, 9), 4 * 3600);
+
+        let mut h = crate::crd::BootHistory::default();
+        let rec = |ok: bool| BootRecord {
+            time: Utc::now(),
+            succeeded: ok,
+            seconds: ok.then_some(90),
+            sign_of_life_seconds: ok.then_some(40),
+        };
+        for ok in [true, false, false, false] {
+            h.record(rec(ok));
+        }
+        assert_eq!(h.consecutive_failures, 3);
+        h.record(rec(true));
+        assert_eq!(h.consecutive_failures, 0, "a boot that reaches Ready starts over");
     }
 
     #[test]

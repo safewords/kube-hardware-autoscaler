@@ -84,6 +84,10 @@ spec:
   a machine whose active hours end before it would be Ready).
   With `hedge`, a boot that is taking too long no longer holds the pending pods: the next
   machine is woken.
+- **Knowing when a machine cannot come up:** each machine's time to a first sign of life
+  is learned, and a power-on with none after twice that is given up and the next machine
+  woken: an unplugged Wake-on-LAN machine costs about a minute, not the full power-on
+  timeout. Failures in a row back off longer each time.
 - **Boot failures and manual power changes:** a machine that doesn't boot within its
   timeout releases its pools and, unless a human started it, is powered off and backed
   off. A machine powered on by hand is left alone (`LeaveOn`), adopted, or powered back

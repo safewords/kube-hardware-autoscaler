@@ -385,6 +385,13 @@
                         "nullable": true,
                         "type": "integer"
                       },
+                      "averageSignOfLifeSeconds": {
+                        "description": "Mean seconds to the first sign of life of the successful boots listed.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "boots": {
                         "default": [],
                         "description": "Up to 10 boots, oldest first.",
@@ -393,6 +400,13 @@
                           "properties": {
                             "seconds": {
                               "description": "Seconds from powering on to Ready (successful boots only).",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "signOfLifeSeconds": {
+                              "description": "Seconds from powering on to the first sign of life: the status\ninterface reading On (a ping answering, a BMC reporting the power on),\nor the Node Ready if nothing read On before. Successful boots only.",
                               "format": "uint64",
                               "minimum": 0.0,
                               "nullable": true,
@@ -415,6 +429,12 @@
                           "type": "object"
                         },
                         "type": "array"
+                      },
+                      "consecutiveFailures": {
+                        "description": "Failed boots since the last successful one (for display; see\n`scaleUp.bootFailureBackoffMaxSeconds`).",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
                       },
                       "failed": {
                         "default": 0,
@@ -732,6 +752,12 @@
                     ],
                     "type": "object"
                   },
+                  "signOfLifeAt": {
+                    "description": "When the boot in progress first showed a sign of life (see\n`bootHistory`). Cleared when it ends.",
+                    "format": "date-time",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "sleepSupport": {
                     "description": "Whether the machine can sleep in S3, as found by the sleep probe for\nits current boot (`powerOffMode: Auto`).",
                     "nullable": true,
@@ -1015,6 +1041,13 @@
                       "requireExplicitSelection": false
                     },
                     "properties": {
+                      "bootFailureBackoffMaxSeconds": {
+                        "description": "Back off longer from a machine that keeps failing to boot: each\nconsecutive failure doubles `bootFailureBackoffSeconds`, up to this.\nA boot that reaches Ready starts over. Unset: no doubling.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "bootFailureBackoffSeconds": {
                         "default": 1800,
                         "description": "After a machine fails to boot, do not power it on again for this long.",
@@ -1056,6 +1089,27 @@
                             "description": "Overdue after this many seconds for a machine with no boot history.\nDefault 300.",
                             "format": "uint64",
                             "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "learnedPowerOnTimeout": {
+                        "description": "Give a power-on up as soon as it is clearly not working, judged by\nthe machine's own history: once it has booted before, a power-on\nwith no sign of life (its status interface still reading Off) after\n`percentOfAverage` of its usual time to one is released by\n`powerOnFailurePolicy: Release`, and the next machine is woken. A\nmachine without power, unplugged or tripped, is found out in about a\nminute instead of `powerOnTimeoutSeconds`, which stays the ceiling.\nOff when omitted.",
+                        "nullable": true,
+                        "properties": {
+                          "minSeconds": {
+                            "default": 60,
+                            "description": "Never released before this many seconds. Default 60.",
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "percentOfAverage": {
+                            "default": 200,
+                            "description": "Released after this percentage of the machine's average time to a\nsign of life. Default 200.",
+                            "format": "uint32",
+                            "minimum": 100.0,
                             "type": "integer"
                           }
                         },
