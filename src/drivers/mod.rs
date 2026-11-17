@@ -16,7 +16,7 @@ mod ipmi;
 mod jetkvm;
 mod nanokvm;
 mod pikvm;
-mod ping;
+pub(crate) mod ping;
 mod redfish;
 mod wol;
 

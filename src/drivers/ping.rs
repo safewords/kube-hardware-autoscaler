@@ -120,7 +120,7 @@ fn node_address(node: &k8s_openapi::api::core::v1::Node) -> Option<IpAddr> {
 }
 
 /// Outcome of one TCP connection attempt.
-fn tcp_verdict(result: io::Result<()>) -> Option<bool> {
+pub(crate) fn tcp_verdict(result: io::Result<()>) -> Option<bool> {
     match result {
         Ok(()) => Some(true),
         // Something answered with a RST: the host is up, the port just closed.
@@ -261,7 +261,7 @@ fn is_reply(icmp: &[u8], seq: u16) -> bool {
 }
 
 /// Sends one echo request and waits for the matching reply.
-fn icmp_echo(target: Ipv4Addr, seq: u16, timeout: Duration) -> io::Result<bool> {
+pub(crate) fn icmp_echo(target: Ipv4Addr, seq: u16, timeout: Duration) -> io::Result<bool> {
     let (socket, raw) = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
         Ok(s) => (s, false),
         Err(_) => (Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?, true),

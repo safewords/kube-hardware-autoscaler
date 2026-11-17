@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Duration, Utc};
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, Pod, Taint, Toleration};
 
-use crate::crd::{DecisionAction, NodeScalingPoolSpec, ResourceAmounts, SAFE_TO_EVICT_ANNOTATION};
+use crate::crd::{DecisionAction, NodeScalingPoolSpec, ResourceAmounts, SAFE_TO_EVICT_ANNOTATION, Strategy};
 use crate::resources::pod_requests;
 
 /// Where a member currently is in its power lifecycle, from the autoscaler's
@@ -97,6 +97,28 @@ pub struct Member {
     /// PowerRequests holding the machine on (their labels, `; `-joined): it is
     /// woken if off, and never unneeded while they last.
     pub power_requests: Option<String>,
+    /// What the operator has learned about the machine (boots, probes).
+    pub history: MachineHistory,
+}
+
+/// What the operator has learned about a machine, for `strategy: Scored`
+/// and `hedge`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MachineHistory {
+    /// Mean seconds to Ready of its recent successful boots.
+    pub boot_average_seconds: Option<f64>,
+    pub boots_succeeded: u32,
+    pub boots_failed: u32,
+    /// Whether its management path answered the last probe; `None` when it
+    /// is not probed.
+    pub reachable: Option<bool>,
+    /// Share of its recent probes answered, 0.0 to 1.0.
+    pub answered: Option<f64>,
+    pub rtt_ms: Option<u64>,
+    /// When the boot in progress began (members that are `Booting`).
+    pub booting_since: Option<DateTime<Utc>>,
+    /// This decision's draw for the `Random` strategy, 0.0 to 1.0.
+    pub lottery: f64,
 }
 
 /// A schedulable node outside every scaling pool: somewhere evicted pods can
@@ -392,7 +414,8 @@ pub fn drain_class(pod: &Pod) -> DrainClass {
 }
 
 /// The order in which a pool powers its machines on; scale-down uses the exact
-/// reverse. Total, so the choice never depends on the order members were listed:
+/// reverse. Total, so the choice never depends on the order members were
+/// listed. With `scaleUp.strategies` empty:
 ///
 /// 1. `scaleUp.preferredNodes` weight, highest first (unlisted machines weigh 0);
 /// 2. with `scaleUp.preferS3Capable`, machines that can sleep in S3 first;
@@ -400,15 +423,283 @@ pub fn drain_class(pod: &Pod) -> DrainClass {
 ///    pending pods, and on the way down the smallest goes first, taking the
 ///    least capacity away while the larger ones absorb its pods;
 /// 4. Node name, ascending (descending on the way down).
+///
+/// With strategies, see `Ranking::order`.
 pub fn power_on_order(spec: &NodeScalingPoolSpec, a: &Member, b: &Member) -> std::cmp::Ordering {
-    let key = |m: &Member| {
-        (
-            std::cmp::Reverse(spec.scale_up.node_weight(&m.name)),
-            spec.scale_up.prefer_s3_capable && !m.s3_capable,
-            std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)),
-        )
-    };
-    key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name))
+    Ranking::new(spec, [a, b]).order(a, b)
+}
+
+/// Ranks machines for one decision: the pool's strategies, and what they
+/// rate relative to (the largest candidate, for `Largest`/`Smallest`).
+pub struct Ranking<'a> {
+    spec: &'a NodeScalingPoolSpec,
+    largest: (i64, i64),
+}
+
+/// One strategy's part of a machine's score.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Factor {
+    pub strategy: Strategy,
+    pub weight: u32,
+    /// 0.0 to 1.0.
+    pub rating: f64,
+}
+
+/// A machine's score under `scaleUp.strategies`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Score {
+    /// The weighted mean of the ratings, 0 to 1000 (so it orders totally).
+    pub total: i64,
+    pub factors: Vec<Factor>,
+}
+
+/// Seconds at which a boot rates 0.5 for `FastestBoot`.
+const BOOT_TIME_HALF_SECS: f64 = 120.0;
+
+impl<'a> Ranking<'a> {
+    pub fn new<'m>(spec: &'a NodeScalingPoolSpec, members: impl IntoIterator<Item = &'m Member>) -> Self {
+        let largest = members
+            .into_iter()
+            .map(|m| (m.allocatable.cpu_millis, m.allocatable.memory_bytes))
+            .fold((0, 0), |(c, mem), (mc, mm)| (c.max(mc), mem.max(mm)));
+        Self { spec, largest }
+    }
+
+    fn strategic(&self) -> bool {
+        !self.spec.scale_up.strategies.is_empty()
+    }
+
+    fn uses(&self, strategy: Strategy) -> bool {
+        self.spec.scale_up.strategies.iter().any(|s| s.name == strategy)
+    }
+
+    /// With strategies: with `Reachable` listed, machines whose management
+    /// interface did not answer go last; then the highest score; then size,
+    /// largest first; then name.
+    pub fn order(&self, a: &Member, b: &Member) -> std::cmp::Ordering {
+        let spec = self.spec;
+        if !self.strategic() {
+            let key = |m: &Member| {
+                (
+                    std::cmp::Reverse(spec.scale_up.node_weight(&m.name)),
+                    spec.scale_up.prefer_s3_capable && !m.s3_capable,
+                    std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)),
+                )
+            };
+            return key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name));
+        }
+        let key = |m: &Member| {
+            (
+                self.unreachable(m),
+                std::cmp::Reverse(self.score(m).total),
+                std::cmp::Reverse((m.allocatable.cpu_millis, m.allocatable.memory_bytes)),
+            )
+        };
+        key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name))
+    }
+
+    fn unreachable(&self, m: &Member) -> bool {
+        self.uses(Strategy::Reachable) && m.history.reachable == Some(false)
+    }
+
+    fn size_rating(&self, m: &Member) -> f64 {
+        let (cpu, mem) = self.largest;
+        let frac = |v: i64, max: i64| if max > 0 { v as f64 / max as f64 } else { 1.0 };
+        // CPU decides; memory only separates machines with the same CPU.
+        0.9 * frac(m.allocatable.cpu_millis, cpu) + 0.1 * frac(m.allocatable.memory_bytes, mem)
+    }
+
+    /// How one strategy rates a machine, 0.0 to 1.0.
+    pub fn rate(&self, strategy: Strategy, m: &Member) -> f64 {
+        let h = &m.history;
+        match strategy {
+            Strategy::Priority => self.spec.scale_up.node_weight(&m.name) as f64 / crate::crd::MAX_NODE_WEIGHT as f64,
+            Strategy::Reachable => match h.reachable {
+                None => 0.5,
+                Some(last) => {
+                    let answered = h.answered.unwrap_or(if last { 1.0 } else { 0.0 });
+                    let speed = h.rtt_ms.map_or(1.0, |ms| (1.0 - ms as f64 / 1000.0).max(0.5));
+                    answered * speed
+                }
+            },
+            Strategy::FastestBoot => match h.boot_average_seconds {
+                Some(secs) => BOOT_TIME_HALF_SECS / (BOOT_TIME_HALF_SECS + secs.max(0.0)),
+                None => 0.5,
+            },
+            Strategy::Reliable => {
+                (h.boots_succeeded as f64 + 1.0) / ((h.boots_succeeded + h.boots_failed) as f64 + 2.0)
+            }
+            Strategy::Standby => {
+                if m.s3_capable {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Strategy::Largest => self.size_rating(m),
+            Strategy::Smallest => 1.0 - self.size_rating(m),
+            Strategy::Random => h.lottery.clamp(0.0, 1.0),
+        }
+    }
+
+    /// A machine's score: the weighted mean of its strategies' ratings.
+    pub fn score(&self, m: &Member) -> Score {
+        let factors: Vec<Factor> = self
+            .spec
+            .scale_up
+            .strategies
+            .iter()
+            .map(|s| Factor {
+                strategy: s.name,
+                weight: s.weight,
+                rating: self.rate(s.name, m),
+            })
+            .collect();
+        let weights: u32 = factors.iter().map(|f| f.weight).sum();
+        let total = if weights == 0 {
+            0
+        } else {
+            let sum: f64 = factors.iter().map(|f| f.weight as f64 * f.rating).sum();
+            (sum / weights as f64 * 1000.0).round() as i64
+        };
+        Score { total, factors }
+    }
+
+    /// The traits shown for a machine in the decision log.
+    pub fn traits(&self, m: &Member) -> String {
+        if !self.strategic() {
+            return format!(
+                "weight {}, S3 {}, {}",
+                self.spec.scale_up.node_weight(&m.name),
+                if m.s3_capable { "yes" } else { "no" },
+                size(m)
+            );
+        }
+        format!("score {}, {}, {}", self.score(m).total, learned(m), size(m))
+    }
+
+    /// Compact tags for the candidate list: `w100 s3 16c/64Gi` or `412 boot 95s`.
+    fn tags(&self, m: &Member) -> String {
+        if !self.strategic() {
+            let mut tags = vec![format!("w{}", self.spec.scale_up.node_weight(&m.name))];
+            if m.s3_capable {
+                tags.push("s3".into());
+            }
+            tags.push(size(m));
+            return tags.join(" ");
+        }
+        format!("{} {}", self.score(m).total, size(m))
+    }
+
+    /// The rule that puts `chosen` ahead of `other`: for scale-up
+    /// (`down == false`) `chosen` ranks before `other`; for scale-down it
+    /// ranks after it.
+    pub fn rule(&self, chosen: &Member, other: &Member, down: bool) -> String {
+        if !self.strategic() {
+            return ordered_rule(self.spec, chosen, other, down);
+        }
+        let (uc, uo) = (self.unreachable(chosen), self.unreachable(other));
+        if uc != uo {
+            return if down {
+                "Reachable (its management interface does not answer)".into()
+            } else {
+                format!("Reachable ({}'s management interface does not answer)", other.name)
+            };
+        }
+        let (sc, so) = (self.score(chosen), self.score(other));
+        if sc.total != so.total {
+            // The strategy contributing most to the difference.
+            let decisive = sc
+                .factors
+                .iter()
+                .zip(&so.factors)
+                .map(|(c, o)| (c.strategy, c.weight as f64 * (c.rating - o.rating)))
+                .filter(|(_, d)| *d != 0.0)
+                .max_by(|a, b| {
+                    if down {
+                        (-a.1).total_cmp(&-b.1)
+                    } else {
+                        a.1.total_cmp(&b.1)
+                    }
+                })
+                .map(|(s, _)| s);
+            let why = match decisive {
+                Some(s) => format!(", mostly {:?}: {}", s, self.compare(s, chosen, other)),
+                None => String::new(),
+            };
+            return format!("score ({} vs {}{why})", sc.total, so.total);
+        }
+        let size_key = |m: &Member| (m.allocatable.cpu_millis, m.allocatable.memory_bytes);
+        if size_key(chosen) != size_key(other) {
+            format!("size ({} vs {})", size(chosen), size(other))
+        } else {
+            format!("name ({} {} {})", chosen.name, if down { ">" } else { "<" }, other.name)
+        }
+    }
+
+    /// One strategy's view of two machines, for the decision log.
+    fn compare(&self, s: Strategy, a: &Member, b: &Member) -> String {
+        let (ha, hb) = (&a.history, &b.history);
+        match s {
+            Strategy::Priority => format!(
+                "weight {} vs {}",
+                self.spec.scale_up.node_weight(&a.name),
+                self.spec.scale_up.node_weight(&b.name)
+            ),
+            Strategy::Reachable => format!("mgmt {} vs {}", mgmt(ha), mgmt(hb)),
+            Strategy::FastestBoot => format!(
+                "boot {} vs {}",
+                secs(ha.boot_average_seconds),
+                secs(hb.boot_average_seconds)
+            ),
+            Strategy::Reliable => format!("boots {} vs {}", ok_of(ha), ok_of(hb)),
+            Strategy::Standby => format!(
+                "S3 {} vs {}",
+                if a.s3_capable { "yes" } else { "no" },
+                if b.s3_capable { "yes" } else { "no" }
+            ),
+            Strategy::Largest | Strategy::Smallest => format!("{} vs {}", size(a), size(b)),
+            Strategy::Random => format!("drew {:.2} vs {:.2}", ha.lottery, hb.lottery),
+        }
+    }
+}
+
+fn secs(s: Option<f64>) -> String {
+    s.map_or("unknown".into(), |s| format!("{s:.0}s"))
+}
+
+fn ok_of(h: &MachineHistory) -> String {
+    format!("{}/{} ok", h.boots_succeeded, h.boots_succeeded + h.boots_failed)
+}
+
+fn mgmt(h: &MachineHistory) -> String {
+    match (h.reachable, h.answered, h.rtt_ms) {
+        (None, ..) => "not probed".into(),
+        (Some(_), Some(a), Some(ms)) => format!("{:.0}% answered, {ms}ms", a * 100.0),
+        (Some(_), Some(a), None) => format!("{:.0}% answered", a * 100.0),
+        (Some(r), None, _) => if r { "up" } else { "down" }.into(),
+    }
+}
+
+/// A machine's learned facts, short: `boot 95s, 9/10 ok, bmc 2ms`.
+fn learned(m: &Member) -> String {
+    let h = &m.history;
+    let mut parts = Vec::new();
+    parts.push(match h.boot_average_seconds {
+        Some(s) => format!("boot {s:.0}s"),
+        None => "boot ?".into(),
+    });
+    let boots = h.boots_succeeded + h.boots_failed;
+    if boots > 0 {
+        parts.push(format!("{}/{} ok", h.boots_succeeded, boots));
+    }
+    match (h.reachable, h.rtt_ms) {
+        (Some(true), Some(ms)) => parts.push(format!("mgmt {ms}ms")),
+        (Some(true), None) => parts.push("mgmt up".into()),
+        (Some(false), _) => parts.push("mgmt down".into()),
+        (None, _) => {}
+    }
+    parts.join(", ")
 }
 
 /// Computes the scaling plan for one pool.
@@ -450,19 +741,43 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     pending.sort_by_key(|p| std::cmp::Reverse((p.requests.cpu_millis, p.requests.memory_bytes)));
 
     // Bins: booting members first (capacity already on its way), then members we open.
+    // With `hedge`, a boot taking longer than it should is no longer counted
+    // on: the pods it was for open the next machine. Member -> since when.
+    let overdue: BTreeMap<String, DateTime<Utc>> = match spec.scale_up.hedge {
+        Some(h) => s
+            .members
+            .iter()
+            .filter(|m| m.state == MemberState::Booting)
+            .filter_map(|m| {
+                let since = m.history.booting_since?;
+                let at = since + Duration::seconds(h.overdue_after(m.history.boot_average_seconds));
+                (s.now >= at).then(|| (m.name.clone(), at))
+            })
+            .collect(),
+        None => BTreeMap::new(),
+    };
     let mut bins: Vec<(&Member, ResourceAmounts)> = s
         .members
         .iter()
-        .filter(|m| m.state == MemberState::Booting)
+        .filter(|m| m.state == MemberState::Booting && !overdue.contains_key(&m.name))
         .map(|m| (m, m.allocatable.minus(&m.requested)))
         .collect();
+    let hedging = if overdue.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; hedging: {} overdue",
+            overdue.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    };
     let mut offline: Vec<&Member> = s
         .members
         .iter()
         .filter(|m| m.auto && m.state == MemberState::Offline)
         .collect();
     // Each pod takes the first machine in `power_on_order` it fits on.
-    offline.sort_by(|a, b| power_on_order(spec, a, b));
+    let ranking = Ranking::new(spec, s.members.iter());
+    offline.sort_by(|a, b| ranking.order(a, b));
     let ranked_up: Vec<&Member> = offline.clone();
     let rank_up = |m: &Member| ranked_up.iter().position(|o| o.name == m.name).unwrap_or(0) + 1;
 
@@ -500,11 +815,11 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
             let m = offline.remove(pos);
             // The machine it would have had otherwise: the next one it fits on.
             let decided = match offline[pos..].iter().find(|o| pod_fits(pod, o, &o.allocatable)) {
-                Some(next) => format!("over {} by {}", next.name, deciding_rule(spec, m, next, false)),
+                Some(next) => format!("over {} by {}", next.name, ranking.rule(m, next, false)),
                 None => "the only machine off that fits".into(),
             };
             let reason = format!(
-                "unschedulable pod {pod_name}; #{} of {} to power on, {decided}",
+                "unschedulable pod {pod_name}; #{} of {} to power on, {decided}{hedging}",
                 rank_up(m),
                 ranked_up.len()
             );
@@ -528,7 +843,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         let Some(m) = offline.first().copied() else { break };
         offline.remove(0);
         let decided = match offline.first() {
-            Some(next) => format!("over {} by {}", next.name, deciding_rule(spec, m, next, false)),
+            Some(next) => format!("over {} by {}", next.name, ranking.rule(m, next, false)),
             None => "the only machine off".into(),
         };
         let reason = format!(
@@ -549,7 +864,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
         .filter(|m| m.auto && m.state == MemberState::Online)
         .collect();
     // The exact reverse of the power-on order.
-    candidates.sort_by(|a, b| power_on_order(spec, b, a));
+    candidates.sort_by(|a, b| ranking.order(b, a));
     let threshold = spec.scale_down.utilization_threshold_percent as f64;
     let backoff = Duration::seconds(spec.scale_down.drain_failure_backoff_seconds as i64);
     let login_recheck = Duration::seconds(LOGIN_RECHECK_SECS);
@@ -763,7 +1078,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                 };
                 // The machine that would have gone otherwise: the next eligible one.
                 let decided = match eligible[i + 1..].iter().find(|o| !removed.contains(&o.name)) {
-                    Some(next) => format!("before {} by {}", next.name, deciding_rule(spec, m, next, true)),
+                    Some(next) => format!("before {} by {}", next.name, ranking.rule(m, next, true)),
                     None => "the only machine eligible".into(),
                 };
                 let rank = candidates.iter().position(|o| o.name == m.name).unwrap_or(0) + 1;
@@ -815,21 +1130,14 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
     // --- explanation ---------------------------------------------------------
     let compact = |list: &[&Member]| {
         list.iter()
-            .map(|m| {
-                let mut tags = vec![format!("w{}", spec.scale_up.node_weight(&m.name))];
-                if m.s3_capable {
-                    tags.push("s3".into());
-                }
-                tags.push(size(m));
-                format!("{}({})", m.name, tags.join(" "))
-            })
+            .map(|m| format!("{}({})", m.name, ranking.tags(m)))
             .collect::<Vec<_>>()
             .join(" > ")
     };
     let render = |live: bool| -> Vec<String> {
         let mut lines = Vec::new();
         for m in &ranked_up {
-            let mut line = format!("{}: #{} to power on ({})", m.name, rank_up(m), traits(spec, m));
+            let mut line = format!("{}: #{} to power on ({})", m.name, rank_up(m), ranking.traits(m));
             match up_notes.iter().find(|(n, _)| *n == m.name) {
                 Some(_) => line.push_str("; chosen"),
                 None if !pending.iter().any(|p| pod_fits(p, m, &m.allocatable)) && !pending.is_empty() => {
@@ -848,7 +1156,7 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                 "{}: #{} to power off ({}{}); {}",
                 m.name,
                 i + 1,
-                traits(spec, m),
+                ranking.traits(m),
                 m.woken_by
                     .as_deref()
                     .map(|p| format!(", woken by pool {p}"))
@@ -878,10 +1186,16 @@ pub fn plan(s: &PoolSnapshot) -> Plan {
                 _ if !m.auto => "excluded: powerPolicy is not Auto".to_string(),
                 _ if m.note.is_some() => m.note.clone().unwrap_or_default(),
                 MemberState::Manual => "powered on by hand; not managing".to_string(),
-                MemberState::Booting => match &m.woken_by {
-                    Some(p) => format!("powering on (woken by pool {p})"),
-                    None => "powering on".to_string(),
-                },
+                MemberState::Booting => {
+                    let base = match &m.woken_by {
+                        Some(p) => format!("powering on (woken by pool {p})"),
+                        None => "powering on".to_string(),
+                    };
+                    match overdue.get(&m.name) {
+                        Some(at) => format!("{base}; boot overdue since {}, not counted as capacity", hhmmss(*at)),
+                        None => base,
+                    }
+                }
                 MemberState::Leaving => "powering off".to_string(),
                 MemberState::Unavailable => "excluded: state unknown or in error".to_string(),
                 // Unreachable: Auto Online/Offline members are ranked above.
@@ -1060,19 +1374,15 @@ fn size(m: &Member) -> String {
     format!("{cpu}c/{gib:.0}Gi")
 }
 
-fn traits(spec: &NodeScalingPoolSpec, m: &Member) -> String {
-    format!(
-        "weight {}, S3 {}, {}",
-        spec.scale_up.node_weight(&m.name),
-        if m.s3_capable { "yes" } else { "no" },
-        size(m)
-    )
-}
-
 /// The rule of `power_on_order` that puts `chosen` ahead of `other`: for
 /// scale-up (`down == false`) `chosen` ranks before `other`; for scale-down it
 /// ranks after it.
 pub fn deciding_rule(spec: &NodeScalingPoolSpec, chosen: &Member, other: &Member, down: bool) -> String {
+    Ranking::new(spec, [chosen, other]).rule(chosen, other, down)
+}
+
+/// `deciding_rule` without strategies.
+fn ordered_rule(spec: &NodeScalingPoolSpec, chosen: &Member, other: &Member, down: bool) -> String {
     let (wc, wo) = (
         spec.scale_up.node_weight(&chosen.name),
         spec.scale_up.node_weight(&other.name),
@@ -1117,6 +1427,8 @@ mod tests {
                 boot_failure_backoff_seconds: 1800,
                 power_on_timeout_seconds: None,
                 power_on_failure_policy: Default::default(),
+                strategies: vec![],
+                hedge: None,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -1178,6 +1490,7 @@ mod tests {
             outside_active_hours: None,
             unneeded_seconds: None,
             power_requests: None,
+            history: Default::default(),
         }
     }
 
@@ -2138,6 +2451,8 @@ mod dedicated_pool_tests {
                 boot_failure_backoff_seconds: 1800,
                 power_on_timeout_seconds: None,
                 power_on_failure_policy: Default::default(),
+                strategies: vec![],
+                hedge: None,
             },
             scale_down: ScaleDownSpec {
                 enabled: true,
@@ -2191,6 +2506,7 @@ mod dedicated_pool_tests {
             outside_active_hours: None,
             unneeded_seconds: None,
             power_requests: None,
+            history: Default::default(),
         }
     }
 
@@ -2381,6 +2697,7 @@ mod overlapping_pool_tests {
             outside_active_hours: None,
             unneeded_seconds: None,
             power_requests: None,
+            history: Default::default(),
         }
     }
 
@@ -2618,6 +2935,7 @@ mod boot_and_manual_tests {
             outside_active_hours: None,
             unneeded_seconds: None,
             power_requests: None,
+            history: Default::default(),
         }
     }
 
@@ -2774,5 +3092,280 @@ mod boot_and_manual_tests {
         let mut s = snap(&spec, vec![m], now);
         s.unneeded_since.clear();
         assert!(plan(&s).power_off.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod strategy_tests {
+    //! `scaleUp.strategies` and `scaleUp.hedge`.
+    use super::*;
+
+    const GI: i64 = 1 << 30;
+
+    fn spec(extra: serde_json::Value) -> NodeScalingPoolSpec {
+        let mut v = serde_json::json!({
+            "nodeSelector": {"matchLabels": {"example.com/gpu": "true"}},
+            "minOnline": 0,
+            "scaleUp": {"maxNodesPerStep": 1, "pendingPodGraceSeconds": 0}
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v["scaleUp"][k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn machine(name: &str, cpu: i64) -> Member {
+        Member {
+            name: name.into(),
+            state: MemberState::Offline,
+            auto: true,
+            labels: BTreeMap::from([("example.com/gpu".to_string(), "true".to_string())]),
+            taints: vec![],
+            allocatable: ResourceAmounts {
+                cpu_millis: cpu * 1000,
+                memory_bytes: 32 * GI,
+                pods: 110,
+            },
+            requested: ResourceAmounts::default(),
+            counted: ResourceAmounts::default(),
+            movable_pods: vec![],
+            blocking_pods: vec![],
+            drain_failed_at: None,
+            logged_in: None,
+            s3_capable: false,
+            registering: BTreeMap::new(),
+            woken_by: None,
+            note: None,
+            adopted_at: None,
+            release_after: None,
+            outside_active_hours: None,
+            unneeded_seconds: None,
+            power_requests: None,
+            history: MachineHistory {
+                lottery: 0.5,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn booted(mut m: Member, avg: f64, ok: u32, failed: u32) -> Member {
+        m.history.boot_average_seconds = Some(avg);
+        m.history.boots_succeeded = ok;
+        m.history.boots_failed = failed;
+        m
+    }
+
+    fn pending(now: DateTime<Utc>) -> Vec<PodView> {
+        vec![PodView {
+            namespace: "transcode".into(),
+            name: "worker".into(),
+            requests: ResourceAmounts {
+                cpu_millis: 1000,
+                memory_bytes: GI,
+                pods: 1,
+            },
+            created: Some(now - Duration::seconds(60)),
+            ..Default::default()
+        }]
+    }
+
+    fn woken(spec: &NodeScalingPoolSpec, members: Vec<Member>) -> Plan {
+        let now = Utc::now();
+        plan(&PoolSnapshot {
+            spec,
+            members,
+            pending: pending(now),
+            now,
+            last_scale_up: None,
+            unneeded_since: BTreeMap::new(),
+            external: vec![],
+            kept_by_others: BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn without_strategies_the_fixed_order_is_unchanged() {
+        let spec = spec(serde_json::json!({"preferredNodes": [{"name": "slow", "weight": 100}]}));
+        let p = woken(
+            &spec,
+            vec![
+                booted(machine("fast", 8), 30.0, 10, 0),
+                booted(machine("slow", 8), 900.0, 2, 8),
+            ],
+        );
+        assert_eq!(
+            p.power_on[0].0, "slow",
+            "preferredNodes still decide when no strategy is listed"
+        );
+    }
+
+    #[test]
+    fn fastest_boot_and_reliable_learn_from_history() {
+        let spec = spec(serde_json::json!({
+            "strategies": [{"name": "FastestBoot", "weight": 2}, {"name": "Reliable", "weight": 2}]
+        }));
+        let p = woken(
+            &spec,
+            vec![
+                booted(machine("slow", 8), 900.0, 2, 8),
+                booted(machine("fast", 8), 30.0, 10, 0),
+            ],
+        );
+        assert_eq!(p.power_on[0].0, "fast");
+        assert!(
+            p.power_on[0].1.contains("over slow by score (")
+                && p.power_on[0].1.contains("mostly FastestBoot: boot 30s vs 900s"),
+            "{}",
+            p.power_on[0].1
+        );
+        // A machine with no history sits between the two.
+        let ranking = Ranking::new(&spec, []);
+        let fresh = ranking.score(&machine("new", 8)).total;
+        assert!(ranking.score(&booted(machine("fast", 8), 30.0, 10, 0)).total > fresh);
+        assert!(ranking.score(&booted(machine("slow", 8), 900.0, 2, 8)).total < fresh);
+    }
+
+    #[test]
+    fn reachable_wakes_whoever_answers_and_an_unreachable_machine_only_last() {
+        let spec = spec(serde_json::json!({
+            "strategies": [{"name": "Reachable", "weight": 1}, {"name": "FastestBoot", "weight": 5}]
+        }));
+        let mut dark = booted(machine("dark", 8), 20.0, 10, 0);
+        dark.history.reachable = Some(false);
+        dark.history.answered = Some(0.0);
+        let mut lit = booted(machine("lit", 8), 400.0, 10, 0);
+        lit.history.reachable = Some(true);
+        lit.history.answered = Some(1.0);
+        lit.history.rtt_ms = Some(2);
+        // Faster to boot, but its management interface does not answer.
+        let p = woken(&spec, vec![dark.clone(), lit]);
+        assert_eq!(p.power_on[0].0, "lit");
+        assert!(
+            p.power_on[0]
+                .1
+                .contains("Reachable (dark's management interface does not answer)"),
+            "{}",
+            p.power_on[0].1
+        );
+        // Still a last resort when it is the only machine that fits.
+        let p = woken(&spec, vec![dark]);
+        assert_eq!(p.power_on[0].0, "dark");
+    }
+
+    #[test]
+    fn largest_smallest_and_standby_rate_what_they_say() {
+        let big = machine("big", 32);
+        let small = machine("small", 4);
+        let largest = spec(serde_json::json!({"strategies": [{"name": "Largest", "weight": 1}]}));
+        assert_eq!(woken(&largest, vec![small.clone(), big.clone()]).power_on[0].0, "big");
+        let smallest = spec(serde_json::json!({"strategies": [{"name": "Smallest", "weight": 1}]}));
+        assert_eq!(
+            woken(&smallest, vec![big.clone(), small.clone()]).power_on[0].0,
+            "small"
+        );
+        let standby = spec(serde_json::json!({"strategies": [{"name": "Standby", "weight": 1}]}));
+        let mut sleeper = small.clone();
+        sleeper.s3_capable = true;
+        assert_eq!(woken(&standby, vec![big, sleeper]).power_on[0].0, "small");
+    }
+
+    #[test]
+    fn random_follows_the_draw() {
+        let spec = spec(serde_json::json!({"strategies": [{"name": "Random", "weight": 1}]}));
+        let (mut a, mut b) = (machine("a", 8), machine("b", 8));
+        a.history.lottery = 0.2;
+        b.history.lottery = 0.9;
+        let p = woken(&spec, vec![a.clone(), b.clone()]);
+        assert_eq!(p.power_on[0].0, "b");
+        assert!(
+            p.power_on[0].1.contains("mostly Random: drew 0.90 vs 0.20"),
+            "{}",
+            p.power_on[0].1
+        );
+        a.history.lottery = 0.95;
+        assert_eq!(woken(&spec, vec![a, b]).power_on[0].0, "a");
+    }
+
+    #[test]
+    fn scale_down_powers_off_the_lowest_score_first() {
+        let spec = spec(serde_json::json!({"strategies": [{"name": "FastestBoot", "weight": 1}]}));
+        let fast = booted(machine("fast", 8), 30.0, 10, 0);
+        let slow = booted(machine("slow", 8), 900.0, 10, 0);
+        let ranking = Ranking::new(&spec, [&fast, &slow]);
+        let mut down = [&fast, &slow];
+        down.sort_by(|a, b| ranking.order(b, a));
+        // The machine quickest to bring back is kept; the slow one goes first.
+        assert_eq!(down[0].name, "slow");
+    }
+
+    #[test]
+    fn hedging_wakes_the_next_machine_when_a_boot_is_overdue() {
+        let now = Utc::now();
+        let spec = spec(serde_json::json!({
+            "strategies": [{"name": "FastestBoot", "weight": 1}],
+            "hedge": {}
+        }));
+        let mut stuck = booted(machine("stuck", 8), 60.0, 5, 0);
+        stuck.state = MemberState::Booting;
+        let spare = machine("spare", 8);
+        let at = |booting_for: i64| {
+            let mut m = stuck.clone();
+            m.history.booting_since = Some(now - Duration::seconds(booting_for));
+            plan(&PoolSnapshot {
+                spec: &spec,
+                members: vec![m, spare.clone()],
+                pending: pending(now),
+                now,
+                last_scale_up: None,
+                unneeded_since: BTreeMap::new(),
+                external: vec![],
+                kept_by_others: BTreeMap::new(),
+            })
+        };
+        // Average 60s: overdue at max(150% of 60s, 120s) = 120s.
+        assert!(
+            at(100).power_on.is_empty(),
+            "within its expected boot, the pod waits for it"
+        );
+        let p = at(130);
+        assert_eq!(p.power_on.len(), 1);
+        assert_eq!(p.power_on[0].0, "spare");
+        assert!(
+            p.power_on[0].1.ends_with("; hedging: stuck overdue"),
+            "{}",
+            p.power_on[0].1
+        );
+        assert!(
+            p.details
+                .iter()
+                .any(|d| d.starts_with("stuck: powering on; boot overdue since ")),
+            "{:?}",
+            p.details
+        );
+
+        // Without `hedge`, the pod keeps waiting for it however long it takes.
+        let mut no_hedge = spec.clone();
+        no_hedge.scale_up.hedge = None;
+        let mut m = stuck.clone();
+        m.history.booting_since = Some(now - Duration::seconds(3600));
+        let p = plan(&PoolSnapshot {
+            spec: &no_hedge,
+            members: vec![m, spare.clone()],
+            pending: pending(now),
+            now,
+            last_scale_up: None,
+            unneeded_since: BTreeMap::new(),
+            external: vec![],
+            kept_by_others: BTreeMap::new(),
+        });
+        assert!(p.power_on.is_empty());
+    }
+
+    #[test]
+    fn hedge_thresholds() {
+        let h = crate::crd::HedgeSpec::default();
+        assert_eq!(h.overdue_after(Some(60.0)), 120, "never before minSeconds");
+        assert_eq!(h.overdue_after(Some(200.0)), 300, "150% of the average");
+        assert_eq!(h.overdue_after(None), 300, "withoutHistorySeconds");
     }
 }

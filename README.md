@@ -78,6 +78,11 @@ spec:
   Machines are powered on in a fixed order: weight (highest first), S3 capability (with
   `preferS3Capable`), size (largest first), then Node name. They're powered off in exactly
   the reverse order.
+- **Wake strategies:** instead of that order, a pool can combine strategies by weight to pick the machine to wake:
+  `Reachable` (its BMC answers, and how fast), `FastestBoot` and `Reliable` (learned from
+  each machine's recent boots), `Standby`, `Largest`, `Smallest`, `Random` and `Priority`.
+  With `hedge`, a boot that is taking too long no longer holds the pending pods: the next
+  machine is woken.
 - **Boot failures and manual power changes:** a machine that doesn't boot within its
   timeout releases its pools and, unless a human started it, is powered off and backed
   off. A machine powered on by hand is left alone (`LeaveOn`), adopted, or powered back

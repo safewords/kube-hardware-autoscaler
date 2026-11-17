@@ -227,6 +227,7 @@ mod tests {
                         end: e.into(),
                     }],
                 }),
+                probe: None,
             },
         );
         m.status = Some(NodePowerManagementConfigStatus {

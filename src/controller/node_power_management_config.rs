@@ -38,11 +38,11 @@ use super::{
     Context, Error, clear_powered_off, cordon, mark_powered_off, node_ready, patch_status_diff, uncordon_if_ours,
 };
 use crate::crd::{
-    BootFailure, COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP, COND_POWER_STATE_CONSISTENT,
-    LoginSessions, ManualPowerChange, ManualPowerOnPolicy, NodePowerManagementConfig, NodePowerManagementConfigStatus,
-    NodeScalingPool, Phase, PowerActionRecord, PowerOffMode, PowerOnFailurePolicy, PowerPolicy, PowerState,
-    PowerTarget, ScalingDecision, SleepSupport, effective_boot_timeout, effective_manual_power_on_policy,
-    effective_power_on_failure,
+    BootFailure, BootRecord, COND_IDENTITY_VERIFIED, COND_NODE_FOUND, COND_POOL_MEMBERSHIP,
+    COND_POWER_STATE_CONSISTENT, LoginSessions, ManualPowerChange, ManualPowerOnPolicy, NodePowerManagementConfig,
+    NodePowerManagementConfigStatus, NodeScalingPool, Phase, PowerActionRecord, PowerOffMode, PowerOnFailurePolicy,
+    PowerPolicy, PowerState, PowerTarget, ScalingDecision, SleepSupport, effective_boot_timeout,
+    effective_manual_power_on_policy, effective_power_on_failure,
 };
 use crate::drivers::inband::{self, HostCommand, Probe, SessionProbe};
 use crate::drivers::{Outcome, PowerChain};
@@ -161,6 +161,19 @@ pub enum BootEvent {
 /// can fail again.
 pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, boot_timeout_secs: u64) -> BootEvent {
     if st.node_ready {
+        // A cold boot of ours just finished: `PoweringOn` began with our
+        // PowerOn, whatever the interface could read meanwhile (Wake-on-LAN
+        // reads Off until the Node is Ready). Waking from standby is not a boot.
+        if st.phase == Phase::PoweringOn
+            && st.standby_since.is_none()
+            && let Some(since) = st.phase_since.filter(|t| *t <= now)
+        {
+            st.boot_history.get_or_insert_default().record(BootRecord {
+                time: now,
+                succeeded: true,
+                seconds: Some((now - since).num_seconds() as u64),
+            });
+        }
         st.powered_on_not_ready_since = None;
         return match st.boot_failure.take() {
             Some(_) => BootEvent::Recovered,
@@ -188,9 +201,19 @@ pub fn track_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>, 
             time: now,
             left_on: false,
         });
+        record_failed_boot(st, now);
         return BootEvent::Failed;
     }
     BootEvent::None
+}
+
+/// Adds a failed boot to `status.bootHistory`.
+pub fn record_failed_boot(st: &mut NodePowerManagementConfigStatus, now: DateTime<Utc>) {
+    st.boot_history.get_or_insert_default().record(BootRecord {
+        time: now,
+        succeeded: false,
+        seconds: None,
+    });
 }
 
 /// Where a power-on attempt stands. `Expired` is only reported for `Release`.
@@ -558,6 +581,7 @@ impl Reconciler<'_> {
             time: self.now,
             left_on: false,
         });
+        record_failed_boot(&mut self.st, self.now);
         self.st.scaling_decision = None;
         self.st.standby_since = None;
         let note = format!(
@@ -1277,6 +1301,29 @@ pub async fn reconcile(mn: Arc<NodePowerManagementConfig>, ctx: Arc<Context>) ->
     }
     ctx.metrics.node_power(&mn.spec.node_name, st.power_state);
 
+    // The management path's reachability (`spec.probe`), once a minute.
+    match crate::probe::target(&mn.spec) {
+        None => st.reachability = None,
+        Some(Err(e)) => {
+            st.reachability = None;
+            st.interface_warnings.push(format!("probe: {e}"));
+        }
+        Some(Ok(target)) => {
+            if crate::probe::due(st.reachability.as_ref(), &target, now) {
+                let outcome = crate::probe::probe(&target).await;
+                st.reachability = Some(crate::probe::record(st.reachability.as_ref(), &target, &outcome, now));
+            }
+            if let Some(e) = st.reachability.as_ref().and_then(|r| r.error.as_ref()) {
+                st.interface_warnings.push(format!("probe: {e}"));
+            }
+        }
+    }
+    ctx.metrics.probe(&mn.spec.node_name, st.reachability.as_ref());
+    ctx.metrics.boot_average(
+        &mn.spec.node_name,
+        st.boot_history.as_ref().and_then(|h| h.average_seconds),
+    );
+
     // --- gate 4: interface reading must not contradict a live Node -----------
     let lease_age = if st.power_state == PowerState::Off && st.node_ready {
         lease_age_secs(&ctx, &mn.spec.node_name, now).await
@@ -1554,6 +1601,53 @@ mod tests {
         assert_eq!(track_boot(&mut st, at(102), 1200), BootEvent::Recovered);
         assert!(st.boot_failure.is_none());
         assert_eq!(track_boot(&mut st, at(103), 1200), BootEvent::None);
+    }
+
+    #[test]
+    fn boots_are_timed_from_our_power_on_and_failures_counted() {
+        let t0 = Utc::now();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        // Wake-on-LAN reads Off until the Node is Ready; the boot is still timed
+        // from when powering on began.
+        let mut st = status(Phase::PoweringOn, PowerState::Off, false);
+        st.phase_since = Some(at(0));
+        assert_eq!(track_boot(&mut st, at(60), 1200), BootEvent::None);
+        st.node_ready = true;
+        track_boot(&mut st, at(95), 1200);
+        let h = st.boot_history.clone().unwrap();
+        assert_eq!((h.succeeded, h.failed, h.average_seconds), (1, 0, Some(95)));
+        // Once On, a Node that blips NotReady and back is not another boot.
+        st.phase = Phase::On;
+        track_boot(&mut st, at(500), 1200);
+        assert_eq!(st.boot_history.as_ref().unwrap().boots.len(), 1);
+
+        // Waking from standby is not a boot.
+        let mut st = status(Phase::PoweringOn, PowerState::On, true);
+        st.phase_since = Some(at(0));
+        st.standby_since = Some(at(-600));
+        track_boot(&mut st, at(5), 1200);
+        assert!(st.boot_history.is_none());
+
+        // A boot past its timeout is a failure.
+        let mut st = status(Phase::PoweringOn, PowerState::On, false);
+        st.phase_since = Some(at(0));
+        track_boot(&mut st, at(0), 1200);
+        assert_eq!(track_boot(&mut st, at(1201), 1200), BootEvent::Failed);
+        let h = st.boot_history.clone().unwrap();
+        assert_eq!((h.succeeded, h.failed, h.average_seconds), (0, 1, None));
+
+        // Only the last ten are kept.
+        let mut h = crate::crd::BootHistory::default();
+        for i in 0..12 {
+            h.record(BootRecord {
+                time: at(i),
+                succeeded: true,
+                seconds: Some(i as u64 * 10),
+            });
+        }
+        assert_eq!(h.boots.len(), 10);
+        assert_eq!(h.boots[0].seconds, Some(20));
+        assert_eq!(h.average_seconds, Some(65));
     }
 
     #[test]

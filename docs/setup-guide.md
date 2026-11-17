@@ -176,6 +176,7 @@ spec:
         address: 192.168.10.11
   manualPowerOnPolicy: null  # LeaveOn | Adopt | PowerOff; unset: the pools' default (see "Manual power changes")
   manualPowerOffCooldownSeconds: null   # unset: the pools' default (0 = none)
+  probe: null                # unset: probe the first interface's management address (see "Management probe")
   lifecycle:                 # optional, defaults shown
     bootTimeoutSeconds: null # unset: the longest of its pools' scaleUp.bootTimeoutSeconds, else 1200
     drainTimeoutSeconds: 300
@@ -364,7 +365,7 @@ metadata:
   name: nightly-batch
   namespace: my-app
 spec:
-  nodeName: vulpes-lagopus    # the machine's Node / NodePowerManagementConfig name
+  nodeName: gpu-node-1    # the machine's Node / NodePowerManagementConfig name
   duration: 2h                # counted from when its Node is Ready; or `until: <RFC 3339>`
   reason: nightly batch       # shown in the pools' decisions and Events
   overrideActiveHours: false  # true: may run it outside its activeHours (needs RBAC, below)
@@ -549,7 +550,9 @@ kubectl delete deployment burn   # after unneededSeconds, machines drain and pow
   The pool then leaves that machine alone for `drainFailureBackoffSeconds`.
   Set `forceAfterDrainTimeout: true` to power off anyway.
 - **Metrics** on `:8080/metrics`: `kha_power_actions_total`, `kha_node_power_state`,
-  `kha_pool_nodes`, `kha_pool_pending_pods`, `kha_reconcile_errors_total`.
+  `kha_pool_nodes`, `kha_pool_pending_pods`, `kha_reconcile_errors_total`,
+  `kha_machine_probe_up`, `kha_machine_probe_rtt_seconds` (see
+  [Management probe](#management-probe)) and `kha_machine_boot_average_seconds`.
 
 ## Driver reference
 
@@ -747,6 +750,8 @@ scaleUp:
   requireExplicitSelection: false   # see "Dedicated pools"
   preferS3Capable: false            # power on S3-capable machines first (see "Standby")
   preferredNodes: []                # [{name: <Node>, weight: 0-100}]; see "Preferred machines"
+  strategies: []                    # [{name: <Strategy>, weight: 1-100}]; see "Wake strategies"
+  hedge: null                       # {} to wake another machine when a boot is overdue; see "Hedging"
   bootTimeoutSeconds: null          # default for members without lifecycle.bootTimeoutSeconds (1200)
   bootFailureBackoffSeconds: 1800   # see "Boot failures"
 scaleDown:
@@ -861,6 +866,94 @@ state whichever pool acts on it. Each pool keeps its own rules:
 For example, a `gpu` pool (only pods selecting `gpu=true` count) and a `ci` pool (only pods
 selecting `ci=true` count) can share a machine. A CI job running on it keeps it on through
 `ci`, although `gpu` ignores that job.
+
+### Wake strategies
+
+When several machines are off and a pending pod fits on more than one, the pool has to
+pick. Without `scaleUp.strategies` it uses the fixed order under
+[Preferred machines](#preferred-machines). With strategies, every candidate is rated by
+each strategy from 0 to 1, the ratings are combined by weight, and the highest total is
+woken first. Scale-down powers off in the reverse order.
+
+```yaml
+scaleUp:
+  strategies:
+    - {name: Reachable,   weight: 3}
+    - {name: FastestBoot, weight: 2}
+    - {name: Reliable,    weight: 2}
+    - {name: Random,      weight: 1}
+```
+
+| Strategy | Rates a machine by |
+|---|---|
+| `Priority` | its `preferredNodes` weight, as a fraction of 100 |
+| `Reachable` | whoever is up on the network: the share of its recent [management probes](#management-probe) answered, scaled down by round-trip time (`1 - rtt / 1s`, at least 0.5 when answered); 0.5 when not probed. A machine whose management interface did not answer its last probe is woken only when no other machine fits. |
+| `FastestBoot` | its average time from power-on to Node Ready (`status.bootHistory`): `120 / (120 + seconds)`, 0.5 at two minutes; 0.5 with no history |
+| `Reliable` | the share of its recent boots that reached Ready, smoothed: `(succeeded + 1) / (boots + 2)` |
+| `Standby` | 1 when it is in standby or can sleep in S3, so it is back in seconds |
+| `Largest` | its CPU (then memory) relative to the largest machine in the pool |
+| `Smallest` | the reverse of `Largest`: least capacity, and power, left idle |
+| `Random` | a fresh draw per machine every time the pool decides; spreads wakes, and wear, over interchangeable machines |
+
+Each strategy may be listed once, with a weight from 1 to 100. Ties go to the larger
+machine, then to the Node name. Strategies only choose among candidates: active hours,
+boot-failure backoffs, `maxOnline` and `maxNodesPerStep` apply first, and a machine that is
+not off and `Auto`, or that the pod does not fit, is never one.
+
+`FastestBoot` and `Reliable` learn from the machine's last ten cold boots, recorded in its
+`status.bootHistory`: seconds from the operator powering it on to its Node being Ready, or
+that it did not become Ready within its boot timeout or did not power on at all. Waking from
+standby is not counted. A machine with no history rates in the middle, so a new machine is
+tried before one with a poor record and after one with a good one.
+
+Every decision says what decided it, for example
+`#1 of 2 to power on, over gpu-node-2 by score (790 vs 455, mostly FastestBoot: boot 95s vs 410s)`.
+
+### Hedging
+
+A boot can hang: a disk that fails a check, a machine that drops into an emergency shell.
+By default the pending pods wait for it until its boot timeout (20 minutes unless set).
+With `scaleUp.hedge`, a boot taking longer than it should stops counting as capacity on its
+way, and the pods it was for wake the next machine:
+
+```yaml
+scaleUp:
+  hedge:
+    percentOfAverage: 150        # overdue at 150% of its average boot time...
+    minSeconds: 120              # ...but never before two minutes
+    withoutHistorySeconds: 300   # with no boot history: after five minutes
+```
+
+`hedge: {}` takes these defaults. The overdue machine keeps booting; if it comes up, the
+pool has one machine more than it needs, and the usual idle rules power the spare off.
+`maxOnline` and `maxNodesPerStep` still apply, so hedging never exceeds them. The machine
+shows `boot overdue since ..., not counted as capacity` in the pool's details, and the
+power-on it causes ends with `hedging: <machine> overdue`.
+
+### Management probe
+
+Once a minute the operator checks that each machine's management path answers, recorded in
+`status.reachability` and as the metrics `kha_machine_probe_up` and
+`kha_machine_probe_rtt_seconds`. The [`Reachable`](#wake-strategies) strategy uses it.
+
+By default the address of the machine's first interface that has one is probed: a TCP
+connect to a `redfish`, `pikvm` or `nanokvm` endpoint (its URL's port, else 443 or 80),
+or an ICMP echo to an `ipmi` address. A machine with only Wake-on-LAN has no management
+address and is not probed unless told where:
+
+```yaml
+spec:
+  probe:
+    address: 10.0.0.12   # host or URL; default: the first interface's address
+    method: icmp         # tcp (default) or icmp; icmp needs unprivileged ping or CAP_NET_RAW
+    port: 443            # tcp only
+    timeoutMs: 1000
+    # disabled: true     # do not probe this machine
+```
+
+A TCP connection that is refused still counts as an answer: something is there. A probe
+that cannot run at all (an address that does not resolve, no ICMP socket) is reported in
+`status.interfaceWarnings` and changes nothing.
 
 ### Preferred machines
 

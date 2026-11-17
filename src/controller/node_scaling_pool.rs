@@ -31,8 +31,8 @@ use crate::crd::{
 use crate::membership::{self, Membership};
 use crate::resources::{node_allocatable, node_extended, pod_requests};
 use crate::scaling::{
-    DrainClass, ExternalNode, Member, MemberState, PlannedDecision, PodView, PoolSnapshot, drain_class, is_active,
-    is_daemonset_pod, is_unschedulable, plan,
+    DrainClass, ExternalNode, MachineHistory, Member, MemberState, PlannedDecision, PodView, PoolSnapshot, drain_class,
+    is_active, is_daemonset_pod, is_unschedulable, plan,
 };
 
 const INTERVAL: Duration = Duration::from_secs(15);
@@ -362,7 +362,55 @@ fn build_member(
         logged_in: st.login_sessions.as_ref().map(|l| (l.checked_at, l.sessions.clone())),
         s3_capable: s3_capable(&st, Utc::now()),
         registering,
+        history: history(&st, state),
     })
+}
+
+/// What the operator has learned about a machine, for `scaleUp.strategies`
+/// and `scaleUp.hedge`.
+pub fn history(st: &NodePowerManagementConfigStatus, state: MemberState) -> MachineHistory {
+    let boots = st.boot_history.clone().unwrap_or_default();
+    let ok: Vec<u64> = boots
+        .boots
+        .iter()
+        .filter(|b| b.succeeded)
+        .filter_map(|b| b.seconds)
+        .collect();
+    // The boot in progress began with our decision to power on; failing
+    // that, with the power-on phase, or when it was first seen booting.
+    let booting_since = (state == MemberState::Booting)
+        .then(|| {
+            st.scaling_decision
+                .as_ref()
+                .filter(|d| d.target == PowerTarget::On)
+                .map(|d| d.time)
+                .or(st.phase_since.filter(|_| st.phase == Phase::PoweringOn))
+                .or(st.powered_on_not_ready_since)
+        })
+        .flatten();
+    MachineHistory {
+        boot_average_seconds: (!ok.is_empty()).then(|| ok.iter().sum::<u64>() as f64 / ok.len() as f64),
+        boots_succeeded: boots.boots.iter().filter(|b| b.succeeded).count() as u32,
+        boots_failed: boots.boots.iter().filter(|b| !b.succeeded).count() as u32,
+        reachable: st.reachability.as_ref().map(|r| r.reachable),
+        answered: st
+            .reachability
+            .as_ref()
+            .filter(|r| !r.recent.is_empty())
+            .map(|r| r.answered()),
+        rtt_ms: st.reachability.as_ref().and_then(|r| r.rtt_ms),
+        booting_since,
+        lottery: lottery(),
+    }
+}
+
+/// A uniform draw in [0, 1) for the `Random` strategy.
+fn lottery() -> f64 {
+    let mut b = [0u8; 8];
+    if getrandom::fill(&mut b).is_err() {
+        return 0.5;
+    }
+    (u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Schedulable nodes that no scaling pool can power off: Ready, not cordoned,
@@ -739,6 +787,7 @@ mod tests {
                 manual_power_on_policy: None,
                 manual_power_off_cooldown_seconds: None,
                 active_hours: None,
+                probe: None,
             },
         );
         m.status = Some(NodePowerManagementConfigStatus {

@@ -96,6 +96,52 @@ pub struct NodePowerManagementConfigSpec {
     /// Only `powerPolicy: Auto` is affected. Always active when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_hours: Option<ActiveHours>,
+
+    /// A periodic reachability check of the machine's management path (its
+    /// BMC or KVM), recorded in `status.reachability` and as the metrics
+    /// `kha_machine_probe_up` and `kha_machine_probe_rtt_seconds`. Pools with
+    /// `scaleUp.strategy: Scored` would rather wake a machine whose
+    /// management interface answers, and wake one that does not only when no
+    /// other machine fits. When omitted, the address of the first interface
+    /// that has one (a `redfish`, `pikvm` or `nanokvm` endpoint, an `ipmi`
+    /// address) is probed; a machine with none (Wake-on-LAN only) is not
+    /// probed. `{disabled: true}` turns it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeSpec>,
+}
+
+/// `spec.probe`: how the machine's management path is checked.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeSpec {
+    /// Do not probe this machine.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Host name or IP address to probe. Defaults to the first interface's
+    /// management address (see `probe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// `tcp` (connect to `port`; a refused connection still proves the host
+    /// is up) or `icmp` (echo, IPv4 only; needs unprivileged ping sockets or
+    /// `CAP_NET_RAW`). Defaults to `tcp`, or `icmp` for an `ipmi` address
+    /// (IPMI is UDP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<ProbeMethod>,
+    /// TCP port. Defaults to the endpoint URL's port, else 443 for `https`
+    /// and 80 for `http`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Timeout per probe, in milliseconds (default 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMethod {
+    #[default]
+    Tcp,
+    Icmp,
 }
 
 /// The hours a machine may be run by the pools: active whenever any window is.
@@ -615,6 +661,15 @@ pub struct NodePowerManagementConfigStatus {
     /// timeout). Cleared once the Node is Ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_failure: Option<BootFailure>,
+    /// The machine's recent cold boots, newest last: how long each took from
+    /// powering on to its Node being Ready, or that it failed. Pools with
+    /// `scaleUp.strategy: Scored` learn from it which machines come up fast
+    /// and reliably, and `scaleUp.hedge` how long a boot should take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_history: Option<BootHistory>,
+    /// The last checks of the management path (`spec.probe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<Reachability>,
     /// When a forced (hard) power off was issued during the current `PoweringOff` phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_off_at: Option<DateTime<Utc>>,
@@ -647,6 +702,89 @@ pub struct ManualPowerChange {
     /// The `manualPowerOnPolicy` in effect when it was seen (power-on only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ManualPowerOnPolicy>,
+}
+
+/// How many boots `status.bootHistory` keeps.
+pub const BOOT_HISTORY_LEN: usize = 10;
+
+/// `status.bootHistory`.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BootHistory {
+    /// Up to 10 boots, oldest first.
+    #[serde(default)]
+    pub boots: Vec<BootRecord>,
+    /// Mean seconds to Ready of the successful boots listed (for display).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_seconds: Option<u64>,
+    /// Successful and failed boots listed (for display).
+    #[serde(default)]
+    pub succeeded: u32,
+    #[serde(default)]
+    pub failed: u32,
+}
+
+/// One boot in `status.bootHistory`.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BootRecord {
+    /// When the boot ended (Ready, or given up).
+    pub time: DateTime<Utc>,
+    /// Whether the Node became Ready.
+    pub succeeded: bool,
+    /// Seconds from powering on to Ready (successful boots only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u64>,
+}
+
+impl BootHistory {
+    /// Appends a boot, keeping the last `BOOT_HISTORY_LEN`, and refreshes the summary.
+    pub fn record(&mut self, record: BootRecord) {
+        self.boots.push(record);
+        let excess = self.boots.len().saturating_sub(BOOT_HISTORY_LEN);
+        self.boots.drain(..excess);
+        let ok: Vec<u64> = self
+            .boots
+            .iter()
+            .filter_map(|b| b.seconds.filter(|_| b.succeeded))
+            .collect();
+        self.succeeded = self.boots.iter().filter(|b| b.succeeded).count() as u32;
+        self.failed = self.boots.len() as u32 - self.succeeded;
+        self.average_seconds = (!ok.is_empty()).then(|| ok.iter().sum::<u64>() / ok.len() as u64);
+    }
+}
+
+/// How many probes `status.reachability.recent` keeps.
+pub const PROBE_HISTORY_LEN: usize = 10;
+
+/// `status.reachability`.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Reachability {
+    /// What was probed, e.g. `tcp 10.0.0.12:443`.
+    pub target: String,
+    /// Whether the last probe was answered.
+    pub reachable: bool,
+    /// Round-trip time of the last answered probe, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
+    /// The last probes, oldest first: `1` answered, `0` not.
+    #[serde(default)]
+    pub recent: String,
+    pub checked_at: DateTime<Utc>,
+    /// Why the probe could not run (bad address, no ICMP socket), if so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Reachability {
+    /// Share of the recent probes that were answered, 0.0 to 1.0.
+    pub fn answered(&self) -> f64 {
+        if self.recent.is_empty() {
+            return if self.reachable { 1.0 } else { 0.0 };
+        }
+        self.recent.chars().filter(|c| *c == '1').count() as f64 / self.recent.len() as f64
+    }
 }
 
 /// A machine that was powered on but did not become Ready in time.
@@ -847,8 +985,10 @@ pub struct ScaleUpSpec {
     pub prefer_s3_capable: bool,
     /// Which machines this pool would rather use: a weight from 0 to 100 per
     /// machine, by Node name. Machines not listed weigh 0; each name may
-    /// appear once. Machines are powered on in this order, and powered off
-    /// in exactly the reverse order:
+    /// appear once. Without `strategies`, machines are powered on in this
+    /// order, and powered off in exactly the reverse order (with
+    /// `strategies`, this weight only counts through the `Priority`
+    /// strategy, if it is listed):
     /// 1. weight, highest first;
     /// 2. with `preferS3Capable`, machines that can sleep in S3 first;
     /// 3. size (CPU, then memory), largest first: fewer machines absorb the
@@ -886,6 +1026,143 @@ pub struct ScaleUpSpec {
     /// `Retry` keeps the attempt, and the capacity hold, open.
     #[serde(default)]
     pub power_on_failure_policy: PowerOnFailurePolicy,
+    /// How the machine to wake is chosen among those that are off and fit:
+    /// strategies, each rating every candidate from 0 to 1, combined by
+    /// weight; the highest total is woken first, and scale-down powers off
+    /// in the reverse order. Ties go to the larger machine, then by name.
+    /// Constraints are never traded away: active hours, backoffs,
+    /// `maxOnline` and `maxNodesPerStep` apply before any strategy, and a
+    /// machine that is not off and `Auto`, or that the pod does not fit, is
+    /// never a candidate.
+    ///
+    /// Empty (the default): the fixed order described under `preferredNodes`.
+    ///
+    /// ```yaml
+    /// strategies:
+    ///   - {name: Reachable, weight: 3}
+    ///   - {name: FastestBoot, weight: 2}
+    ///   - {name: Reliable, weight: 2}
+    ///   - {name: Random, weight: 1}
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "strategies_schema")]
+    pub strategies: Vec<WeightedStrategy>,
+    /// Wake another machine when the one booting for pending pods is taking
+    /// longer than it should. Off when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hedge: Option<HedgeSpec>,
+}
+
+/// One entry of `scaleUp.strategies`.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WeightedStrategy {
+    pub name: Strategy,
+    /// 1 to 100: how much this strategy counts against the others.
+    pub weight: u32,
+}
+
+/// A way of choosing which machine to wake. Each rates a machine from 0 to 1.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
+pub enum Strategy {
+    /// The machine's `preferredNodes` weight, as a fraction of 100.
+    Priority,
+    /// Whoever is up on the network: the share of its recent management
+    /// probes (`spec.probe`) answered, scaled down by round-trip time
+    /// (`1 - rtt / 1000ms`, at least 0.5 when answered); 0.5 when it is not
+    /// probed. With this strategy listed, a machine whose management
+    /// interface did not answer its last probe is woken only when no other
+    /// machine fits.
+    Reachable,
+    /// How fast its recent boots reached Ready (`status.bootHistory`):
+    /// `120 / (120 + seconds)`, so 0.5 at two minutes; 0.5 with no history.
+    FastestBoot,
+    /// The share of its recent boots that succeeded, smoothed so a single
+    /// boot is not certainty: `(succeeded + 1) / (boots + 2)`.
+    Reliable,
+    /// 1 when it is in standby or can sleep in S3 (see `preferS3Capable`):
+    /// back in seconds instead of a full boot.
+    Standby,
+    /// CPU (then memory) relative to the largest candidate: fewer machines
+    /// absorb the pending pods.
+    Largest,
+    /// The reverse of `Largest`: the least capacity, and power, left idle.
+    Smallest,
+    /// A fresh random number per candidate every time the pool decides:
+    /// spreads wakes, and wear, over interchangeable machines.
+    Random,
+}
+
+fn strategies_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "x-kubernetes-list-type": "map",
+        "x-kubernetes-list-map-keys": ["name"],
+        "items": {
+            "type": "object",
+            "required": ["name", "weight"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "enum": ["Priority", "Reachable", "FastestBoot", "Reliable", "Standby", "Largest", "Smallest", "Random"]
+                },
+                "weight": {
+                    "description": "1 to 100: how much this strategy counts against the others.",
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                }
+            }
+        }
+    })
+}
+
+/// `scaleUp.hedge`.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HedgeSpec {
+    /// A boot is overdue at this percentage of the machine's average boot
+    /// time (`status.bootHistory`). Default 150.
+    #[serde(default = "default_hedge_percent")]
+    #[schemars(range(min = 100))]
+    pub percent_of_average: u32,
+    /// Never overdue before this many seconds. Default 120.
+    #[serde(default = "default_hedge_min")]
+    pub min_seconds: u64,
+    /// Overdue after this many seconds for a machine with no boot history.
+    /// Default 300.
+    #[serde(default = "default_hedge_unknown")]
+    pub without_history_seconds: u64,
+}
+
+fn default_hedge_percent() -> u32 {
+    150
+}
+fn default_hedge_min() -> u64 {
+    120
+}
+fn default_hedge_unknown() -> u64 {
+    300
+}
+
+impl Default for HedgeSpec {
+    fn default() -> Self {
+        Self {
+            percent_of_average: default_hedge_percent(),
+            min_seconds: default_hedge_min(),
+            without_history_seconds: default_hedge_unknown(),
+        }
+    }
+}
+
+impl HedgeSpec {
+    /// Seconds after which a boot is overdue, given the machine's average.
+    pub fn overdue_after(&self, average_seconds: Option<f64>) -> i64 {
+        match average_seconds {
+            Some(avg) => ((avg * self.percent_of_average as f64 / 100.0).ceil() as i64).max(self.min_seconds as i64),
+            None => self.without_history_seconds.max(self.min_seconds) as i64,
+        }
+    }
 }
 
 fn default_boot_failure_backoff() -> u64 {
@@ -955,6 +1232,8 @@ impl Default for ScaleUpSpec {
             boot_failure_backoff_seconds: DEFAULT_BOOT_FAILURE_BACKOFF_SECONDS,
             power_on_timeout_seconds: None,
             power_on_failure_policy: PowerOnFailurePolicy::default(),
+            strategies: Vec::new(),
+            hedge: None,
         }
     }
 }

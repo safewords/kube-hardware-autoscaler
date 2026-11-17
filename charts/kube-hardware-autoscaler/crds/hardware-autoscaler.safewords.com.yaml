@@ -278,6 +278,48 @@
                       "AlwaysOff"
                     ],
                     "type": "string"
+                  },
+                  "probe": {
+                    "description": "A periodic reachability check of the machine's management path (its\nBMC or KVM), recorded in `status.reachability` and as the metrics\n`kha_machine_probe_up` and `kha_machine_probe_rtt_seconds`. Pools with\n`scaleUp.strategy: Scored` would rather wake a machine whose\nmanagement interface answers, and wake one that does not only when no\nother machine fits. When omitted, the address of the first interface\nthat has one (a `redfish`, `pikvm` or `nanokvm` endpoint, an `ipmi`\naddress) is probed; a machine with none (Wake-on-LAN only) is not\nprobed. `{disabled: true}` turns it off.",
+                    "nullable": true,
+                    "properties": {
+                      "address": {
+                        "description": "Host name or IP address to probe. Defaults to the first interface's\nmanagement address (see `probe`).",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "disabled": {
+                        "default": false,
+                        "description": "Do not probe this machine.",
+                        "type": "boolean"
+                      },
+                      "method": {
+                        "description": "`tcp` (connect to `port`; a refused connection still proves the host\nis up) or `icmp` (echo, IPv4 only; needs unprivileged ping sockets or\n`CAP_NET_RAW`). Defaults to `tcp`, or `icmp` for an `ipmi` address\n(IPMI is UDP).",
+                        "enum": [
+                          "tcp",
+                          "icmp",
+                          null
+                        ],
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "port": {
+                        "description": "TCP port. Defaults to the endpoint URL's port, else 443 for `https`\nand 80 for `http`.",
+                        "format": "uint16",
+                        "maximum": 65535.0,
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "timeoutMs": {
+                        "description": "Timeout per probe, in milliseconds (default 1000).",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
                   }
                 },
                 "required": [
@@ -330,6 +372,64 @@
                     "required": [
                       "time"
                     ],
+                    "type": "object"
+                  },
+                  "bootHistory": {
+                    "description": "The machine's recent cold boots, newest last: how long each took from\npowering on to its Node being Ready, or that it failed. Pools with\n`scaleUp.strategy: Scored` learn from it which machines come up fast\nand reliably, and `scaleUp.hedge` how long a boot should take.",
+                    "nullable": true,
+                    "properties": {
+                      "averageSeconds": {
+                        "description": "Mean seconds to Ready of the successful boots listed (for display).",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "boots": {
+                        "default": [],
+                        "description": "Up to 10 boots, oldest first.",
+                        "items": {
+                          "description": "One boot in `status.bootHistory`.",
+                          "properties": {
+                            "seconds": {
+                              "description": "Seconds from powering on to Ready (successful boots only).",
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "nullable": true,
+                              "type": "integer"
+                            },
+                            "succeeded": {
+                              "description": "Whether the Node became Ready.",
+                              "type": "boolean"
+                            },
+                            "time": {
+                              "description": "When the boot ended (Ready, or given up).",
+                              "format": "date-time",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "succeeded",
+                            "time"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "failed": {
+                        "default": 0,
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "succeeded": {
+                        "default": 0,
+                        "description": "Successful and failed boots listed (for display).",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      }
+                    },
                     "type": "object"
                   },
                   "conditions": {
@@ -558,6 +658,47 @@
                     "format": "date-time",
                     "nullable": true,
                     "type": "string"
+                  },
+                  "reachability": {
+                    "description": "The last checks of the management path (`spec.probe`).",
+                    "nullable": true,
+                    "properties": {
+                      "checkedAt": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "error": {
+                        "description": "Why the probe could not run (bad address, no ICMP socket), if so.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "reachable": {
+                        "description": "Whether the last probe was answered.",
+                        "type": "boolean"
+                      },
+                      "recent": {
+                        "default": "",
+                        "description": "The last probes, oldest first: `1` answered, `0` not.",
+                        "type": "string"
+                      },
+                      "rttMs": {
+                        "description": "Round-trip time of the last answered probe, in milliseconds.",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "target": {
+                        "description": "What was probed, e.g. `tcp 10.0.0.12:443`.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "checkedAt",
+                      "reachable",
+                      "target"
+                    ],
+                    "type": "object"
                   },
                   "scalingDecision": {
                     "description": "Latest decision from the pool autoscaler (only honoured with\n`powerPolicy: Auto`, and only while the machine is still a member of\nthe pool that made it).",
@@ -892,6 +1033,34 @@
                         "default": true,
                         "type": "boolean"
                       },
+                      "hedge": {
+                        "description": "Wake another machine when the one booting for pending pods is taking\nlonger than it should. Off when omitted.",
+                        "nullable": true,
+                        "properties": {
+                          "minSeconds": {
+                            "default": 120,
+                            "description": "Never overdue before this many seconds. Default 120.",
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "percentOfAverage": {
+                            "default": 150,
+                            "description": "A boot is overdue at this percentage of the machine's average boot\ntime (`status.bootHistory`). Default 150.",
+                            "format": "uint32",
+                            "minimum": 100.0,
+                            "type": "integer"
+                          },
+                          "withoutHistorySeconds": {
+                            "default": 300,
+                            "description": "Overdue after this many seconds for a machine with no boot history.\nDefault 300.",
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "maxNodesPerStep": {
                         "default": 3,
                         "description": "Maximum machines powered on per autoscaler cycle.",
@@ -928,7 +1097,7 @@
                         "type": "boolean"
                       },
                       "preferredNodes": {
-                        "description": "Which machines this pool would rather use: a weight from 0 to 100 per\nmachine, by Node name. Machines not listed weigh 0; each name may\nappear once. Machines are powered on in this order, and powered off\nin exactly the reverse order:\n1. weight, highest first;\n2. with `preferS3Capable`, machines that can sleep in S3 first;\n3. size (CPU, then memory), largest first: fewer machines absorb the\n   pending pods, and on the way down the smallest goes first, taking\n   the least capacity away;\n4. Node name, ascending.\n\nScale-up gives each pending pod the first machine in this order that\nit fits on; `minOnline` takes the first machines that are off. When\nseveral machines are unneeded, scale-down powers off the last first.\nA weight never makes a machine eligible that otherwise is not, and\nnever keeps one on that is otherwise unneeded.",
+                        "description": "Which machines this pool would rather use: a weight from 0 to 100 per\nmachine, by Node name. Machines not listed weigh 0; each name may\nappear once. Without `strategies`, machines are powered on in this\norder, and powered off in exactly the reverse order (with\n`strategies`, this weight only counts through the `Priority`\nstrategy, if it is listed):\n1. weight, highest first;\n2. with `preferS3Capable`, machines that can sleep in S3 first;\n3. size (CPU, then memory), largest first: fewer machines absorb the\n   pending pods, and on the way down the smallest goes first, taking\n   the least capacity away;\n4. Node name, ascending.\n\nScale-up gives each pending pod the first machine in this order that\nit fits on; `minOnline` takes the first machines that are off. When\nseveral machines are unneeded, scale-down powers off the last first.\nA weight never makes a machine eligible that otherwise is not, and\nnever keeps one on that is otherwise unneeded.",
                         "items": {
                           "properties": {
                             "name": {
@@ -959,6 +1128,42 @@
                         "default": false,
                         "description": "Only count pending pods that explicitly target this pool: their\n`nodeSelector` (or every required node-affinity term) must require all of\nthe pool's `nodeSelector.matchLabels`. Keeps unrelated pods (CI runners,\noverflow from other nodes) from powering on a dedicated pool such as GPUs.",
                         "type": "boolean"
+                      },
+                      "strategies": {
+                        "description": "How the machine to wake is chosen among those that are off and fit:\nstrategies, each rating every candidate from 0 to 1, combined by\nweight; the highest total is woken first, and scale-down powers off\nin the reverse order. Ties go to the larger machine, then by name.\nConstraints are never traded away: active hours, backoffs,\n`maxOnline` and `maxNodesPerStep` apply before any strategy, and a\nmachine that is not off and `Auto`, or that the pod does not fit, is\nnever a candidate.\n\nEmpty (the default): the fixed order described under `preferredNodes`.\n\n```yaml\nstrategies:\n  - {name: Reachable, weight: 3}\n  - {name: FastestBoot, weight: 2}\n  - {name: Reliable, weight: 2}\n  - {name: Random, weight: 1}\n```",
+                        "items": {
+                          "properties": {
+                            "name": {
+                              "enum": [
+                                "Priority",
+                                "Reachable",
+                                "FastestBoot",
+                                "Reliable",
+                                "Standby",
+                                "Largest",
+                                "Smallest",
+                                "Random"
+                              ],
+                              "type": "string"
+                            },
+                            "weight": {
+                              "description": "1 to 100: how much this strategy counts against the others.",
+                              "maximum": 100.0,
+                              "minimum": 1.0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "weight"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array",
+                        "x-kubernetes-list-map-keys": [
+                          "name"
+                        ],
+                        "x-kubernetes-list-type": "map"
                       }
                     },
                     "type": "object"
